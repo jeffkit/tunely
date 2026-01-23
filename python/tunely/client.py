@@ -20,11 +20,13 @@ WS-Tunnel 客户端 SDK
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 import websockets
@@ -43,10 +45,159 @@ from .protocol import (
     StreamStartMessage,
     StreamChunkMessage,
     StreamEndMessage,
+    TcpConnectMessage,
+    TcpDataMessage,
+    TcpCloseMessage,
     parse_message,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TcpConnection:
+    """
+    单个 TCP 连接管理
+    
+    管理一个 TCP 连接的生命周期，包括：
+    - 连接到目标服务
+    - 读取数据并发送到服务端
+    - 接收数据并写入到目标服务
+    - 连接关闭处理
+    """
+
+    def __init__(self, conn_id: str, target_host: str, target_port: int, websocket):
+        """
+        初始化 TCP 连接
+        
+        Args:
+            conn_id: 连接唯一 ID
+            target_host: 目标主机
+            target_port: 目标端口
+            websocket: WebSocket 连接（用于发送数据回服务端）
+        """
+        self.conn_id = conn_id
+        self.target_host = target_host
+        self.target_port = target_port
+        self._websocket = websocket
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._read_task: Optional[asyncio.Task] = None
+        self._sequence = 0
+        self._closed = False
+
+    async def connect(self) -> bool:
+        """
+        连接到目标服务
+        
+        Returns:
+            是否连接成功
+        """
+        try:
+            self._reader, self._writer = await asyncio.open_connection(
+                self.target_host, self.target_port
+            )
+            logger.info(f"TCP 连接已建立: {self.conn_id} -> {self.target_host}:{self.target_port}")
+            
+            # 启动读取任务
+            self._read_task = asyncio.create_task(self._read_loop())
+            return True
+        except Exception as e:
+            logger.error(f"TCP 连接失败: {self.conn_id} -> {self.target_host}:{self.target_port}, {e}")
+            await self._send_close(str(e))
+            return False
+
+    async def _read_loop(self) -> None:
+        """持续读取 TCP 数据并发送到服务端"""
+        try:
+            while not self._closed and self._reader:
+                # 读取数据
+                data = await self._reader.read(4096)
+                if not data:
+                    # 连接关闭
+                    break
+                
+                # 发送到服务端
+                await self._send_data(data)
+                self._sequence += 1
+        except Exception as e:
+            logger.error(f"TCP 读取错误: {self.conn_id}, {e}")
+        finally:
+            await self._send_close()
+
+    async def _send_data(self, data: bytes) -> None:
+        """发送数据到服务端"""
+        try:
+            message = TcpDataMessage(
+                conn_id=self.conn_id,
+                data=base64.b64encode(data).decode('ascii'),
+                sequence=self._sequence,
+            )
+            await self._websocket.send(message.model_dump_json())
+        except Exception as e:
+            logger.error(f"发送 TCP 数据失败: {self.conn_id}, {e}")
+
+    async def _send_close(self, error: Optional[str] = None) -> None:
+        """发送关闭消息到服务端"""
+        if self._closed:
+            return
+        
+        try:
+            message = TcpCloseMessage(
+                conn_id=self.conn_id,
+                error=error,
+            )
+            await self._websocket.send(message.model_dump_json())
+        except Exception as e:
+            logger.error(f"发送 TCP 关闭消息失败: {self.conn_id}, {e}")
+
+    async def write_data(self, data: bytes) -> None:
+        """写入数据到目标服务"""
+        if self._closed or not self._writer:
+            return
+        
+        try:
+            self._writer.write(data)
+            await self._writer.drain()
+        except Exception as e:
+            logger.error(f"TCP 写入错误: {self.conn_id}, {e}")
+            await self.close(str(e))
+
+    async def close(self, error: Optional[str] = None) -> None:
+        """关闭连接"""
+        if self._closed:
+            return
+        
+        logger.info(f"TCP 连接关闭: {self.conn_id}")
+        
+        # 先发送关闭消息（在设置 _closed 之前）
+        if not self._closed:
+            try:
+                message = TcpCloseMessage(
+                    conn_id=self.conn_id,
+                    error=error,
+                )
+                await self._websocket.send(message.model_dump_json())
+            except Exception as e:
+                logger.error(f"发送 TCP 关闭消息失败: {self.conn_id}, {e}")
+        
+        # 设置关闭标志
+        self._closed = True
+        
+        # 取消读取任务
+        if self._read_task:
+            self._read_task.cancel()
+            try:
+                await self._read_task
+            except asyncio.CancelledError:
+                pass
+        
+        # 关闭 writer
+        if self._writer:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception as e:
+                logger.error(f"关闭 TCP writer 错误: {e}")
 
 
 class TunnelClient:
@@ -87,10 +238,29 @@ class TunnelClient:
         self._domain: str | None = None
         self._reconnect_count = 0
 
+        # TCP 连接管理（TCP 模式使用）
+        self._tcp_connections: Dict[str, TcpConnection] = {}
+        
+        # 目标服务解析（TCP 模式使用）
+        self._target_host: str = "localhost"
+        self._target_port: int = 8080
+        self._parse_target_url()
+
         # 回调函数
         self._on_connect: Callable[[], None] | None = None
         self._on_disconnect: Callable[[], None] | None = None
         self._on_request: Callable[[TunnelRequest], None] | None = None
+
+    def _parse_target_url(self) -> None:
+        """解析目标 URL，提取主机和端口（用于 TCP 模式）"""
+        try:
+            parsed = urlparse(self.config.target_url)
+            self._target_host = parsed.hostname or "localhost"
+            self._target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except Exception as e:
+            logger.warning(f"解析目标 URL 失败: {e}，使用默认值")
+            self._target_host = "localhost"
+            self._target_port = 8080
 
     @property
     def is_connected(self) -> bool:
@@ -206,7 +376,7 @@ class TunnelClient:
                     await websocket.send(PongMessage().model_dump_json())
 
                 elif isinstance(message, TunnelRequest):
-                    # 处理请求
+                    # 处理 HTTP 请求
                     if self._on_request:
                         self._on_request(message)
 
@@ -216,6 +386,18 @@ class TunnelClient:
                     response = await self._execute_request(message)
                     if response is not None:
                         await websocket.send(response.model_dump_json())
+
+                elif isinstance(message, TcpConnectMessage):
+                    # 处理 TCP 连接建立
+                    await self._handle_tcp_connect(message, websocket)
+
+                elif isinstance(message, TcpDataMessage):
+                    # 处理 TCP 数据
+                    await self._handle_tcp_data(message)
+
+                elif isinstance(message, TcpCloseMessage):
+                    # 处理 TCP 连接关闭
+                    await self._handle_tcp_close(message)
 
                 else:
                     logger.warning(f"未知消息类型: {type(message)}")
@@ -374,6 +556,69 @@ class TunnelClient:
         )
         await self._websocket.send(end_msg.model_dump_json())
         logger.debug(f"SSE 流结束: request_id={request_id}, chunks={chunk_count}, duration={duration_ms}ms")
+
+    # ============== TCP 模式处理方法 ==============
+
+    async def _handle_tcp_connect(self, message: TcpConnectMessage, websocket) -> None:
+        """
+        处理 TCP 连接建立请求
+        
+        创建到目标服务的 TCP 连接
+        """
+        conn_id = message.conn_id
+        logger.info(f"收到 TCP 连接请求: {conn_id}")
+        
+        # 创建 TCP 连接
+        tcp_conn = TcpConnection(
+            conn_id=conn_id,
+            target_host=self._target_host,
+            target_port=self._target_port,
+            websocket=websocket,
+        )
+        
+        # 尝试连接
+        success = await tcp_conn.connect()
+        if success:
+            self._tcp_connections[conn_id] = tcp_conn
+        else:
+            # 连接失败，TcpConnection 已经发送了关闭消息
+            logger.warning(f"TCP 连接失败: {conn_id}")
+
+    async def _handle_tcp_data(self, message: TcpDataMessage) -> None:
+        """
+        处理 TCP 数据传输
+        
+        将数据写入到对应的 TCP 连接
+        """
+        conn_id = message.conn_id
+        conn = self._tcp_connections.get(conn_id)
+        
+        if not conn:
+            logger.warning(f"收到未知连接的数据: {conn_id}")
+            return
+        
+        try:
+            # 解码 base64 数据
+            data = base64.b64decode(message.data)
+            await conn.write_data(data)
+        except Exception as e:
+            logger.error(f"处理 TCP 数据错误: {conn_id}, {e}")
+            await conn.close(str(e))
+
+    async def _handle_tcp_close(self, message: TcpCloseMessage) -> None:
+        """
+        处理 TCP 连接关闭
+        
+        关闭对应的 TCP 连接
+        """
+        conn_id = message.conn_id
+        conn = self._tcp_connections.pop(conn_id, None)
+        
+        if conn:
+            logger.info(f"关闭 TCP 连接: {conn_id}")
+            await conn.close(message.error)
+        else:
+            logger.warning(f"尝试关闭未知连接: {conn_id}")
 
 
 async def run_tunnel_client(

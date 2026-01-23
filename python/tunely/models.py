@@ -50,6 +50,11 @@ class Tunnel(Base):
         Text, nullable=True, comment="隧道描述（可选）"
     )
 
+    # 隧道模式
+    mode: Mapped[str] = mapped_column(
+        String(10), default="http", nullable=False, comment="隧道模式: http/tcp"
+    )
+
     # 状态
     enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False, comment="是否启用"
@@ -81,6 +86,7 @@ class Tunnel(Base):
             "domain": self.domain,
             "name": self.name,
             "description": self.description,
+            "mode": self.mode,
             "enabled": self.enabled,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

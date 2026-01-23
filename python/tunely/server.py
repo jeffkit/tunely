@@ -53,6 +53,9 @@ from .protocol import (
     StreamStartMessage,
     StreamChunkMessage,
     StreamEndMessage,
+    TcpConnectMessage,
+    TcpDataMessage,
+    TcpCloseMessage,
     parse_message,
 )
 from .repository import TunnelRepository, TunnelRequestLogRepository
@@ -95,6 +98,20 @@ class PendingStreamRequest:
     start_message: StreamStartMessage | None = None
     end_message: StreamEndMessage | None = None
     created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class TcpConnectionState:
+    """TCP 连接状态（TCP 模式）"""
+
+    conn_id: str
+    domain: str
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    read_task: asyncio.Task | None = None
+    websocket: WebSocket | None = None
+    created_at: datetime = field(default_factory=datetime.now)
+    closed: bool = False
 
 
 # ============== 请求/响应模型 ==============
@@ -195,6 +212,9 @@ class TunnelManager:
 
         # request_id → PendingStreamRequest（流式响应/SSE）
         self._pending_stream_requests: dict[str, PendingStreamRequest] = {}
+
+        # conn_id → TcpConnectionState（TCP 模式）
+        self._tcp_connections: dict[str, TcpConnectionState] = {}
 
         self._lock = asyncio.Lock()
 
@@ -363,6 +383,64 @@ class TunnelManager:
     async def cleanup_stream_request(self, request_id: str) -> None:
         """清理流式请求"""
         self._pending_stream_requests.pop(request_id, None)
+
+    # ============== TCP 模式支持 ==============
+
+    async def register_tcp_connection(
+        self,
+        conn_id: str,
+        domain: str,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        websocket: WebSocket,
+    ) -> None:
+        """注册 TCP 连接"""
+        tcp_conn = TcpConnectionState(
+            conn_id=conn_id,
+            domain=domain,
+            reader=reader,
+            writer=writer,
+            websocket=websocket,
+        )
+        self._tcp_connections[conn_id] = tcp_conn
+        logger.info(f"注册 TCP 连接: {conn_id} for domain={domain}")
+
+    async def get_tcp_connection(self, conn_id: str) -> TcpConnectionState | None:
+        """获取 TCP 连接"""
+        return self._tcp_connections.get(conn_id)
+
+    async def remove_tcp_connection(self, conn_id: str) -> None:
+        """移除 TCP 连接"""
+        tcp_conn = self._tcp_connections.pop(conn_id, None)
+        if tcp_conn:
+            logger.info(f"移除 TCP 连接: {conn_id}")
+            # 取消读取任务
+            if tcp_conn.read_task:
+                tcp_conn.read_task.cancel()
+            # 关闭 writer
+            if tcp_conn.writer and not tcp_conn.closed:
+                try:
+                    tcp_conn.writer.close()
+                    await tcp_conn.writer.wait_closed()
+                except Exception as e:
+                    logger.error(f"关闭 TCP writer 错误: {e}")
+
+    async def handle_tcp_data(self, conn_id: str, data: bytes) -> bool:
+        """处理 TCP 数据（写入到连接）"""
+        tcp_conn = self._tcp_connections.get(conn_id)
+        if not tcp_conn or tcp_conn.closed:
+            logger.warning(f"TCP 连接不存在或已关闭: {conn_id}")
+            return False
+
+        try:
+            tcp_conn.writer.write(data)
+            await tcp_conn.writer.drain()
+            return True
+        except Exception as e:
+            logger.error(f"写入 TCP 数据失败: {conn_id}, {e}")
+            tcp_conn.closed = True
+            await self.remove_tcp_connection(conn_id)
+            return False
 
 
 # ============== 隧道服务器 ==============
@@ -647,6 +725,11 @@ class TunnelServer:
                     await self.manager.handle_stream_chunk(message)
                 elif isinstance(message, StreamEndMessage):
                     await self.manager.handle_stream_end(message)
+                # TCP 消息处理
+                elif isinstance(message, TcpDataMessage):
+                    await self._handle_tcp_data_from_client(message)
+                elif isinstance(message, TcpCloseMessage):
+                    await self._handle_tcp_close_from_client(message)
                 else:
                     logger.warning(f"未知消息类型: {type(message)}")
 
@@ -864,25 +947,55 @@ class TunnelServer:
         timeout: float = 300.0,
     ) -> ForwardResponse:
         """
-        转发请求到隧道
+        转发请求到隧道（支持 HTTP 和 TCP 模式）
 
         Args:
             domain: 目标隧道域名
-            method: HTTP 方法
-            path: 请求路径
-            headers: 请求头
-            body: 请求体
+            method: HTTP 方法（TCP 模式忽略）
+            path: 请求路径（TCP 模式忽略）
+            headers: 请求头（TCP 模式忽略）
+            body: 请求体（TCP 模式为原始二进制数据）
             timeout: 超时时间（秒）
 
         Returns:
             ForwardResponse
         """
+        # 检查连接
         conn = self.manager.get_connection_by_domain(domain)
         if not conn:
             return ForwardResponse(
                 status=503,
                 error=f"Tunnel not connected: {domain}",
             )
+
+        # 查询隧道模式
+        tunnel_mode = "http"  # 默认 HTTP 模式（向后兼容）
+        if self.db:
+            async with self.db.session() as session:
+                repo = TunnelRepository(session)
+                tunnel = await repo.get_by_domain(domain)
+                if tunnel:
+                    tunnel_mode = tunnel.mode
+
+        # 根据模式选择转发方式
+        if tunnel_mode == "tcp":
+            return await self._forward_tcp(domain, body, timeout)
+        else:
+            return await self._forward_http(domain, method, path, headers, body, timeout)
+
+    async def _forward_http(
+        self,
+        domain: str,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None,
+        body: Any,
+        timeout: float,
+    ) -> ForwardResponse:
+        """HTTP 模式转发（原 forward 方法的逻辑）"""
+        conn = self.manager.get_connection_by_domain(domain)
+        if not conn:
+            return ForwardResponse(status=503, error=f"Tunnel not connected: {domain}")
 
         request_id = str(uuid.uuid4())
         request = TunnelRequest(
@@ -1026,6 +1139,71 @@ class TunnelServer:
                 error=error_msg,
             )
 
+    async def _forward_tcp(
+        self,
+        domain: str,
+        body: Any,
+        timeout: float,
+    ) -> ForwardResponse:
+        """
+        TCP 模式转发
+        
+        将原始二进制数据通过 TCP 隧道转发
+        """
+        import base64
+        
+        conn = self.manager.get_connection_by_domain(domain)
+        if not conn:
+            return ForwardResponse(status=503, error=f"Tunnel not connected: {domain}")
+
+        conn_id = str(uuid.uuid4())
+        
+        try:
+            # 发送 TCP 连接建立消息
+            connect_msg = TcpConnectMessage(conn_id=conn_id)
+            await conn.websocket.send_text(connect_msg.model_dump_json())
+            
+            # 等待客户端建立连接（简化处理，假设立即建立）
+            await asyncio.sleep(0.1)
+            
+            # 发送数据
+            if body:
+                # 处理不同类型的 body
+                if isinstance(body, bytes):
+                    data = body
+                elif isinstance(body, str):
+                    data = body.encode('utf-8')
+                else:
+                    data = json.dumps(body).encode('utf-8')
+                
+                # 编码为 base64 并发送
+                data_msg = TcpDataMessage(
+                    conn_id=conn_id,
+                    data=base64.b64encode(data).decode('ascii'),
+                    sequence=0,
+                )
+                await conn.websocket.send_text(data_msg.model_dump_json())
+            
+            # 等待响应（TCP 模式目前简化为单次请求-响应）
+            # TODO: 实现完整的双向流式 TCP 代理
+            await asyncio.sleep(timeout)
+            
+            # 关闭连接
+            close_msg = TcpCloseMessage(conn_id=conn_id)
+            await conn.websocket.send_text(close_msg.model_dump_json())
+            
+            return ForwardResponse(
+                status=200,
+                body={"message": "TCP data sent", "conn_id": conn_id},
+                duration_ms=int(timeout * 1000),
+            )
+            
+        except asyncio.TimeoutError:
+            return ForwardResponse(status=504, error="TCP forward timeout")
+        except Exception as e:
+            logger.error(f"TCP forward error: {e}", exc_info=True)
+            return ForwardResponse(status=500, error=str(e))
+
     async def forward_stream(
         self,
         domain: str,
@@ -1132,3 +1310,32 @@ class TunnelServer:
         finally:
             # 清理流式请求
             await self.manager.cleanup_stream_request(request_id)
+
+    # ============== TCP 模式支持方法 ==============
+
+    async def _handle_tcp_data_from_client(self, message: TcpDataMessage) -> None:
+        """
+        处理从客户端接收的 TCP 数据
+        
+        将数据写入到对应的 TCP 连接
+        """
+        import base64
+        
+        try:
+            # 解码数据
+            data = base64.b64decode(message.data)
+            # 写入到 TCP 连接
+            success = await self.manager.handle_tcp_data(message.conn_id, data)
+            if not success:
+                logger.warning(f"写入 TCP 数据失败: {message.conn_id}")
+        except Exception as e:
+            logger.error(f"处理 TCP 数据错误: {message.conn_id}, {e}")
+
+    async def _handle_tcp_close_from_client(self, message: TcpCloseMessage) -> None:
+        """
+        处理从客户端接收的 TCP 关闭消息
+        
+        关闭对应的 TCP 连接
+        """
+        logger.info(f"客户端请求关闭 TCP 连接: {message.conn_id}")
+        await self.manager.remove_tcp_connection(message.conn_id)

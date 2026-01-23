@@ -30,7 +30,7 @@ class MessageType(str, Enum):
     AUTH_OK = "auth_ok"
     AUTH_ERROR = "auth_error"
 
-    # 请求-响应
+    # 请求-响应（HTTP 模式）
     REQUEST = "request"
     RESPONSE = "response"
 
@@ -38,6 +38,11 @@ class MessageType(str, Enum):
     STREAM_START = "stream_start"
     STREAM_CHUNK = "stream_chunk"
     STREAM_END = "stream_end"
+
+    # TCP 模式
+    TCP_CONNECT = "tcp_connect"  # 服务端通知新 TCP 连接
+    TCP_DATA = "tcp_data"        # TCP 数据传输（双向）
+    TCP_CLOSE = "tcp_close"      # TCP 连接关闭
 
     # 心跳
     PING = "ping"
@@ -172,6 +177,54 @@ class StreamEndMessage(BaseModel):
     )
 
 
+# ============== TCP 模式消息 ==============
+
+
+class TcpConnectMessage(BaseModel):
+    """
+    TCP 连接建立（服务端 → 客户端）
+    
+    当有新的 TCP 连接到达时，服务端发送此消息通知客户端
+    """
+
+    type: MessageType = MessageType.TCP_CONNECT
+    conn_id: str = Field(..., description="连接唯一 ID")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().isoformat(), description="连接时间"
+    )
+
+
+class TcpDataMessage(BaseModel):
+    """
+    TCP 数据传输（双向）
+    
+    用于在服务端和客户端之间传输原始 TCP 数据
+    """
+
+    type: MessageType = MessageType.TCP_DATA
+    conn_id: str = Field(..., description="连接 ID")
+    data: str = Field(..., description="Base64 编码的二进制数据")
+    sequence: int = Field(default=0, description="数据包序号")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().isoformat(), description="发送时间"
+    )
+
+
+class TcpCloseMessage(BaseModel):
+    """
+    TCP 连接关闭（双向）
+    
+    通知对方关闭 TCP 连接
+    """
+
+    type: MessageType = MessageType.TCP_CLOSE
+    conn_id: str = Field(..., description="连接 ID")
+    error: str | None = Field(default=None, description="错误信息（如果异常关闭）")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().isoformat(), description="关闭时间"
+    )
+
+
 # ============== 心跳消息 ==============
 
 
@@ -227,6 +280,12 @@ def parse_message(data: dict[str, Any]) -> BaseModel:
         return StreamChunkMessage(**data)
     elif msg_type == MessageType.STREAM_END:
         return StreamEndMessage(**data)
+    elif msg_type == MessageType.TCP_CONNECT:
+        return TcpConnectMessage(**data)
+    elif msg_type == MessageType.TCP_DATA:
+        return TcpDataMessage(**data)
+    elif msg_type == MessageType.TCP_CLOSE:
+        return TcpCloseMessage(**data)
     elif msg_type == MessageType.PING:
         return PingMessage(**data)
     elif msg_type == MessageType.PONG:
