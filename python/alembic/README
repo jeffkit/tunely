@@ -1,0 +1,28 @@
+WS-Tunnel 数据库迁移
+
+使用 Alembic 管理数据库 Schema 变更。
+
+## 常用命令
+
+# 创建新的迁移脚本
+alembic revision --autogenerate -m "描述信息"
+
+# 升级到最新版本
+alembic upgrade head
+
+# 回滚一个版本
+alembic downgrade -1
+
+# 查看当前版本
+alembic current
+
+# 查看迁移历史
+alembic history
+
+## 配置数据库
+
+通过环境变量配置数据库 URL：
+
+export WS_TUNNEL_DATABASE_URL="sqlite+aiosqlite:///./data/tunnels.db"
+export WS_TUNNEL_DATABASE_URL="mysql+aiomysql://user:pass@host/db"
+export WS_TUNNEL_DATABASE_URL="postgresql+asyncpg://user:pass@host/db"
