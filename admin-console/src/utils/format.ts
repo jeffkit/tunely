@@ -1,18 +1,27 @@
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
+import utc from 'dayjs/plugin/utc'
+import timezone from 'dayjs/plugin/timezone'
 import zhCN from 'dayjs/locale/zh-cn'
 
 dayjs.extend(relativeTime)
+dayjs.extend(utc)
+dayjs.extend(timezone)
 dayjs.locale(zhCN)
+
+// 设置默认时区为本地时区
+dayjs.tz.setDefault(dayjs.tz.guess())
 
 export function formatDate(date: string | null): string {
   if (!date) return '-'
-  return dayjs(date).format('YYYY-MM-DD HH:mm:ss')
+  // 将 UTC 时间转换为本地时区
+  return dayjs.utc(date).local().format('YYYY-MM-DD HH:mm:ss')
 }
 
 export function formatRelativeTime(date: string | null): string {
   if (!date) return '-'
-  return dayjs(date).fromNow()
+  // 将 UTC 时间转换为本地时区
+  return dayjs.utc(date).local().fromNow()
 }
 
 export function formatNumber(num: number): string {
@@ -21,7 +30,8 @@ export function formatNumber(num: number): string {
 
 export function formatDateTime(date: string | null): string {
   if (!date) return '-'
-  return dayjs(date).format('YYYY-MM-DD HH:mm:ss')
+  // 将 UTC 时间转换为本地时区
+  return dayjs.utc(date).local().format('YYYY-MM-DD HH:mm:ss')
 }
 
 export function formatDuration(ms: number): string {

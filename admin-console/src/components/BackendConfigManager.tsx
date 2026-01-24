@@ -75,11 +75,26 @@ export function BackendConfigManager() {
   const handleSaveConfig = async () => {
     try {
       const values = await form.validateFields()
+      
+      // 预先 trim，避免保存时丢失数据
+      const baseUrl = values.baseUrl?.trim()
+      const apiKey = values.apiKey?.trim()
+      
+      // 验证 trim 后不为空
+      if (!baseUrl) {
+        message.error('后端服务地址不能为空')
+        return
+      }
+      if (!apiKey) {
+        message.error('API Key 不能为空')
+        return
+      }
+      
       const config: BackendConfig = {
         id: editingConfig?.id || generateBackendId(),
-        name: values.name,
-        baseUrl: values.baseUrl.trim(),
-        apiKey: values.apiKey.trim(),
+        name: values.name.trim(),
+        baseUrl,
+        apiKey,
       }
       saveBackendConfig(config)
       loadBackendConfigs()
@@ -182,20 +197,28 @@ export function BackendConfigManager() {
         width={600}
       >
         <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
-          <Form.Item name="name" label="后端名称" rules={[{ required: true, message: '请输入后端名称' }]}>
+          <Form.Item 
+            name="name" 
+            label="后端名称" 
+            rules={[{ required: true, whitespace: true, message: '请输入后端名称' }]}
+          >
             <Input placeholder="例如: Pro 服务器、本地开发" onPressEnter={handleSaveConfig} />
           </Form.Item>
           <Form.Item
             name="baseUrl"
             label="后端服务地址（API Base URL）"
-            rules={[{ required: true, message: '请输入后端服务地址' }]}
+            rules={[{ required: true, whitespace: true, message: '请输入后端服务地址' }]}
+            extra="完整的 API 基础 URL，如 http://host:port/api"
           >
             <Input placeholder="例如: http://21.6.243.90:8083/api" onPressEnter={handleSaveConfig} />
-            <div style={{ marginTop: 4, fontSize: 12, color: '#999' }}>完整的 API 基础 URL，如 http://host:port/api</div>
           </Form.Item>
-          <Form.Item name="apiKey" label="API Key" rules={[{ required: true, message: '请输入 API Key' }]}>
+          <Form.Item 
+            name="apiKey" 
+            label="API Key" 
+            rules={[{ required: true, whitespace: true, message: '请输入 API Key' }]}
+            extra="Tunely Server 的管理 API Key"
+          >
             <Input.Password placeholder="输入 API Key（用于访问受保护的 API）" onPressEnter={handleSaveConfig} />
-            <div style={{ marginTop: 4, fontSize: 12, color: '#999' }}>Tunely Server 的管理 API Key</div>
           </Form.Item>
         </Form>
       </Modal>
