@@ -445,8 +445,9 @@ class TunnelServer:
         async def delete_tunnel(
             domain: str,
             x_api_key: str | None = Header(None, alias="x-api-key"),
+            x_tunnel_token: str | None = Header(None, alias="x-tunnel-token"),
         ):
-            return await self._delete_tunnel(domain, x_api_key)
+            return await self._delete_tunnel(domain, x_api_key, x_tunnel_token)
 
         @self.router.post(
             "/api/tunnels/{domain}/regenerate-token", response_model=RegenerateTokenResponse
@@ -667,8 +668,9 @@ class TunnelServer:
     async def _create_tunnel(
         self, request: CreateTunnelRequest, api_key: str | None
     ) -> CreateTunnelResponse:
-        """创建隧道"""
-        self._check_admin_api_key(api_key)
+        """创建隧道 - 公开接口,不需要 API Key"""
+        # 移除 API Key 验证,允许用户自助创建隧道
+        # self._check_admin_api_key(api_key)
 
         if not self.db:
             raise HTTPException(status_code=500, detail="Database not initialized")
@@ -838,15 +840,33 @@ class TunnelServer:
                 "logs": [log.to_dict() for log in logs],
             }
 
-    async def _delete_tunnel(self, domain: str, api_key: str | None) -> dict:
-        """删除隧道"""
-        self._check_admin_api_key(api_key)
-
+    async def _delete_tunnel(
+        self, 
+        domain: str, 
+        api_key: str | None,
+        tunnel_token: str | None = None
+    ) -> dict:
+        """删除隧道 - 支持 Admin API Key 或隧道自己的 Token"""
         if not self.db:
             raise HTTPException(status_code=500, detail="Database not initialized")
 
         async with self.db.session() as session:
             repo = TunnelRepository(session)
+            
+            # 验证权限:Admin API Key 或隧道自己的 Token
+            if tunnel_token:
+                # 使用隧道 Token 验证
+                tunnel = await repo.get_by_token(tunnel_token)
+                if not tunnel or tunnel.domain != domain:
+                    raise HTTPException(
+                        status_code=401, 
+                        detail="Invalid tunnel token or domain mismatch"
+                    )
+                # Token 验证通过,允许删除自己
+            else:
+                # 使用 Admin API Key 验证
+                self._check_admin_api_key(api_key)
+            
             deleted = await repo.delete(domain)
 
             if not deleted:
