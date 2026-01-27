@@ -1,6 +1,6 @@
 [project]
 name = "tunely"
-version = "0.2.0"
+version = "0.2.1"
 description = "WebSocket Tunnel - 透明反向代理隧道，支持服务端嵌入和客户端 SDK"
 readme = "README.md"
 requires-python = ">=3.11"
