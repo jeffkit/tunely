@@ -790,7 +790,8 @@ class TunnelServer:
 
         async with self.db.session() as session:
             repo = TunnelRepository(session)
-            tunnels = await repo.list_all()
+            # 移除 limit 限制，返回所有隧道（原默认 limit=100）
+            tunnels = await repo.list_all(limit=999999)
 
             return [
                 TunnelInfo(
