@@ -473,4 +473,13 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    run_app()
+    # 从环境变量读取配置（TUNELY_ 前缀）
+    env_settings = AppSettings()
+    run_app(
+        host=env_settings.host,
+        port=env_settings.port,
+        domain=env_settings.domain,
+        database_url=env_settings.database_url,
+        admin_api_key=env_settings.admin_api_key,
+        ws_path=env_settings.ws_path,
+    )
