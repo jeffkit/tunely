@@ -60,6 +60,7 @@ def main():
 )
 @click.option("--api-key", "-k", help="管理 API 密钥")
 @click.option("--ws-path", default="/ws/tunnel", help="WebSocket 路径")
+@click.option("--cors-origins", default="*", help="CORS 允许的来源（逗号分隔，* 表示全部）")
 @click.option("--verbose", "-v", is_flag=True, help="详细日志")
 def serve(
     host: str,
@@ -68,21 +69,28 @@ def serve(
     database: str,
     api_key: str,
     ws_path: str,
+    cors_origins: str,
     verbose: bool,
 ):
     """启动 Tunely Server（独立隧道服务）"""
+    import os
     setup_logging(verbose)
     
-    console.print(f"[bold blue]Tunely Server[/bold blue]")
+    console.print(f"[bold blue]Tunely Server v0.3.0[/bold blue]")
     console.print(f"  监听: {host}:{port}")
     console.print(f"  域名: {domain}")
     console.print(f"  数据库: {database}")
     console.print(f"  WebSocket: {ws_path}")
+    console.print(f"  CORS: {cors_origins}")
     console.print()
     console.print(f"[dim]访问方式:[/dim]")
-    console.print(f"  管理 API: http://{domain}/api/tunnels")
-    console.print(f"  隧道访问: http://{{subdomain}}.{domain}/")
+    console.print(f"  管理 API:    http://{domain}/api/tunnels")
+    console.print(f"  子域名模式:  http://{{subdomain}}.{domain}/")
+    console.print(f"  路径前缀模式: http://{domain}/t/{{tunnel-name}}/")
     console.print()
+    
+    # 设置 CORS 环境变量（供 AppSettings 读取）
+    os.environ["TUNELY_CORS_ORIGINS"] = cors_origins
     
     from .app import run_app
     

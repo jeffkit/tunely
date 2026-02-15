@@ -1,7 +1,7 @@
 """
 Tunely Server - 独立的隧道服务应用
 
-支持通过子域名访问，实现真正的 HTTP 反向代理功能。
+支持通过子域名和路径前缀两种方式访问，实现真正的 HTTP 反向代理功能。
 
 使用示例:
     # 启动服务器
@@ -11,8 +11,11 @@ Tunely Server - 独立的隧道服务应用
     tunely serve --port 8000 --domain tunely.woa.com
 
 访问方式:
-    # 假设有一个名为 my-agent 的隧道
+    # 方式 1: 子域名模式（需要 DNS 泛解析 + 通配符 SSL）
     curl https://my-agent.tunely.woa.com/api/chat -d '{"message": "hello"}'
+    
+    # 方式 2: 路径前缀模式（无需额外 DNS / SSL，适合浏览器跨域访问）
+    curl https://tunely.woa.com/t/my-agent/api/chat -d '{"message": "hello"}'
     
     # 隧道管理 API
     curl https://tunely.woa.com/api/tunnels
@@ -24,6 +27,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +62,10 @@ class AppSettings(BaseSettings):
     
     # 请求超时（秒）
     request_timeout: float = 300.0
+    
+    # CORS 配置（用于浏览器跨域访问）
+    # 逗号分隔的允许来源列表，"*" 表示允许所有来源
+    cors_origins: str = "*"
 
 
 # 全局配置实例
@@ -170,15 +178,33 @@ def create_full_app(
     # 创建 FastAPI 应用
     new_app = FastAPI(
         title="Tunely Server",
-        description="WebSocket 隧道服务 - 通过子域名访问内网服务",
-        version="0.2.0",
+        description="WebSocket 隧道服务 - 通过子域名或路径前缀访问内网服务",
+        version="0.3.0",
         lifespan=create_lifespan(tunnel_srv),
+    )
+    
+    # ============== CORS 中间件 ==============
+    # 解析 CORS 来源配置
+    cors_origins = settings.cors_origins.strip()
+    if cors_origins == "*":
+        allow_origins = ["*"]
+    else:
+        allow_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+    
+    new_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=cors_origins != "*",  # credentials 与通配符互斥
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
     )
     
     # 包含 TunnelServer 的路由（API 和 WebSocket）
     new_app.include_router(tunnel_srv.router)
     
-    # 添加基础路由
+    # ============== 基础路由 ==============
+    
     @new_app.get("/")
     async def root(request: Request):
         """根路径"""
@@ -190,7 +216,7 @@ def create_full_app(
         
         return {
             "service": "Tunely Server",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "domain": settings.domain,
             "status": "running",
         }
@@ -203,6 +229,31 @@ def create_full_app(
         return {"status": "healthy", "connected_tunnels": connected_count}
     
     # 注意：/api/info 接口由 TunnelServer 提供，不需要在这里重复定义
+    
+    # ============== 路径前缀模式路由 ==============
+    # /t/{domain}/... 用于浏览器跨域访问，无需 DNS 泛解析和通配符 SSL
+    # 例如: https://agentstudio.woa.com/t/my-agent/api/health
+    
+    @new_app.api_route(
+        "/t/{tunnel_domain}/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    )
+    async def path_prefix_forward(request: Request, tunnel_domain: str, path: str):
+        """路径前缀模式 - 通过 /t/{domain}/ 转发请求到隧道"""
+        full_path = f"/{path}"
+        if request.query_params:
+            full_path += f"?{request.query_params}"
+        return await forward_to_tunnel(request, tunnel_domain, full_path)
+    
+    @new_app.api_route(
+        "/t/{tunnel_domain}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    )
+    async def path_prefix_forward_root(request: Request, tunnel_domain: str):
+        """路径前缀模式 - 根路径转发"""
+        return await forward_to_tunnel(request, tunnel_domain, "/")
+    
+    # ============== 子域名模式路由（通用 catch-all） ==============
     
     @new_app.api_route(
         "/{path:path}",
@@ -233,8 +284,8 @@ def create_full_app(
 # 注意：这个实例不包含完整功能，请使用 create_full_app() 或 run_app()
 app = FastAPI(
     title="Tunely Server",
-    description="WebSocket 隧道服务 - 通过子域名访问内网服务",
-    version="0.2.0",
+    description="WebSocket 隧道服务 - 通过子域名或路径前缀访问内网服务",
+    version="0.3.0",
 )
 
 
