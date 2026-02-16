@@ -102,7 +102,7 @@ class PendingStreamRequest:
 
 @dataclass
 class TcpConnectionState:
-    """TCP 连接状态（TCP 模式）"""
+    """TCP 连接状态（服务端有真实 TCP 连接时使用）"""
 
     conn_id: str
     domain: str
@@ -112,6 +112,28 @@ class TcpConnectionState:
     websocket: WebSocket | None = None
     created_at: datetime = field(default_factory=datetime.now)
     closed: bool = False
+
+
+@dataclass
+class PendingTcpRequest:
+    """待响应的 TCP 请求（HTTP 触发的 TCP 转发）
+
+    当 HTTP 请求触发 TCP 隧道转发时，服务端没有真实的 TCP 连接，
+    而是通过 WebSocket 与客户端交换 TCP 数据。
+
+    工作流:
+    1. _forward_tcp 创建 PendingTcpRequest（含 Future）
+    2. 发送 TcpConnectMessage + TcpDataMessage 给客户端
+    3. 客户端建立到目标的真实 TCP 连接，转发数据
+    4. 客户端返回 TcpDataMessage（目标的响应数据）→ 累积到 chunks
+    5. 客户端返回 TcpCloseMessage → 解析 Future
+    6. _forward_tcp 收到 Future 结果，返回累积的数据
+    """
+
+    conn_id: str
+    future: asyncio.Future
+    chunks: list[bytes] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
 
 
 # ============== 请求/响应模型 ==============
@@ -213,8 +235,11 @@ class TunnelManager:
         # request_id → PendingStreamRequest（流式响应/SSE）
         self._pending_stream_requests: dict[str, PendingStreamRequest] = {}
 
-        # conn_id → TcpConnectionState（TCP 模式）
+        # conn_id → TcpConnectionState（TCP 模式 - 服务端有真实 TCP 连接）
         self._tcp_connections: dict[str, TcpConnectionState] = {}
+
+        # conn_id → PendingTcpRequest（TCP 模式 - HTTP 触发的 TCP 转发）
+        self._pending_tcp_requests: dict[str, PendingTcpRequest] = {}
 
         self._lock = asyncio.Lock()
 
@@ -426,7 +451,7 @@ class TunnelManager:
                     logger.error(f"关闭 TCP writer 错误: {e}")
 
     async def handle_tcp_data(self, conn_id: str, data: bytes) -> bool:
-        """处理 TCP 数据（写入到连接）"""
+        """处理 TCP 数据（写入到真实 TCP 连接 - 服务端监听场景）"""
         tcp_conn = self._tcp_connections.get(conn_id)
         if not tcp_conn or tcp_conn.closed:
             logger.warning(f"TCP 连接不存在或已关闭: {conn_id}")
@@ -441,6 +466,44 @@ class TunnelManager:
             tcp_conn.closed = True
             await self.remove_tcp_connection(conn_id)
             return False
+
+    # ============== TCP Pending Request（HTTP 触发的 TCP 转发） ==============
+
+    async def create_pending_tcp_request(self, conn_id: str) -> asyncio.Future:
+        """创建待响应的 TCP 请求"""
+        future = asyncio.get_event_loop().create_future()
+        self._pending_tcp_requests[conn_id] = PendingTcpRequest(
+            conn_id=conn_id,
+            future=future,
+        )
+        return future
+
+    async def handle_tcp_response_data(self, conn_id: str, data: bytes) -> bool:
+        """累积客户端返回的 TCP 响应数据"""
+        pending = self._pending_tcp_requests.get(conn_id)
+        if not pending:
+            return False
+        pending.chunks.append(data)
+        return True
+
+    async def complete_tcp_request(self, conn_id: str, error: str | None = None) -> bool:
+        """完成 TCP 请求（客户端关闭连接时调用）"""
+        pending = self._pending_tcp_requests.pop(conn_id, None)
+        if pending and not pending.future.done():
+            if error:
+                pending.future.set_result({"error": error, "data": b""})
+            else:
+                # 合并所有数据块
+                full_data = b"".join(pending.chunks)
+                pending.future.set_result({"error": None, "data": full_data})
+            return True
+        return False
+
+    async def cleanup_tcp_request(self, conn_id: str) -> None:
+        """清理 TCP 请求"""
+        pending = self._pending_tcp_requests.pop(conn_id, None)
+        if pending and not pending.future.done():
+            pending.future.cancel()
 
 
 # ============== 隧道服务器 ==============
@@ -461,6 +524,7 @@ class TunnelServer:
         self.db: DatabaseManager | None = None
         self.manager = TunnelManager()
         self.router = APIRouter(tags=["Tunnel"])
+        self._tcp_server: asyncio.Server | None = None
 
         # 注册路由
         self._register_routes()
@@ -471,8 +535,17 @@ class TunnelServer:
         await self.db.initialize()
         logger.info("TunnelServer 初始化完成")
 
+        # 如果配置了 TCP 监听端口，启动 TCP 监听
+        if self.config.tcp_listen_port:
+            await self._start_tcp_listener()
+
     async def close(self) -> None:
         """关闭服务器"""
+        # 关闭 TCP 监听器
+        if self._tcp_server:
+            self._tcp_server.close()
+            await self._tcp_server.wait_closed()
+            logger.info("TCP 监听器已关闭")
         if self.db:
             await self.db.close()
         logger.info("TunnelServer 已关闭")
@@ -1081,10 +1154,18 @@ class TunnelServer:
                         logger.warning(f"记录请求日志失败: {e}")
                         await session.rollback()
 
+            # Parse body: try JSON first, fall back to raw string
+            parsed_body = None
+            if response.body:
+                try:
+                    parsed_body = json.loads(response.body)
+                except (json.JSONDecodeError, ValueError):
+                    parsed_body = response.body
+
             return ForwardResponse(
                 status=response.status,
                 headers=response.headers,
-                body=json.loads(response.body) if response.body else None,
+                body=parsed_body,
                 duration_ms=duration_ms,
                 error=response.error,
             )
@@ -1168,62 +1249,161 @@ class TunnelServer:
     ) -> ForwardResponse:
         """
         TCP 模式转发
-        
-        将原始二进制数据通过 TCP 隧道转发
+
+        完整的请求-响应闭环:
+        1. 创建 PendingTcpRequest + 发送 TcpConnectMessage 给客户端
+        2. 客户端建立到目标的 TCP 连接
+        3. 发送 TcpDataMessage（请求数据）给客户端
+        4. 客户端将数据写入目标 TCP，读取目标响应
+        5. 客户端回传 TcpDataMessage（响应数据）→ 累积到 PendingTcpRequest
+        6. 客户端发送 TcpCloseMessage → 解析 Future
+        7. 返回累积的响应数据
         """
         import base64
-        
+
         conn = self.manager.get_connection_by_domain(domain)
         if not conn:
             return ForwardResponse(status=503, error=f"Tunnel not connected: {domain}")
 
         conn_id = str(uuid.uuid4())
-        
+        start_time = asyncio.get_event_loop().time()
+
         try:
-            # 发送 TCP 连接建立消息
+            # 1. 创建待响应请求
+            future = await self.manager.create_pending_tcp_request(conn_id)
+
+            # 2. 发送 TCP 连接建立消息
             connect_msg = TcpConnectMessage(conn_id=conn_id)
             await conn.websocket.send_text(connect_msg.model_dump_json())
-            
-            # 等待客户端建立连接（简化处理，假设立即建立）
-            await asyncio.sleep(0.1)
-            
-            # 发送数据
+
+            # 3. 发送数据
             if body:
                 # 处理不同类型的 body
                 if isinstance(body, bytes):
                     data = body
                 elif isinstance(body, str):
-                    data = body.encode('utf-8')
+                    data = body.encode("utf-8")
                 else:
-                    data = json.dumps(body).encode('utf-8')
-                
+                    data = json.dumps(body).encode("utf-8")
+
                 # 编码为 base64 并发送
                 data_msg = TcpDataMessage(
                     conn_id=conn_id,
-                    data=base64.b64encode(data).decode('ascii'),
+                    data=base64.b64encode(data).decode("ascii"),
                     sequence=0,
                 )
                 await conn.websocket.send_text(data_msg.model_dump_json())
-            
-            # 等待响应（TCP 模式目前简化为单次请求-响应）
-            # TODO: 实现完整的双向流式 TCP 代理
-            await asyncio.sleep(timeout)
-            
-            # 关闭连接
-            close_msg = TcpCloseMessage(conn_id=conn_id)
-            await conn.websocket.send_text(close_msg.model_dump_json())
-            
+
+            # 4. 等待客户端响应（TcpDataMessage 累积 + TcpCloseMessage 完成）
+            result = await asyncio.wait_for(future, timeout=timeout)
+
+            elapsed = asyncio.get_event_loop().time() - start_time
+            duration_ms = int(elapsed * 1000)
+
+            if result.get("error"):
+                return ForwardResponse(
+                    status=502,
+                    error=result["error"],
+                    duration_ms=duration_ms,
+                )
+
+            # 5. 解析响应数据
+            response_data = result.get("data", b"")
+
+            # 尝试将响应解析为 HTTP 响应（如果是 HTTP-over-TCP）
+            parsed = self._parse_tcp_response(response_data)
+
             return ForwardResponse(
-                status=200,
-                body={"message": "TCP data sent", "conn_id": conn_id},
-                duration_ms=int(timeout * 1000),
+                status=parsed.get("status", 200),
+                headers=parsed.get("headers", {}),
+                body=parsed.get("body", response_data.decode("utf-8", errors="replace") if response_data else ""),
+                duration_ms=duration_ms,
             )
-            
+
         except asyncio.TimeoutError:
-            return ForwardResponse(status=504, error="TCP forward timeout")
+            # 超时清理
+            await self.manager.cleanup_tcp_request(conn_id)
+            # 通知客户端关闭
+            try:
+                close_msg = TcpCloseMessage(conn_id=conn_id)
+                await conn.websocket.send_text(close_msg.model_dump_json())
+            except Exception:
+                pass
+            elapsed = asyncio.get_event_loop().time() - start_time
+            return ForwardResponse(
+                status=504,
+                error="TCP forward timeout",
+                duration_ms=int(elapsed * 1000),
+            )
         except Exception as e:
+            await self.manager.cleanup_tcp_request(conn_id)
             logger.error(f"TCP forward error: {e}", exc_info=True)
-            return ForwardResponse(status=500, error=str(e))
+            elapsed = asyncio.get_event_loop().time() - start_time
+            return ForwardResponse(
+                status=500,
+                error=str(e),
+                duration_ms=int(elapsed * 1000),
+            )
+
+    @staticmethod
+    def _parse_tcp_response(data: bytes) -> dict:
+        """
+        尝试将 TCP 响应数据解析为结构化格式
+
+        如果数据是 HTTP 响应格式（HTTP/1.x STATUS ...），解析为状态码 + 头 + body。
+        如果是 JSON，直接解析。
+        否则作为原始文本返回。
+        """
+        if not data:
+            return {"status": 200, "body": ""}
+
+        text = data.decode("utf-8", errors="replace")
+
+        # 尝试解析为 JSON
+        try:
+            body = json.loads(text)
+            return {"status": 200, "body": body}
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # 尝试解析为 HTTP 响应
+        if text.startswith("HTTP/"):
+            try:
+                # 分离头和 body
+                header_end = text.find("\r\n\r\n")
+                if header_end == -1:
+                    header_end = text.find("\n\n")
+                    sep_len = 2
+                else:
+                    sep_len = 4
+
+                if header_end != -1:
+                    header_part = text[:header_end]
+                    body_part = text[header_end + sep_len:]
+
+                    # 解析状态行
+                    lines = header_part.split("\r\n" if "\r\n" in header_part else "\n")
+                    status_line = lines[0]
+                    parts = status_line.split(" ", 2)
+                    status_code = int(parts[1]) if len(parts) >= 2 else 200
+
+                    # 解析头
+                    headers = {}
+                    for line in lines[1:]:
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            headers[key.strip()] = value.strip()
+
+                    return {
+                        "status": status_code,
+                        "headers": headers,
+                        "body": body_part,
+                    }
+            except Exception:
+                pass
+
+        # 原始文本
+        return {"status": 200, "body": text}
 
     async def forward_stream(
         self,
@@ -1332,31 +1512,175 @@ class TunnelServer:
             # 清理流式请求
             await self.manager.cleanup_stream_request(request_id)
 
-    # ============== TCP 模式支持方法 ==============
+    # ============== TCP 监听端口场景 ==============
+
+    async def _start_tcp_listener(self) -> None:
+        """
+        启动 TCP 监听器
+
+        当配置了 tcp_listen_port 时，在指定端口上监听 TCP 连接，
+        并通过 WebSocket 隧道转发到客户端。
+        """
+        port = self.config.tcp_listen_port
+        host = self.config.tcp_listen_host
+
+        if not port:
+            return
+
+        self._tcp_server = await asyncio.start_server(
+            self._handle_tcp_connection,
+            host=host,
+            port=port,
+        )
+        logger.info(f"TCP 监听器已启动: {host}:{port}")
+
+    async def _handle_tcp_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """
+        处理外部 TCP 连接
+
+        流程:
+        1. 接受外部 TCP 连接
+        2. 找到目标隧道客户端
+        3. 发送 TcpConnectMessage 通知客户端建立到目标的连接
+        4. 双向转发数据: 外部 TCP <-> WebSocket <-> 客户端 <-> 目标服务
+        """
+        import base64
+
+        conn_id = str(uuid.uuid4())
+        peer = writer.get_extra_info("peername")
+        logger.info(f"收到 TCP 连接: {peer} -> conn_id={conn_id}")
+
+        # 确定目标域名
+        domain = self.config.tcp_target_domain
+        if not domain:
+            # 如果没有配置目标域名，尝试使用第一个在线的隧道
+            active = self.manager.list_connected_domains()
+            if active:
+                domain = active[0]
+
+        if not domain:
+            logger.warning(f"没有可用的隧道域名，关闭 TCP 连接: {conn_id}")
+            writer.close()
+            return
+
+        # 获取隧道连接
+        tunnel_conn = self.manager.get_connection_by_domain(domain)
+        if not tunnel_conn:
+            logger.warning(f"隧道未连接: {domain}，关闭 TCP 连接: {conn_id}")
+            writer.close()
+            return
+
+        # 注册 TCP 连接
+        await self.manager.register_tcp_connection(
+            conn_id=conn_id,
+            domain=domain,
+            reader=reader,
+            writer=writer,
+            websocket=tunnel_conn.websocket,
+        )
+
+        try:
+            # 通知客户端建立到目标的 TCP 连接
+            connect_msg = TcpConnectMessage(conn_id=conn_id)
+            await tunnel_conn.websocket.send_text(connect_msg.model_dump_json())
+
+            # 启动从外部 TCP 读取数据的任务
+            tcp_conn = await self.manager.get_tcp_connection(conn_id)
+            if tcp_conn:
+                tcp_conn.read_task = asyncio.create_task(
+                    self._tcp_read_loop(conn_id, reader, tunnel_conn.websocket)
+                )
+                # 等待读取任务完成（连接关闭或出错）
+                await tcp_conn.read_task
+
+        except Exception as e:
+            logger.error(f"TCP 连接处理错误: conn_id={conn_id}, {e}")
+        finally:
+            # 通知客户端关闭连接
+            try:
+                close_msg = TcpCloseMessage(conn_id=conn_id)
+                await tunnel_conn.websocket.send_text(close_msg.model_dump_json())
+            except Exception:
+                pass
+            await self.manager.remove_tcp_connection(conn_id)
+
+    async def _tcp_read_loop(
+        self,
+        conn_id: str,
+        reader: asyncio.StreamReader,
+        websocket: WebSocket,
+    ) -> None:
+        """
+        持续从外部 TCP 连接读取数据，通过 WebSocket 发送给客户端
+        """
+        import base64
+
+        sequence = 0
+        try:
+            while True:
+                data = await reader.read(65536)  # 64KB chunks
+                if not data:
+                    # 对端关闭连接
+                    logger.info(f"TCP 连接对端关闭: conn_id={conn_id}")
+                    break
+
+                # 编码并发送
+                data_msg = TcpDataMessage(
+                    conn_id=conn_id,
+                    data=base64.b64encode(data).decode("ascii"),
+                    sequence=sequence,
+                )
+                await websocket.send_text(data_msg.model_dump_json())
+                sequence += 1
+                logger.debug(f"TCP->WS: conn_id={conn_id}, size={len(data)}, seq={sequence}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"TCP 读取错误: conn_id={conn_id}, {e}")
+
+    # ============== TCP 模式支持方法（WebSocket 消息处理） ==============
 
     async def _handle_tcp_data_from_client(self, message: TcpDataMessage) -> None:
         """
         处理从客户端接收的 TCP 数据
-        
-        将数据写入到对应的 TCP 连接
+
+        两种场景:
+        1. HTTP 触发的 TCP 转发 -> 累积到 PendingTcpRequest
+        2. 服务端 TCP 监听 -> 写入到真实 TCP 连接
         """
         import base64
-        
+
         try:
-            # 解码数据
             data = base64.b64decode(message.data)
-            # 写入到 TCP 连接
+
+            # 优先检查是否有待响应的 HTTP 触发的 TCP 请求
+            if await self.manager.handle_tcp_response_data(message.conn_id, data):
+                logger.debug(f"TCP 响应数据累积: conn_id={message.conn_id}, size={len(data)}")
+                return
+
+            # 其次检查是否有真实 TCP 连接（服务端监听场景）
             success = await self.manager.handle_tcp_data(message.conn_id, data)
             if not success:
-                logger.warning(f"写入 TCP 数据失败: {message.conn_id}")
+                logger.warning(f"无法路由 TCP 数据: conn_id={message.conn_id}")
         except Exception as e:
             logger.error(f"处理 TCP 数据错误: {message.conn_id}, {e}")
 
     async def _handle_tcp_close_from_client(self, message: TcpCloseMessage) -> None:
         """
         处理从客户端接收的 TCP 关闭消息
-        
-        关闭对应的 TCP 连接
+
+        两种场景:
+        1. HTTP 触发的 TCP 转发 -> 完成 PendingTcpRequest（解析 Future）
+        2. 服务端 TCP 监听 -> 关闭真实 TCP 连接
         """
         logger.info(f"客户端请求关闭 TCP 连接: {message.conn_id}")
+
+        # 优先检查是否有待响应的 HTTP 触发的 TCP 请求
+        if await self.manager.complete_tcp_request(message.conn_id, error=message.error):
+            logger.info(f"TCP 请求已完成: conn_id={message.conn_id}")
+            return
+
+        # 其次关闭真实 TCP 连接
         await self.manager.remove_tcp_connection(message.conn_id)
