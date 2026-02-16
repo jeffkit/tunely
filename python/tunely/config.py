@@ -45,6 +45,17 @@ class TunnelServerConfig(BaseSettings):
         default=None, description="管理 API 密钥（用于创建/删除隧道）"
     )
 
+    # TCP 监听配置（可选，启用后会监听 TCP 端口并通过隧道转发）
+    tcp_listen_port: int | None = Field(
+        default=None, description="TCP 监听端口（如果设置，服务端会监听此端口并转发到隧道客户端）"
+    )
+    tcp_listen_host: str = Field(
+        default="0.0.0.0", description="TCP 监听地址"
+    )
+    tcp_target_domain: str | None = Field(
+        default=None, description="TCP 转发目标域名（必须与某个隧道域名匹配）"
+    )
+
     # 用户提示信息
     instruction: str | None = Field(
         default=None, description="接入用户须知说明（在 /api/info 接口中返回）"

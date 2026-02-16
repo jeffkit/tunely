@@ -818,7 +818,7 @@ class TunnelServer:
         except Exception as e:
             logger.error(f"WebSocket 错误: {e}", exc_info=True)
         finally:
-            if token:
+            if token and success:
                 await self.manager.unregister(token)
 
     async def _create_tunnel(
