@@ -53,6 +53,7 @@ export class TunnelClient {
   private connected = false;
   private domain: string | null = null;
   private reconnectCount = 0;
+  private consecutiveRejectCount = 0;
   private events: TunnelClientEvents = {};
 
   constructor(config: TunnelClientConfig) {
@@ -106,11 +107,29 @@ export class TunnelClient {
           break;
         }
 
+        // Exponential backoff: base * 2^(attempts-1), capped at maxDelay
+        const baseInterval = this.config.reconnectInterval;
+        const errorMsg = String(error);
+        const isRejected = errorMsg.includes('already connected') || errorMsg.includes('已有活跃连接');
+        
+        if (isRejected) {
+          this.consecutiveRejectCount++;
+        } else {
+          this.consecutiveRejectCount = 0;
+        }
+
+        const backoffFactor = Math.min(this.reconnectCount + this.consecutiveRejectCount, 8);
+        const maxDelay = 300000; // 5 minutes max
+        const delay = Math.min(baseInterval * Math.pow(2, backoffFactor - 1), maxDelay);
+        // Add jitter (±20%) to prevent thundering herd
+        const jitter = delay * (0.8 + Math.random() * 0.4);
+        const actualDelay = Math.round(jitter);
+
         console.warn(
-          `连接断开: ${error}，${this.config.reconnectInterval / 1000}秒后重连 ` +
-            `(第 ${this.reconnectCount} 次)`
+          `连接断开: ${error}，${(actualDelay / 1000).toFixed(1)}秒后重连 ` +
+            `(第 ${this.reconnectCount} 次, backoff=${backoffFactor})`
         );
-        await this.sleep(this.config.reconnectInterval);
+        await this.sleep(actualDelay);
       }
     }
   }
@@ -186,6 +205,7 @@ export class TunnelClient {
     this.domain = message.domain;
     this.connected = true;
     this.reconnectCount = 0;
+    this.consecutiveRejectCount = 0;
     console.log(`已连接: domain=${this.domain}`);
     this.events.onConnect?.(this.domain);
   }
@@ -220,10 +240,25 @@ export class TunnelClient {
         body = request.body;
       }
 
+      // 清理转发的请求头，移除可能导致 fetch 失败的头部
+      const cleanHeaders: Record<string, string> = {};
+      if (request.headers) {
+        const skipHeaders = new Set([
+          'host', 'connection', 'keep-alive', 'transfer-encoding',
+          'te', 'trailer', 'upgrade', 'proxy-authorization',
+          'proxy-connection',
+        ]);
+        for (const [key, value] of Object.entries(request.headers)) {
+          if (!skipHeaders.has(key.toLowerCase())) {
+            cleanHeaders[key] = value;
+          }
+        }
+      }
+
       // 发送请求
       const fetchOptions: RequestInit = {
         method: request.method,
-        headers: request.headers,
+        headers: cleanHeaders,
         body: body,
       };
 
@@ -298,12 +333,16 @@ export class TunnelClient {
           durationMs
         );
       } else {
+        const errorDetail = error.cause
+          ? `${error.message} (cause: ${error.cause?.message || error.cause})`
+          : error.message;
+        console.error(`[Tunnel] Fetch error for ${request.method} ${request.path}: ${errorDetail}`);
         response = createResponse(
           request.id,
           500,
           null,
           {},
-          error.message,
+          errorDetail,
           durationMs
         );
       }

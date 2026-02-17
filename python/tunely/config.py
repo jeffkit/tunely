@@ -56,6 +56,11 @@ class TunnelServerConfig(BaseSettings):
         default=None, description="TCP 转发目标域名（必须与某个隧道域名匹配）"
     )
 
+    # JWT 认证（公网模式：需要 JWT 令牌才能创建隧道）
+    jwt_secret: str | None = Field(
+        default=None, description="JWT 共享密钥（设置后创建隧道需要 Bearer JWT 认证）"
+    )
+
     # 用户提示信息
     instruction: str | None = Field(
         default=None, description="接入用户须知说明（在 /api/info 接口中返回）"

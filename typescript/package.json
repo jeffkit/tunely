@@ -32,13 +32,14 @@
   "author": "HITL Team",
   "license": "MIT",
   "dependencies": {
-    "ws": "^8.16.0",
-    "commander": "^12.0.0"
+    "commander": "^12.0.0",
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/ws": "^8.5.10",
     "typescript": "^5.3.3",
+    "undici-types": "^7.22.0",
     "vitest": "^1.2.0"
   },
   "engines": {

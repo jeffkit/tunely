@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
+import jwt as pyjwt
 from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
@@ -561,8 +562,9 @@ class TunnelServer:
         async def create_tunnel(
             request: CreateTunnelRequest,
             x_api_key: str | None = Header(None, alias="x-api-key"),
+            authorization: str | None = Header(None),
         ):
-            return await self._create_tunnel(request, x_api_key)
+            return await self._create_tunnel(request, x_api_key, authorization)
 
         @self.router.get("/api/tunnels", response_model=list[TunnelInfo])
         async def list_tunnels(
@@ -636,12 +638,11 @@ class TunnelServer:
         @self.router.get("/api/info")
         async def get_server_info():
             """获取服务信息和域名配置规则"""
-            # 使用配置的 ws_url，或自动生成
             ws_url = self.config.ws_url or f"wss://{self.config.domain}{self.config.ws_path}"
             
-            result = {
+            result: dict[str, Any] = {
                 "name": "Tunely Server",
-                "version": "0.2.0",
+                "version": "0.2.1",
                 "domain": {
                     "pattern": f"{{subdomain}}.{self.config.domain}",
                     "customizable": "subdomain",
@@ -651,9 +652,12 @@ class TunnelServer:
                     "url": ws_url,
                 },
                 "protocols": ["https", "http"],
+                "auth": {
+                    "required": self.config.jwt_secret is not None,
+                    "type": "bearer" if self.config.jwt_secret else None,
+                },
             }
             
-            # 添加 instruction 字段（如果配置了）
             if self.config.instruction:
                 result["instruction"] = self.config.instruction
             
@@ -821,12 +825,42 @@ class TunnelServer:
             if token and success:
                 await self.manager.unregister(token)
 
+    def _verify_jwt_token(self, authorization: str | None) -> dict | None:
+        """验证 JWT Bearer token，返回 payload 或 None"""
+        if not self.config.jwt_secret:
+            return None
+
+        if not authorization:
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header required (Bearer <token>)"
+            )
+
+        parts = authorization.split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authorization format. Use: Bearer <token>"
+            )
+
+        token = parts[1]
+        try:
+            payload = pyjwt.decode(
+                token,
+                self.config.jwt_secret,
+                algorithms=["HS256"],
+            )
+            return payload
+        except pyjwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token has expired")
+        except pyjwt.InvalidTokenError as e:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
     async def _create_tunnel(
-        self, request: CreateTunnelRequest, api_key: str | None
+        self, request: CreateTunnelRequest, api_key: str | None, authorization: str | None = None
     ) -> CreateTunnelResponse:
-        """创建隧道 - 公开接口,不需要 API Key"""
-        # 移除 API Key 验证,允许用户自助创建隧道
-        # self._check_admin_api_key(api_key)
+        """创建隧道 - 支持 JWT 认证（公网模式）或无认证（内网模式）"""
+        jwt_payload = self._verify_jwt_token(authorization)
 
         if not self.db:
             raise HTTPException(status_code=500, detail="Database not initialized")
