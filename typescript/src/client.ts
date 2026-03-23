@@ -5,6 +5,7 @@
  */
 
 import WebSocket from 'ws';
+import { Agent } from 'undici';
 import {
   AuthMessage,
   AuthOkMessage,
@@ -255,27 +256,35 @@ export class TunnelClient {
         }
       }
 
-      // 发送请求
+      // request.timeout 单位是秒，this.config.requestTimeout 单位是毫秒
+      const timeoutSeconds = request.timeout ?? (this.config.requestTimeout / 1000);
+      const timeoutMs = timeoutSeconds * 1000;
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      // 自定义 undici Agent，确保 headersTimeout/bodyTimeout 与请求超时一致
+      // 不设置的话 undici 默认 headersTimeout=300s，Agent 处理慢时会先于 AbortController 触发
+      const dispatcher = new Agent({
+        headersTimeout: timeoutMs,
+        bodyTimeout: timeoutMs,
+        connectTimeout: 30_000,
+      });
+
       const fetchOptions: RequestInit = {
         method: request.method,
         headers: cleanHeaders,
         body: body,
       };
 
-      // request.timeout 单位是秒，this.config.requestTimeout 单位是毫秒
-      // 统一转换为秒：如果 request.timeout 存在则使用（秒），否则使用 config（毫秒转秒）
-      const timeoutSeconds = request.timeout ?? (this.config.requestTimeout / 1000);
-      const controller = new AbortController();
-      // setTimeout 需要毫秒，所以乘以 1000
-      const timeoutId = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
-
       try {
         const fetchResponse = await fetch(url, {
           ...fetchOptions,
           signal: controller.signal,
+          // @ts-expect-error Node.js fetch supports undici dispatcher option
+          dispatcher,
         });
 
-        clearTimeout(timeoutId);
         const responseHeaders = Object.fromEntries(fetchResponse.headers.entries());
 
         // 检查是否是 SSE 响应
@@ -305,10 +314,9 @@ export class TunnelClient {
           durationMs
         );
         ws.send(JSON.stringify(response));
-
-      } catch (error: any) {
+      } finally {
         clearTimeout(timeoutId);
-        throw error;
+        await dispatcher.close();
       }
     } catch (error: any) {
       const durationMs = Date.now() - startTime;
