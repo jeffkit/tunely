@@ -31,7 +31,7 @@ class TunnelServerConfig(BaseSettings):
     heartbeat_timeout: int = Field(default=90, description="心跳超时（秒）")
 
     # 请求配置
-    default_timeout: float = Field(default=300.0, description="默认请求超时（秒）")
+    default_timeout: float = Field(default=1800.0, description="默认请求超时（秒）")
     max_pending_requests: int = Field(default=1000, description="最大待处理请求数")
 
     # 分布式配置（可选）
@@ -93,7 +93,7 @@ class TunnelClientConfig(BaseSettings):
     force: bool = Field(default=False, description="是否强制抢占已有连接")
 
     # 请求配置
-    request_timeout: float = Field(default=300.0, description="请求超时（秒）")
+    request_timeout: float = Field(default=1800.0, description="请求超时（秒）")
 
     model_config = {
         "env_prefix": "WS_TUNNEL_CLIENT_",

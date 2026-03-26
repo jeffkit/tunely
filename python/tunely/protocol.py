@@ -94,7 +94,7 @@ class TunnelRequest(BaseModel):
     path: str = Field(..., description="请求路径，如 /api/chat")
     headers: dict[str, str] = Field(default_factory=dict, description="HTTP 请求头")
     body: str | None = Field(default=None, description="请求体（JSON 字符串或其他）")
-    timeout: float = Field(default=300.0, description="超时时间（秒）")
+    timeout: float = Field(default=1800.0, description="超时时间（秒）")
 
     # 元信息
     timestamp: str = Field(

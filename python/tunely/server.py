@@ -200,7 +200,7 @@ class ForwardRequest(BaseModel):
     path: str = "/"
     headers: dict[str, str] = {}
     body: Any = None
-    timeout: float = 300.0
+    timeout: float = 1800.0
 
 
 class ForwardResponse(BaseModel):
@@ -1072,7 +1072,7 @@ class TunnelServer:
         path: str = "/",
         headers: dict[str, str] | None = None,
         body: Any = None,
-        timeout: float = 300.0,
+        timeout: float = 1800.0,
     ) -> ForwardResponse:
         """
         转发请求到隧道（支持 HTTP 和 TCP 模式）
@@ -1446,7 +1446,7 @@ class TunnelServer:
         path: str = "/",
         headers: dict[str, str] | None = None,
         body: Any = None,
-        timeout: float = 300.0,
+        timeout: float = 1800.0,
     ) -> AsyncIterator[StreamStartMessage | StreamChunkMessage | StreamEndMessage]:
         """
         转发请求到隧道并返回流式响应（SSE 支持）
