@@ -272,18 +272,21 @@ class TunnelManager:
                 
                 # 检查旧连接是否健康（通过检查 WebSocket 状态）
                 try:
-                    # 尝试 ping 检查连接是否存活
-                    # WebSocket 的 client_state 可以告诉我们连接状态
                     is_healthy = old_conn.websocket.client_state.name == "CONNECTED"
                 except Exception:
                     is_healthy = False
                 
                 if is_healthy and not force:
-                    # 旧连接健康且不强制抢占，拒绝新连接
-                    logger.warning(f"拒绝新连接: domain={domain}，已有活跃连接")
-                    return (False, f"已有活跃连接存在，使用 --force 参数可强制抢占")
+                    seconds_since_heartbeat = (datetime.now() - old_conn.last_heartbeat).total_seconds()
+                    
+                    if seconds_since_heartbeat < 120:
+                        logger.warning(f"拒绝新连接: domain={domain}，已有活跃连接 (上次心跳 {seconds_since_heartbeat:.0f}s 前)")
+                        return (False, f"已有活跃连接存在，使用 --force 参数可强制抢占")
+                    else:
+                        logger.info(f"旧连接可能已过期 (上次心跳 {seconds_since_heartbeat:.0f}s 前)，自动替换: domain={domain}")
+                        force = True
                 
-                # 关闭旧连接（不健康或强制抢占）
+                # 关闭旧连接（不健康或强制抢占或过期）
                 try:
                     await old_conn.websocket.close(code=1000, reason="New connection (force)" if force else "Connection replaced")
                 except Exception:

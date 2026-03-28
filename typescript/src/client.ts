@@ -55,6 +55,7 @@ export class TunnelClient {
   private domain: string | null = null;
   private reconnectCount = 0;
   private consecutiveRejectCount = 0;
+  private wasConnectedBefore = false;
   private events: TunnelClientEvents = {};
 
   constructor(config: TunnelClientConfig) {
@@ -94,6 +95,13 @@ export class TunnelClient {
     while (this.running) {
       try {
         await this.connectAndRun();
+        if (!this.running) break;
+        this.connected = false;
+        this.events.onDisconnect?.();
+        const reconnectDelay = this.config.reconnectInterval;
+        console.warn(`连接已关闭，${(reconnectDelay / 1000).toFixed(1)}秒后重连`);
+        await this.sleep(reconnectDelay);
+        continue;
       } catch (error) {
         if (!this.running) break;
 
@@ -151,8 +159,8 @@ export class TunnelClient {
       this.ws = ws;
 
       ws.on('open', () => {
-        // 发送认证消息
-        const authMessage = createAuthMessage(this.config.token, this.config.force);
+        const useForce = this.config.force || (this.wasConnectedBefore && this.consecutiveRejectCount > 0);
+        const authMessage = createAuthMessage(this.config.token, useForce);
         ws.send(JSON.stringify(authMessage));
       });
 
@@ -205,6 +213,7 @@ export class TunnelClient {
   private handleAuthOk(message: AuthOkMessage): void {
     this.domain = message.domain;
     this.connected = true;
+    this.wasConnectedBefore = true;
     this.reconnectCount = 0;
     this.consecutiveRejectCount = 0;
     console.log(`已连接: domain=${this.domain}`);
