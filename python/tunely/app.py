@@ -60,6 +60,9 @@ class AppSettings(BaseSettings):
     # 管理 API 密钥（可选）
     admin_api_key: str | None = None
     
+    # JWT 共享密钥（设置后创建隧道需要 Bearer JWT 认证）
+    jwt_secret: str | None = None
+    
     # 请求超时（秒）
     request_timeout: float = 300.0
     
@@ -143,6 +146,7 @@ def create_full_app(
     domain: str = "localhost",
     database_url: str = "sqlite+aiosqlite:///./data/tunely.db",
     admin_api_key: str | None = None,
+    jwt_secret: str | None = None,
     ws_path: str = "/ws/tunnel",
 ) -> FastAPI:
     """
@@ -152,6 +156,7 @@ def create_full_app(
         domain: 顶级域名
         database_url: 数据库连接 URL
         admin_api_key: 管理 API 密钥
+        jwt_secret: JWT 共享密钥
         ws_path: WebSocket 路径
         
     Returns:
@@ -162,6 +167,7 @@ def create_full_app(
         domain=domain,
         database_url=database_url,
         admin_api_key=admin_api_key,
+        jwt_secret=jwt_secret,
         ws_path=ws_path,
     )
     
@@ -172,6 +178,7 @@ def create_full_app(
             database_url=database_url,
             ws_path=ws_path,
             admin_api_key=admin_api_key,
+            jwt_secret=jwt_secret,
         )
     )
     
@@ -426,6 +433,7 @@ def run_app(
     domain: str = "localhost",
     database_url: str = "sqlite+aiosqlite:///./data/tunely.db",
     admin_api_key: str | None = None,
+    jwt_secret: str | None = None,
     ws_path: str = "/ws/tunnel",
 ):
     """
@@ -437,6 +445,7 @@ def run_app(
         domain: 顶级域名
         database_url: 数据库连接 URL
         admin_api_key: 管理 API 密钥
+        jwt_secret: JWT 共享密钥
         ws_path: WebSocket 路径
     """
     import uvicorn
@@ -448,6 +457,7 @@ def run_app(
         domain=domain,
         database_url=database_url,
         admin_api_key=admin_api_key,
+        jwt_secret=jwt_secret,
         ws_path=ws_path,
     )
     
@@ -456,6 +466,7 @@ def run_app(
         domain=domain,
         database_url=database_url,
         admin_api_key=admin_api_key,
+        jwt_secret=jwt_secret,
         ws_path=ws_path,
     )
     
@@ -481,5 +492,6 @@ if __name__ == "__main__":
         domain=env_settings.domain,
         database_url=env_settings.database_url,
         admin_api_key=env_settings.admin_api_key,
+        jwt_secret=env_settings.jwt_secret,
         ws_path=env_settings.ws_path,
     )
