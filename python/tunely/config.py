@@ -71,6 +71,10 @@ class TunnelServerConfig(BaseSettings):
         default=None,
         description="as-dispatch webhook 地址（如 http://localhost:8083），设置后客户端连接时会发送通知",
     )
+    dispatch_webhook_secret: str | None = Field(
+        default=None,
+        description="Webhook HMAC-SHA256 共享密钥（env: WS_TUNNEL_DISPATCH_WEBHOOK_SECRET），设置后每次请求附加 X-Webhook-Signature 头",
+    )
 
     model_config = {
         "env_prefix": "WS_TUNNEL_",

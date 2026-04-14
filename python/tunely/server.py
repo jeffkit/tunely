@@ -28,6 +28,8 @@ WS-Tunnel 服务端 SDK
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -527,6 +529,7 @@ class TunnelServer:
         self.manager = TunnelManager()
         self.router = APIRouter(tags=["Tunnel"])
         self._tcp_server: asyncio.Server | None = None
+        self._background_tasks: set[asyncio.Task] = set()
 
         # 注册路由
         self._register_routes()
@@ -676,9 +679,18 @@ class TunnelServer:
             return
         url = f"{self.config.dispatch_webhook_url.rstrip('/')}/api/tunnel/connected"
         payload = {"domain": domain, "event": "connected"}
+        body_bytes = json.dumps(payload, separators=(",", ":")).encode()
+        headers: dict[str, str] = {}
+        if self.config.dispatch_webhook_secret:
+            digest = hmac.new(
+                self.config.dispatch_webhook_secret.encode(),
+                body_bytes,
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-Webhook-Signature"] = f"sha256={digest}"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(url, json=payload)
+                resp = await client.post(url, content=body_bytes, headers={**headers, "Content-Type": "application/json"})
                 logger.info(f"连接 webhook 已发送: domain={domain}, status={resp.status_code}")
         except Exception as e:
             logger.warning(f"连接 webhook 发送失败（忽略）: domain={domain}, error={e}")
@@ -722,6 +734,7 @@ class TunnelServer:
 
         token: str | None = None
         tunnel_domain: str | None = None
+        success: bool = False
 
         try:
             # 等待认证消息
@@ -801,7 +814,9 @@ class TunnelServer:
                 )
 
                 # 发送连接 webhook（fire-and-forget）
-                asyncio.create_task(self._notify_connected(tunnel.domain))
+                task = asyncio.create_task(self._notify_connected(tunnel.domain))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
             # 处理消息循环
             while True:
