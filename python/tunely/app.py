@@ -474,8 +474,8 @@ def run_app(
         full_app,
         host=host,
         port=port,
-        ws_ping_interval=None,
-        ws_ping_timeout=None,
+        ws_ping_interval=30,   # 每 30s 向客户端发 WebSocket ping，检测静默死连接
+        ws_ping_timeout=10,    # 10s 内未收到 pong 则关闭连接
     )
 
 

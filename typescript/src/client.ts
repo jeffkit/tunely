@@ -189,8 +189,14 @@ export class TunnelClient {
       });
 
       ws.on('close', () => {
+        const wasConnected = this.connected;
         this.connected = false;
         this.domain = null;
+        // 无论是正常关闭还是异常关闭，只要之前是已连接状态，都需要触发 onDisconnect
+        // 否则调用方（如 tunnelService）的状态会停留在 connected=true，导致 UI 显示误连接
+        if (wasConnected) {
+          this.events.onDisconnect?.();
+        }
         resolve();
       });
 
