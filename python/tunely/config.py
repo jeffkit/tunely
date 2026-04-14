@@ -66,6 +66,12 @@ class TunnelServerConfig(BaseSettings):
         default=None, description="接入用户须知说明（在 /api/info 接口中返回）"
     )
 
+    # Webhook 通知（用于 as-dispatch ACN Inbox 集成）
+    dispatch_webhook_url: str | None = Field(
+        default=None,
+        description="as-dispatch webhook 地址（如 http://localhost:8083），设置后客户端连接时会发送通知",
+    )
+
     model_config = {
         "env_prefix": "WS_TUNNEL_",
         "env_file": ".env",

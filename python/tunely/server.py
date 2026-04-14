@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
+import httpx
 import jwt as pyjwt
 from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -669,6 +670,19 @@ class TunnelServer:
             if api_key != self.config.admin_api_key:
                 raise HTTPException(status_code=401, detail="Invalid API key")
 
+    async def _notify_connected(self, domain: str) -> None:
+        """向 as-dispatch 发送客户端连接 webhook（fire-and-forget）"""
+        if not self.config.dispatch_webhook_url:
+            return
+        url = f"{self.config.dispatch_webhook_url.rstrip('/')}/api/tunnel/connected"
+        payload = {"domain": domain, "event": "connected"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, json=payload)
+                logger.info(f"连接 webhook 已发送: domain={domain}, status={resp.status_code}")
+        except Exception as e:
+            logger.warning(f"连接 webhook 发送失败（忽略）: domain={domain}, error={e}")
+
     # 域名格式：字母数字开头，可包含中划线，长度 1-63
     DOMAIN_PATTERN = re.compile(r"^[a-zA-Z0-9][-a-zA-Z0-9]{0,62}$")
 
@@ -785,6 +799,9 @@ class TunnelServer:
                         tunnel_id=str(tunnel.id),
                     ).model_dump_json()
                 )
+
+                # 发送连接 webhook（fire-and-forget）
+                asyncio.create_task(self._notify_connected(tunnel.domain))
 
             # 处理消息循环
             while True:
