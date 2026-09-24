@@ -19,6 +19,11 @@ export enum MessageType {
   STREAM_CHUNK = 'stream_chunk',
   STREAM_END = 'stream_end',
 
+  // TCP 模式
+  TCP_CONNECT = 'tcp_connect',
+  TCP_DATA = 'tcp_data',
+  TCP_CLOSE = 'tcp_close',
+
   // 心跳
   PING = 'ping',
   PONG = 'pong',
@@ -97,6 +102,30 @@ export interface StreamEndMessage {
   timestamp?: string;
 }
 
+// ============== TCP 模式消息 ==============
+
+export interface TcpConnectMessage {
+  type: MessageType.TCP_CONNECT;
+  conn_id: string;
+  timestamp?: string;
+}
+
+export interface TcpDataMessage {
+  type: MessageType.TCP_DATA;
+  conn_id: string;
+  /** Base64 编码的二进制数据 */
+  data: string;
+  sequence?: number;
+  timestamp?: string;
+}
+
+export interface TcpCloseMessage {
+  type: MessageType.TCP_CLOSE;
+  conn_id: string;
+  error?: string | null;
+  timestamp?: string;
+}
+
 // ============== 心跳消息 ==============
 
 export interface PingMessage {
@@ -120,6 +149,9 @@ export type Message =
   | StreamStartMessage
   | StreamChunkMessage
   | StreamEndMessage
+  | TcpConnectMessage
+  | TcpDataMessage
+  | TcpCloseMessage
   | PingMessage
   | PongMessage;
 

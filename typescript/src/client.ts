@@ -6,6 +6,7 @@
 
 import WebSocket from 'ws';
 import { Agent } from 'undici';
+import * as net from 'net';
 import {
   AuthMessage,
   AuthOkMessage,
@@ -21,6 +22,9 @@ import {
   StreamStartMessage,
   StreamChunkMessage,
   StreamEndMessage,
+  TcpConnectMessage,
+  TcpDataMessage,
+  TcpCloseMessage,
 } from './protocol.js';
 
 export interface TunnelClientConfig {
@@ -47,6 +51,15 @@ export interface TunnelClientEvents {
   onError?: (error: Error) => void;
 }
 
+/** 单个本地 TCP 连接的状态（TCP 模式） */
+interface TcpConnState {
+  socket: net.Socket;
+  /** 发往服务端的下一个数据包序号 */
+  sequence: number;
+  /** 是否已发送过 tcp_close（保证幂等） */
+  closeSent: boolean;
+}
+
 export class TunnelClient {
   private config: Required<TunnelClientConfig>;
   private ws: WebSocket | null = null;
@@ -58,6 +71,12 @@ export class TunnelClient {
   private wasConnectedBefore = false;
   private events: TunnelClientEvents = {};
 
+  // TCP 模式：conn_id -> 本地连接状态
+  private tcpConnections: Map<string, TcpConnState> = new Map();
+  // TCP 模式：目标服务地址（从 targetUrl 解析）
+  private targetHost = 'localhost';
+  private targetPort = 8080;
+
   constructor(config: TunnelClientConfig) {
     this.config = {
       serverUrl: config.serverUrl,
@@ -68,6 +87,7 @@ export class TunnelClient {
       requestTimeout: config.requestTimeout ?? 300000,
       force: config.force ?? false,
     };
+    this.parseTargetUrl();
   }
 
   /** 是否已连接 */
@@ -146,8 +166,28 @@ export class TunnelClient {
   /** 停止客户端 */
   stop(): void {
     this.running = false;
+    this.cleanupTcpConnections();
     if (this.ws) {
       this.ws.close();
+    }
+  }
+
+  /**
+   * 解析目标 URL，提取主机和端口（TCP 模式使用）
+   */
+  private parseTargetUrl(): void {
+    try {
+      const url = new URL(this.config.targetUrl);
+      this.targetHost = url.hostname || 'localhost';
+      this.targetPort = url.port
+        ? parseInt(url.port, 10)
+        : url.protocol === 'https:'
+          ? 443
+          : 80;
+    } catch {
+      console.warn(`解析目标 URL 失败: ${this.config.targetUrl}，使用默认值 localhost:8080`);
+      this.targetHost = 'localhost';
+      this.targetPort = 8080;
     }
   }
 
@@ -187,6 +227,18 @@ export class TunnelClient {
               await this.handleRequest(message as TunnelRequest, ws);
               break;
 
+            case MessageType.TCP_CONNECT:
+              this.handleTcpConnect(message as TcpConnectMessage, ws);
+              break;
+
+            case MessageType.TCP_DATA:
+              this.handleTcpData(message as TcpDataMessage);
+              break;
+
+            case MessageType.TCP_CLOSE:
+              this.handleTcpClose(message as TcpCloseMessage);
+              break;
+
             default:
               console.warn(`未知消息类型: ${message.type}`);
           }
@@ -197,6 +249,8 @@ export class TunnelClient {
       });
 
       ws.on('close', () => {
+        // WebSocket 断开后服务端会重新分配 conn_id，旧本地连接全部丢弃，防止泄漏
+        this.cleanupTcpConnections();
         const wasConnected = this.connected;
         this.connected = false;
         this.domain = null;
@@ -435,6 +489,123 @@ export class TunnelClient {
       timestamp: new Date().toISOString(),
     };
     ws.send(JSON.stringify(endMsg));
+  }
+
+  // ============== TCP 模式处理方法 ==============
+
+  /**
+   * 处理 TCP 连接建立请求：建立到本地目标服务的连接
+   */
+  private handleTcpConnect(message: TcpConnectMessage, ws: WebSocket): void {
+    const connId = message.conn_id;
+
+    if (this.tcpConnections.has(connId)) {
+      console.warn(`TCP 连接已存在，忽略重复的 tcp_connect: ${connId}`);
+      return;
+    }
+
+    const state: TcpConnState = {
+      socket: net.connect({ host: this.targetHost, port: this.targetPort }),
+      sequence: 0,
+      closeSent: false,
+    };
+    this.tcpConnections.set(connId, state);
+
+    state.socket.on('data', (data: Buffer) => {
+      const msg: TcpDataMessage = {
+        type: MessageType.TCP_DATA,
+        conn_id: connId,
+        data: data.toString('base64'),
+        sequence: state.sequence++,
+        timestamp: new Date().toISOString(),
+      };
+      this.sendToWs(ws, JSON.stringify(msg));
+    });
+
+    // 连接失败（如目标端口拒绝）：向服务端回执带 error 的 tcp_close，由其关闭外部连接
+    state.socket.on('error', (error: Error) => {
+      console.error(
+        `TCP 连接错误: ${connId} -> ${this.targetHost}:${this.targetPort}, ${error.message}`
+      );
+      this.sendTcpClose(ws, connId, state, error.message);
+    });
+
+    // 默认 allowHalfOpen=false：'end'（对端 FIN）后本端也会结束，最终都以 'close' 收场。
+    // 'error' 之后也必然触发 'close'，配合 closeSent 幂等标记保证只回执一个 tcp_close。
+    state.socket.on('close', () => {
+      this.sendTcpClose(ws, connId, state);
+      this.tcpConnections.delete(connId);
+    });
+  }
+
+  /**
+   * 处理来自服务端的 TCP 数据：解码后写入本地连接
+   */
+  private handleTcpData(message: TcpDataMessage): void {
+    const state = this.tcpConnections.get(message.conn_id);
+    if (!state) {
+      console.warn(`收到未知 TCP 连接的数据: ${message.conn_id}`);
+      return;
+    }
+
+    const data = Buffer.from(message.data, 'base64');
+    state.socket.write(data);
+  }
+
+  /**
+   * 处理服务端发起的 TCP 关闭：销毁本地连接，不回执 tcp_close
+   */
+  private handleTcpClose(message: TcpCloseMessage): void {
+    const state = this.tcpConnections.get(message.conn_id);
+    if (!state) {
+      console.warn(`尝试关闭未知 TCP 连接: ${message.conn_id}`);
+      return;
+    }
+
+    this.tcpConnections.delete(message.conn_id);
+    state.closeSent = true;
+    state.socket.destroy();
+  }
+
+  /**
+   * 向服务端回执 tcp_close（幂等：每条连接最多发送一次）
+   */
+  private sendTcpClose(
+    ws: WebSocket,
+    connId: string,
+    state: TcpConnState,
+    error?: string
+  ): void {
+    if (state.closeSent) return;
+    state.closeSent = true;
+
+    const msg: TcpCloseMessage = {
+      type: MessageType.TCP_CLOSE,
+      conn_id: connId,
+      error: error ?? null,
+      timestamp: new Date().toISOString(),
+    };
+    this.sendToWs(ws, JSON.stringify(msg));
+  }
+
+  /**
+   * 丢弃全部本地 TCP 连接（WebSocket 断开或客户端停止时调用）
+   *
+   * 服务端重连后会分配新的 conn_id，旧连接无法恢复；
+   * WS 已断开，回执无从发送，直接静默销毁防止 socket 泄漏。
+   */
+  private cleanupTcpConnections(): void {
+    for (const state of this.tcpConnections.values()) {
+      state.closeSent = true;
+      state.socket.destroy();
+    }
+    this.tcpConnections.clear();
+  }
+
+  private sendToWs(ws: WebSocket, data: string): void {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
   }
 
   private sleep(ms: number): Promise<void> {
