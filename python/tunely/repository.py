@@ -26,6 +26,7 @@ class TunnelRepository:
         token: str | None = None,
         name: str | None = None,
         description: str | None = None,
+        mode: str = "http",
     ) -> Tunnel:
         """
         创建隧道
@@ -35,6 +36,7 @@ class TunnelRepository:
             token: 连接令牌（可选，不提供则自动生成）
             name: 隧道名称（可选）
             description: 隧道描述（可选）
+            mode: 隧道模式: http/tcp
 
         Returns:
             创建的隧道对象
@@ -47,6 +49,7 @@ class TunnelRepository:
             token=token,
             name=name,
             description=description,
+            mode=mode,
             enabled=True,
         )
         self.session.add(tunnel)

@@ -167,10 +167,17 @@ def tunnel():
 @click.argument("domain")
 @click.option("--name", "-n", help="隧道名称")
 @click.option("--description", "-d", help="隧道描述")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["http", "tcp"]),
+    default="http",
+    help="隧道模式: http（应用层转发）/ tcp（传输层原始转发）",
+)
 @click.option("--server", "-s", default="http://localhost:8000", help="服务端 URL")
 @click.option("--api-key", "-k", help="管理 API 密钥")
 def tunnel_create(
-    domain: str, name: str, description: str, server: str, api_key: str
+    domain: str, name: str, description: str, mode: str, server: str, api_key: str
 ):
     """创建隧道"""
     import httpx
@@ -182,7 +189,12 @@ def tunnel_create(
     try:
         response = httpx.post(
             f"{server}/api/tunnels",
-            json={"domain": domain, "name": name, "description": description},
+            json={
+                "domain": domain,
+                "name": name,
+                "description": description,
+                "mode": mode,
+            },
             headers=headers,
         )
 
@@ -191,6 +203,7 @@ def tunnel_create(
             console.print(f"[green]✓[/green] 隧道已创建")
             console.print(f"  域名: {data['domain']}")
             console.print(f"  令牌: [bold]{data['token']}[/bold]")
+            console.print(f"  模式: {data.get('mode', 'http')}")
             console.print()
             console.print("[dim]使用以下命令连接:[/dim]")
             console.print(f"  ws-tunnel connect --token {data['token']} --target http://localhost:8080")

@@ -36,15 +36,16 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 import httpx
 import jwt as pyjwt
 from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .config import TunnelServerConfig
 from .database import DatabaseManager
+from .models import Tunnel
 from .protocol import (
     AuthErrorMessage,
     AuthMessage,
@@ -146,9 +147,13 @@ class PendingTcpRequest:
 class CreateTunnelRequest(BaseModel):
     """创建隧道请求"""
 
+    # extra="forbid"：服务端未实现的字段直接报错，而不是静默丢弃（issue #2）
+    model_config = ConfigDict(extra="forbid")
+
     domain: str
     name: str | None = None
     description: str | None = None
+    mode: Literal["http", "tcp"] = "http"
 
 
 class CreateTunnelResponse(BaseModel):
@@ -157,6 +162,7 @@ class CreateTunnelResponse(BaseModel):
     domain: str
     token: str
     name: str | None = None
+    mode: str = "http"
 
 
 class CheckAvailabilityResponse(BaseModel):
@@ -173,6 +179,7 @@ class TunnelInfo(BaseModel):
     domain: str
     name: str | None = None
     description: str | None = None
+    mode: str = "http"
     enabled: bool
     connected: bool
     token: str | None = None  # 可选，仅在需要时返回
@@ -184,9 +191,12 @@ class TunnelInfo(BaseModel):
 class UpdateTunnelRequest(BaseModel):
     """更新隧道请求"""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = None
     description: str | None = None
     enabled: bool | None = None
+    mode: Literal["http", "tcp"] | None = None
 
 
 class RegenerateTokenResponse(BaseModel):
@@ -912,6 +922,7 @@ class TunnelServer:
                 domain=request.domain,
                 name=request.name,
                 description=request.description,
+                mode=request.mode,
             )
 
             await session.commit()
@@ -921,6 +932,7 @@ class TunnelServer:
                 domain=tunnel.domain,
                 token=tunnel.token,
                 name=tunnel.name,
+                mode=tunnel.mode,
             )
 
     async def _list_tunnels(self, api_key: str | None) -> list[TunnelInfo]:
@@ -940,6 +952,7 @@ class TunnelServer:
                     domain=t.domain,
                     name=t.name,
                     description=t.description,
+                    mode=t.mode,
                     enabled=t.enabled,
                     connected=self.manager.is_connected(t.domain),
                     created_at=t.created_at.isoformat() if t.created_at else None,
@@ -969,6 +982,7 @@ class TunnelServer:
                 domain=tunnel.domain,
                 name=tunnel.name,
                 description=tunnel.description,
+                mode=tunnel.mode,
                 enabled=tunnel.enabled,
                 connected=self.manager.is_connected(tunnel.domain),
                 created_at=tunnel.created_at.isoformat() if tunnel.created_at else None,
@@ -1002,6 +1016,9 @@ class TunnelServer:
                 update_values['description'] = request.description
             if request.enabled is not None:
                 update_values['enabled'] = request.enabled
+            if request.mode is not None:
+                update_values['mode'] = request.mode
+            if update_values:
                 update_values['updated_at'] = datetime.now(timezone.utc)
 
             if update_values:
@@ -1018,6 +1035,7 @@ class TunnelServer:
                 domain=tunnel.domain,
                 name=tunnel.name,
                 description=tunnel.description,
+                mode=tunnel.mode,
                 enabled=tunnel.enabled,
                 connected=self.manager.is_connected(tunnel.domain),
                 created_at=tunnel.created_at.isoformat() if tunnel.created_at else None,

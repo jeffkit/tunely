@@ -39,10 +39,16 @@ curl -X POST http://localhost:8000/api/tunnels \
 ### 2. 启动客户端
 
 ```bash
-tunely client \
-  --server-url wss://your-server.com/ws/tunnel \
+tunely connect \
+  --server wss://your-server.com/ws/tunnel \
   --token tun_xxxxxxxxxxxxxx \
-  --target-url http://localhost:8080
+  --target http://localhost:8080
+```
+
+也可以在 CLI 创建隧道时直接指定模式：
+
+```bash
+tunely tunnel create my-tcp-tunnel --mode tcp --api-key your-api-key
 ```
 
 或使用 Python SDK：
