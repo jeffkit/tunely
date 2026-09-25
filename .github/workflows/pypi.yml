@@ -12,7 +12,9 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    working-directory: python
+    defaults:
+      run:
+        working-directory: python
     steps:
       - uses: actions/checkout@v4
 
