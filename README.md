@@ -7,7 +7,9 @@ WebSocket 透明反向代理隧道，支持服务端嵌入和客户端 SDK。
 - 🔌 **透明代理**：HTTP 请求通过 WebSocket 隧道转发，本地服务无感知
 - 🏠 **服务端 SDK**：可嵌入到 FastAPI 应用中
 - 🖥️ **客户端 SDK**：Python / TypeScript / Rust 三版本，支持独立运行和嵌入使用
-- 🦀 **Rust 客户端**：单个静态二进制、零运行时依赖（见 `rust/`），适合内网机器分发部署
+- 🦀 **Rust 客户端**：单个静态二进制、零运行时依赖（见 `rust/`），适合内网机器分发部署（crates.io: `cargo install tunely`）
+- 🐳 **Docker**：服务端镜像 ghcr.io/jeffkit/tunely（python-v* tag 自动构建）
+- 🔐 **多隧道**：`WS_TUNNEL_TCP_LISTEN="9080:dsh,9081:foo"` 一实例多端口、每端口绑一条隧道；API 暴露每隧道流量统计
 - 🔐 **预注册机制**：域名 + Token 认证，安全可控
 - 💾 **数据库支持**：SQLAlchemy 支持 SQLite / MySQL / PostgreSQL
 - 📦 **数据迁移**：Alembic 管理数据库 Schema
@@ -158,6 +160,21 @@ packages/ws-tunnel/
 当前协议版本：**1.0**
 
 详见 [PROTOCOL.md](docs/PROTOCOL.md)
+
+## Docker
+
+服务端镜像自动构建到 `ghcr.io/jeffkit/tunely`（推 `python-v*` tag 触发）：
+
+```bash
+docker run -d -p 8000:8000 -p 9080:9080 \
+  -e WS_TUNNEL_TCP_LISTEN="9080:dsh" \
+  ghcr.io/jeffkit/tunely:latest \
+  tunely serve --host 0.0.0.0 --port 8000 --api-key <KEY> \
+    --database sqlite+aiosqlite:////data/tunely.db
+```
+
+本地编排示例见 `docker-compose.yml`。注意：容器内监听地址须为 0.0.0.0，
+公网暴露面由端口映射与宿主防火墙控制。
 
 ## License
 

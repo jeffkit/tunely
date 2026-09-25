@@ -55,6 +55,11 @@ class TunnelServerConfig(BaseSettings):
     tcp_target_domain: str | None = Field(
         default=None, description="TCP 转发目标域名（必须与某个隧道域名匹配）"
     )
+    tcp_listen: str | None = Field(
+        default=None,
+        description="多监听器配置（可选）：'port:domain[,port:domain...]'，"
+        "每个端口固定绑定一条隧道；与 tcp_listen_port 可并用，同端口时本字段优先",
+    )
 
     # JWT 认证（公网模式：需要 JWT 令牌才能创建隧道）
     jwt_secret: str | None = Field(

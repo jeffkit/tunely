@@ -1,0 +1,38 @@
+# Tunely Server 单机编排示例
+#
+# 用法:
+#   docker compose up -d
+#
+# 客户端（内网机器）连接: ws://<host>:8000/ws/tunnel
+# 隧道出口: <host>:9080 -> 域名 dsh 对应的隧道
+services:
+  tunely:
+    build:
+      context: ./python
+    container_name: tunely-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # 隧道 WebSocket 接入（公网需经 nginx 反代 + TLS，不建议直接暴露）
+      - "9080:9080" # TCP 出口（映射给 nginx 转发）
+    environment:
+      # serve CLI 不读 TUNELY_* env，host/port/database/api-key 走 command
+      # TCP 监听经 WS_TUNNEL_* env 注入；多隧道用 WS_TUNNEL_TCP_LISTEN="9080:dsh,9081:foo"
+      WS_TUNNEL_TCP_LISTEN: "9080:dsh"
+      WS_TUNNEL_TCP_LISTEN_HOST: "0.0.0.0"
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --domain
+      - example.com
+      - --database
+      - sqlite+aiosqlite:////data/tunely.db
+      - --api-key
+      - change-me-to-a-random-key
+    volumes:
+      - tunely-data:/data
+
+volumes:
+  tunely-data:

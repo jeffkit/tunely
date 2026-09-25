@@ -181,6 +181,8 @@ class TunnelInfo(BaseModel):
     description: str | None = None
     mode: str = "http"
     enabled: bool
+    bytes_in: int = 0
+    bytes_out: int = 0
     connected: bool
     token: str | None = None  # 可选，仅在需要时返回
     created_at: str | None = None
@@ -451,6 +453,28 @@ class TunnelManager:
         """获取 TCP 连接"""
         return self._tcp_connections.get(conn_id)
 
+    async def close_all_tcp_connections(self) -> None:
+        """关闭全部活跃外部 TCP 连接（服务端优雅停机时调用）"""
+        states = list(self._tcp_connections.values())
+        for tcp_conn in states:
+            tcp_conn.closed = True
+            if tcp_conn.read_task:
+                tcp_conn.read_task.cancel()
+            if tcp_conn.writer:
+                try:
+                    tcp_conn.writer.close()
+                except Exception:
+                    pass
+        for tcp_conn in states:
+            if tcp_conn.writer:
+                try:
+                    await tcp_conn.writer.wait_closed()
+                except Exception:
+                    pass
+        self._tcp_connections.clear()
+        if states:
+            logger.info(f"已关闭 {len(states)} 个活跃 TCP 连接")
+
     async def remove_tcp_connection(self, conn_id: str) -> None:
         """移除 TCP 连接"""
         tcp_conn = self._tcp_connections.pop(conn_id, None)
@@ -541,7 +565,12 @@ class TunnelServer:
         self.db: DatabaseManager | None = None
         self.manager = TunnelManager()
         self.router = APIRouter(tags=["Tunnel"])
-        self._tcp_server: asyncio.Server | None = None
+        self._tcp_servers: list[asyncio.Server] = []
+        # 监听端口 -> 绑定的隧道域名（多监听器路由）
+        self._listener_domains: dict[int, str] = {}
+        # 每隧道流量统计（内存态，重启归零）：domain -> {"bytes_in": n, "bytes_out": n}
+        # bytes_in = 外部 → 内网服务；bytes_out = 内网服务 → 外部
+        self._tunnel_bytes: dict[str, dict[str, int]] = {}
         self._background_tasks: set[asyncio.Task] = set()
 
         # 注册路由
@@ -554,16 +583,21 @@ class TunnelServer:
         logger.info("TunnelServer 初始化完成")
 
         # 如果配置了 TCP 监听端口，启动 TCP 监听
-        if self.config.tcp_listen_port:
-            await self._start_tcp_listener()
+        await self._start_tcp_listeners()
 
     async def close(self) -> None:
         """关闭服务器"""
-        # 关闭 TCP 监听器
-        if self._tcp_server:
-            self._tcp_server.close()
-            await self._tcp_server.wait_closed()
-            logger.info("TCP 监听器已关闭")
+        # 先清理活跃的外部 TCP 连接（否则 wait_closed 会等它们自然结束）
+        await self.manager.close_all_tcp_connections()
+        # 关闭全部 TCP 监听器
+        for tcp_server in self._tcp_servers:
+            tcp_server.close()
+        for tcp_server in self._tcp_servers:
+            await tcp_server.wait_closed()
+        if self._tcp_servers:
+            logger.info(f"TCP 监听器已关闭（{len(self._tcp_servers)} 个）")
+        self._tcp_servers = []
+        self._listener_domains.clear()
         if self.db:
             await self.db.close()
         logger.info("TunnelServer 已关闭")
@@ -657,9 +691,14 @@ class TunnelServer:
             """获取服务信息和域名配置规则"""
             ws_url = self.config.ws_url or f"wss://{self.config.domain}{self.config.ws_path}"
             
+            try:
+                from importlib.metadata import version as _pkg_version
+                server_version = _pkg_version("tunely")
+            except Exception:
+                server_version = "unknown"
             result: dict[str, Any] = {
                 "name": "Tunely Server",
-                "version": "0.2.1",
+                "version": server_version,
                 "domain": {
                     "pattern": f"{{subdomain}}.{self.config.domain}",
                     "customizable": "subdomain",
@@ -905,6 +944,9 @@ class TunnelServer:
         self, request: CreateTunnelRequest, api_key: str | None, authorization: str | None = None
     ) -> CreateTunnelResponse:
         """创建隧道 - 支持 JWT 认证（公网模式）或无认证（内网模式）"""
+        # 配置了 admin api-key 时，创建与查询/删除同样强制鉴权（0.5.0 起；
+        # 未配置 key 的部署保持内网模式语义不变）
+        self._check_admin_api_key(api_key)
         jwt_payload = self._verify_jwt_token(authorization)
 
         if not self.db:
@@ -954,6 +996,7 @@ class TunnelServer:
                     description=t.description,
                     mode=t.mode,
                     enabled=t.enabled,
+                    **self._tunnel_byte_stats(t.domain),
                     connected=self.manager.is_connected(t.domain),
                     created_at=t.created_at.isoformat() if t.created_at else None,
                     last_connected_at=(
@@ -984,6 +1027,7 @@ class TunnelServer:
                 description=tunnel.description,
                 mode=tunnel.mode,
                 enabled=tunnel.enabled,
+                **self._tunnel_byte_stats(tunnel.domain),
                 connected=self.manager.is_connected(tunnel.domain),
                 created_at=tunnel.created_at.isoformat() if tunnel.created_at else None,
                 last_connected_at=(
@@ -1037,6 +1081,7 @@ class TunnelServer:
                 description=tunnel.description,
                 mode=tunnel.mode,
                 enabled=tunnel.enabled,
+                **self._tunnel_byte_stats(tunnel.domain),
                 connected=self.manager.is_connected(tunnel.domain),
                 created_at=tunnel.created_at.isoformat() if tunnel.created_at else None,
                 last_connected_at=(
@@ -1601,35 +1646,89 @@ class TunnelServer:
 
     # ============== TCP 监听端口场景 ==============
 
-    async def _start_tcp_listener(self) -> None:
-        """
-        启动 TCP 监听器
+    def _count_tunnel_bytes(self, domain: str, direction: str, n: int) -> None:
+        """累计每隧道流量（内存态，重启归零）"""
+        stats = self._tunnel_bytes.setdefault(
+            domain, {"bytes_in": 0, "bytes_out": 0}
+        )
+        stats[direction] += n
 
-        当配置了 tcp_listen_port 时，在指定端口上监听 TCP 连接，
-        并通过 WebSocket 隧道转发到客户端。
-        """
-        port = self.config.tcp_listen_port
-        host = self.config.tcp_listen_host
+    def _tunnel_byte_stats(self, domain: str | None) -> dict[str, int]:
+        stats = self._tunnel_bytes.get(domain or "", {})
+        return {"bytes_in": stats.get("bytes_in", 0), "bytes_out": stats.get("bytes_out", 0)}
 
-        if not port:
+    def _resolve_tcp_listen_specs(self) -> list[tuple[int, str, str | None]]:
+        """
+        汇总 TCP 监听器配置，返回 [(port, host, domain | None), ...]
+
+        两个来源（同端口时 WS_TUNNEL_TCP_LISTEN 优先）：
+        - tcp_listen: "port:domain[,port:domain...]"，每端口固定绑定一条隧道
+        - tcp_listen_port + tcp_listen_host + tcp_target_domain：旧字段，
+          domain 可为空（运行时回退到第一个在线隧道）
+        """
+        specs: dict[int, tuple[int, str, str | None]] = {}
+        if self.config.tcp_listen:
+            for entry in self.config.tcp_listen.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    port_str, domain = entry.split(":", 1)
+                    port = int(port_str)
+                except ValueError:
+                    logger.warning(f"忽略无法解析的监听配置项: {entry!r}")
+                    continue
+                specs[port] = (port, self.config.tcp_listen_host, domain.strip())
+        if self.config.tcp_listen_port:
+            specs.setdefault(
+                self.config.tcp_listen_port,
+                (
+                    self.config.tcp_listen_port,
+                    self.config.tcp_listen_host,
+                    self.config.tcp_target_domain,
+                ),
+            )
+        return list(specs.values())
+
+    async def _start_tcp_listeners(self) -> None:
+        """
+        启动全部 TCP 监听器
+
+        每个监听器可固定绑定一条隧道（按端口路由）；
+        未绑定域名的监听器回退到第一个在线隧道（旧行为）。
+        """
+        specs = self._resolve_tcp_listen_specs()
+        if not specs:
             return
 
-        self._tcp_server = await asyncio.start_server(
-            self._handle_tcp_connection,
-            host=host,
-            port=port,
-        )
-        logger.info(f"TCP 监听器已启动: {host}:{port}")
+        for port, host, domain in specs:
+            tcp_server = await asyncio.start_server(
+                self._make_tcp_handler(port),
+                host=host,
+                port=port,
+            )
+            self._tcp_servers.append(tcp_server)
+            if domain:
+                self._listener_domains[port] = domain
+            logger.info(f"TCP 监听器已启动: {host}:{port} -> {domain or '<首个在线隧道>'}")
+
+    def _make_tcp_handler(self, port: int):
+        """为指定监听端口生成连接回调（携带端口以便路由到绑定隧道）"""
+
+        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await self._handle_tcp_connection(reader, writer, port=port)
+
+        return handler
 
     async def _handle_tcp_connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, port: int | None = None
     ) -> None:
         """
         处理外部 TCP 连接
 
         流程:
         1. 接受外部 TCP 连接
-        2. 找到目标隧道客户端
+        2. 找到目标隧道客户端（按监听端口绑定，否则首个在线隧道）
         3. 发送 TcpConnectMessage 通知客户端建立到目标的连接
         4. 双向转发数据: 外部 TCP <-> WebSocket <-> 客户端 <-> 目标服务
         """
@@ -1639,8 +1738,10 @@ class TunnelServer:
         peer = writer.get_extra_info("peername")
         logger.info(f"收到 TCP 连接: {peer} -> conn_id={conn_id}")
 
-        # 确定目标域名
-        domain = self.config.tcp_target_domain
+        # 确定目标域名：优先该监听端口绑定的隧道
+        domain = self._listener_domains.get(port) if port is not None else None
+        if not domain:
+            domain = self.config.tcp_target_domain
         if not domain:
             # 如果没有配置目标域名，尝试使用第一个在线的隧道
             active = self.manager.list_connected_domains()
@@ -1677,7 +1778,7 @@ class TunnelServer:
             tcp_conn = await self.manager.get_tcp_connection(conn_id)
             if tcp_conn:
                 tcp_conn.read_task = asyncio.create_task(
-                    self._tcp_read_loop(conn_id, reader, tunnel_conn.websocket)
+                    self._tcp_read_loop(conn_id, reader, tunnel_conn.websocket, domain)
                 )
                 # 等待读取任务完成（连接关闭或出错）
                 await tcp_conn.read_task
@@ -1698,6 +1799,7 @@ class TunnelServer:
         conn_id: str,
         reader: asyncio.StreamReader,
         websocket: WebSocket,
+        domain: str | None = None,
     ) -> None:
         """
         持续从外部 TCP 连接读取数据，通过 WebSocket 发送给客户端
@@ -1712,6 +1814,9 @@ class TunnelServer:
                     # 对端关闭连接
                     logger.info(f"TCP 连接对端关闭: conn_id={conn_id}")
                     break
+
+                if domain:
+                    self._count_tunnel_bytes(domain, "bytes_out", len(data))
 
                 # 编码并发送
                 data_msg = TcpDataMessage(
@@ -1742,14 +1847,18 @@ class TunnelServer:
         try:
             data = base64.b64decode(message.data)
 
-            # 优先检查是否有待响应的 HTTP 触发的 TCP 请求
+            # 优先检查是否有待响应的 HTTP 触发的 TCP 转发
             if await self.manager.handle_tcp_response_data(message.conn_id, data):
                 logger.debug(f"TCP 响应数据累积: conn_id={message.conn_id}, size={len(data)}")
                 return
 
             # 其次检查是否有真实 TCP 连接（服务端监听场景）
             success = await self.manager.handle_tcp_data(message.conn_id, data)
-            if not success:
+            if success:
+                tcp_conn = await self.manager.get_tcp_connection(message.conn_id)
+                if tcp_conn and tcp_conn.domain:
+                    self._count_tunnel_bytes(tcp_conn.domain, "bytes_in", len(data))
+            else:
                 logger.warning(f"无法路由 TCP 数据: conn_id={message.conn_id}")
         except Exception as e:
             logger.error(f"处理 TCP 数据错误: {message.conn_id}, {e}")
