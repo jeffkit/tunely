@@ -1,0 +1,36 @@
+[package]
+name = "tunely"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket Tunnel Client — 透明反向代理隧道（Rust 版客户端，与服务端 wire 协议对齐）"
+license = "MIT"
+repository = "https://github.com/jeffkit/tunely"
+
+[lib]
+name = "tunely"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tunely"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+url = "2"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+base64 = "0.22"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true

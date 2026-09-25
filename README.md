@@ -6,7 +6,8 @@ WebSocket 透明反向代理隧道，支持服务端嵌入和客户端 SDK。
 
 - 🔌 **透明代理**：HTTP 请求通过 WebSocket 隧道转发，本地服务无感知
 - 🏠 **服务端 SDK**：可嵌入到 FastAPI 应用中
-- 🖥️ **客户端 SDK**：Python 和 TypeScript 双版本，支持独立运行和嵌入使用
+- 🖥️ **客户端 SDK**：Python / TypeScript / Rust 三版本，支持独立运行和嵌入使用
+- 🦀 **Rust 客户端**：单个静态二进制、零运行时依赖（见 `rust/`），适合内网机器分发部署
 - 🔐 **预注册机制**：域名 + Token 认证，安全可控
 - 💾 **数据库支持**：SQLAlchemy 支持 SQLite / MySQL / PostgreSQL
 - 📦 **数据迁移**：Alembic 管理数据库 Schema
