@@ -496,7 +496,8 @@ async fn http_request_forwarded_to_target() {
     assert_eq!(msg["id"], "r1");
     assert_eq!(msg["status"], 200);
     assert_eq!(msg["body"], "ok-from-target");
-    assert!(msg["duration_ms"].as_u64().is_some());
+    // duration_ms 为 0 时按 wire 约定省略字段（serde skip_serializing_if）
+    assert!(msg["duration_ms"].as_u64().map_or(true, |v| v < 60_000));
 
     h.stop().await;
 }
