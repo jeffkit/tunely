@@ -1,0 +1,39 @@
+# PyPI 发布：推 python-v* tag 或手动触发。
+# 前置：仓库 Secrets 配置 PYPI_TOKEN（crates 模式的 pypi- API token）。
+# 未配置时本 job 告警跳过，不会失败。
+name: pypi
+
+on:
+  push:
+    tags:
+      - 'python-v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build
+        run: uv build
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "$UV_PUBLISH_TOKEN" ]; then
+            echo "::warning::Secret PYPI_TOKEN is not set — PyPI publish skipped."
+            exit 0
+          fi
+          out=$(uv publish 2>&1) && { echo "$out"; exit 0; }
+          if echo "$out" | grep -q "already exists"; then
+            echo "this version already published — skipping."
+            exit 0
+          fi
+          echo "$out"
+          exit 1
