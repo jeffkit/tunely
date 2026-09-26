@@ -195,7 +195,9 @@ export class TunnelClient {
     console.log(`正在连接到 ${this.config.serverUrl}...`);
 
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.config.serverUrl);
+      // 显式启用 permessage-deflate（ws 客户端默认关闭），
+      // 服务端（uvicorn/websockets）默认开启，双方协商后压缩 wire 流量
+      const ws = new WebSocket(this.config.serverUrl, { perMessageDeflate: true });
       this.ws = ws;
 
       ws.on('open', () => {

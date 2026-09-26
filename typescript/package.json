@@ -1,6 +1,6 @@
 {
   "name": "tunely",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "WebSocket Tunnel Client - 透明反向代理隧道，让内网服务可被外网访问",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

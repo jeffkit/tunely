@@ -383,6 +383,51 @@ describe('TunnelClient - onDisconnect Bug Fix（回归测试）', () => {
 });
 
 // ================================================================
+// WebSocket 构造选项：permessage-deflate
+// 服务端（uvicorn/websockets）默认开启压缩，客户端需显式启用才能协商成功
+// ================================================================
+
+describe('TunnelClient - WebSocket 构造选项', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('构造 WebSocket 时第二参数应包含 perMessageDeflate: true', async () => {
+    const WebSocketMock = vi.mocked((await import('ws')).default);
+    let mockWs!: MockWebSocket;
+
+    WebSocketMock.mockImplementationOnce(() => {
+      mockWs = new MockWebSocket();
+      return mockWs as any;
+    }).mockImplementation(() => {
+      const ws = new MockWebSocket();
+      Promise.resolve().then(() => ws.emit('close'));
+      return ws as any;
+    });
+
+    const client = new TunnelClient({
+      serverUrl: 'ws://test-server',
+      token: 'test-token',
+      targetUrl: 'http://localhost:3000',
+      reconnectInterval: 100,
+    });
+
+    const runPromise = client.run();
+    await new Promise((r) => setImmediate(r));
+    client.stop();
+    await runPromise.catch(() => {});
+
+    // 构造函数被调用，且第二参数精确为 { perMessageDeflate: true }
+    expect(WebSocketMock).toHaveBeenCalled();
+    const calls = WebSocketMock.mock.calls as unknown as unknown[][];
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    const [url, options] = calls[0];
+    expect(url).toBe('ws://test-server');
+    expect(options).toEqual({ perMessageDeflate: true });
+  });
+});
+
+// ================================================================
 // TCP 隧道模式（tcp_connect / tcp_data / tcp_close）
 //
 // WebSocket 侧沿用 MockWebSocket，本地目标侧用 Node 内置 net

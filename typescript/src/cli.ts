@@ -16,27 +16,40 @@ program
   .description('WebSocket Tunnel Client - 让内网服务可被外网访问')
   .version('0.1.0');
 
+const DEFAULT_SERVER = 'ws://localhost:8000/ws/tunnel';
+const DEFAULT_TARGET = 'http://localhost:8080';
+
 program
   .command('connect')
   .description('连接到隧道服务器')
-  .requiredOption('-t, --token <token>', '隧道令牌')
-  .option('-s, --server <url>', '服务端 WebSocket URL', 'ws://localhost:8000/ws/tunnel')
-  .option('-T, --target <url>', '本地目标服务 URL', 'http://localhost:8080')
+  .option('-t, --token <token>', '隧道令牌（也可通过环境变量 TUNELY_TOKEN 提供）')
+  .option('-s, --server <url>', `服务端 WebSocket URL（也可通过环境变量 TUNELY_SERVER 提供，默认 ${DEFAULT_SERVER}）`)
+  .option('-T, --target <url>', `本地目标服务 URL（也可通过环境变量 TUNELY_TARGET 提供，默认 ${DEFAULT_TARGET}）`)
   .option('-r, --reconnect <seconds>', '重连间隔（秒）', '5')
   .option('-f, --force', '强制抢占已有连接', false)
   .action(async (options) => {
+    // 取值优先级：命令行参数 > 环境变量 > 默认值
+    const token = options.token ?? process.env.TUNELY_TOKEN;
+    const server = options.server ?? process.env.TUNELY_SERVER ?? DEFAULT_SERVER;
+    const target = options.target ?? process.env.TUNELY_TARGET ?? DEFAULT_TARGET;
+
+    if (!token) {
+      console.error('错误: 缺少隧道令牌，请通过 --token 参数或环境变量 TUNELY_TOKEN 提供');
+      process.exit(1);
+    }
+
     console.log('tunely - WebSocket Tunnel Client');
-    console.log(`  服务端: ${options.server}`);
-    console.log(`  目标: ${options.target}`);
+    console.log(`  服务端: ${server}`);
+    console.log(`  目标: ${target}`);
     if (options.force) {
       console.log('  强制模式: 将抢占已有连接');
     }
     console.log();
 
     const client = new TunnelClient({
-      serverUrl: options.server,
-      token: options.token,
-      targetUrl: options.target,
+      serverUrl: server,
+      token,
+      targetUrl: target,
       reconnectInterval: parseFloat(options.reconnect) * 1000,
       force: options.force,
     });
