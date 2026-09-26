@@ -41,6 +41,16 @@ class TunnelServerConfig(BaseSettings):
         description="forward 转发超时上限（秒）：对请求传入的 timeout 做 clamp，防止长期占用；0 = 不限制（env: WS_TUNNEL_FORWARD_MAX_TIMEOUT）",
     )
 
+    # 内存安全上限（防 OOM）
+    tcp_forward_max_buffer_bytes: int = Field(
+        default=10485760,
+        description="HTTP 触发的 TCP 转发单请求响应累积缓冲上限（字节），超限该请求以 'response too large' 失败；0 = 不限制（env: WS_TUNNEL_TCP_FORWARD_MAX_BUFFER_BYTES）",
+    )
+    stream_queue_maxsize: int = Field(
+        default=1024,
+        description="流式响应（SSE）单请求数据块队列上限，生产侧写满即按流错误结束该流；0 = 不限制（env: WS_TUNNEL_STREAM_QUEUE_MAXSIZE）",
+    )
+
     # 分布式配置（可选）
     redis_url: str | None = Field(
         default=None, description="Redis URL（用于分布式部署）"

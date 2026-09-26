@@ -28,6 +28,7 @@ WS-Tunnel 服务端 SDK
 """
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
@@ -128,6 +129,9 @@ class ActiveConnection:
     tunnel_id: int
     domain: str
     token: str
+    # 隧道转发模式（注册时从 DB 行读取一次缓存；forward 路由用，避免每请求查库。
+    # token 轮换/隧道删除后连接仍存活时，沿用缓存值，行为兼容）
+    mode: str = "http"
     connected_at: datetime = field(default_factory=datetime.now)
     last_heartbeat: datetime = field(default_factory=datetime.now)
 
@@ -147,12 +151,16 @@ class PendingStreamRequest:
     """待响应的流式请求（SSE 支持）"""
 
     request_id: str
-    queue: asyncio.Queue  # 存储流式数据块
+    queue: asyncio.Queue  # 存储流式数据块（有界：stream_queue_maxsize，0 = 不限）
     started: bool = False
     ended: bool = False
     start_message: StreamStartMessage | None = None
     end_message: StreamEndMessage | None = None
     domain: str = ""  # 归属隧道（跨隧道串扰校验用）
+    # 流错误通道：队列写满 / 隧道断连时置 error 并 set 事件，
+    # 消费侧（forward_stream）立即以错误结束，不依赖超时兜底
+    error: str | None = None
+    failed: asyncio.Event = field(default_factory=asyncio.Event)
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -189,6 +197,7 @@ class PendingTcpRequest:
     conn_id: str
     future: asyncio.Future
     chunks: list[bytes] = field(default_factory=list)
+    total_bytes: int = 0  # 已累积字节数（tcp_forward_max_buffer_bytes 限额用）
     domain: str = ""  # 归属隧道（跨隧道串扰校验用）
     created_at: datetime = field(default_factory=datetime.now)
 
@@ -290,7 +299,11 @@ class TunnelManager:
     管理所有活跃的隧道连接和待响应的请求
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        tcp_forward_max_buffer_bytes: int = 10485760,
+        stream_queue_maxsize: int = 1024,
+    ):
         # token → ActiveConnection
         self._connections: dict[str, ActiveConnection] = {}
 
@@ -309,6 +322,10 @@ class TunnelManager:
         # conn_id → PendingTcpRequest（TCP 模式 - HTTP 触发的 TCP 转发）
         self._pending_tcp_requests: dict[str, PendingTcpRequest] = {}
 
+        # 内存安全上限（0 = 不限制）
+        self.tcp_forward_max_buffer_bytes = tcp_forward_max_buffer_bytes
+        self.stream_queue_maxsize = stream_queue_maxsize
+
         self._lock = asyncio.Lock()
 
     async def register(
@@ -318,17 +335,19 @@ class TunnelManager:
         domain: str,
         token: str,
         force: bool = False,
+        mode: str = "http",
     ) -> tuple[bool, str | None]:
         """
         注册隧道连接
-        
+
         Args:
             websocket: WebSocket 连接
             tunnel_id: 隧道 ID
             domain: 隧道域名
             token: 隧道令牌
             force: 是否强制抢占已有连接
-            
+            mode: 隧道转发模式（http/tcp，注册时从 DB 读一次缓存，forward 路由用）
+
         Returns:
             (success, error_message) - 成功返回 (True, None)，失败返回 (False, error_message)
         """
@@ -365,11 +384,12 @@ class TunnelManager:
                 tunnel_id=tunnel_id,
                 domain=domain,
                 token=token,
+                mode=mode if mode in ("http", "tcp") else "http",
             )
             self._connections[token] = conn
             self._domain_token_map[domain] = token
 
-            logger.info(f"隧道已连接: domain={domain}")
+            logger.info(f"隧道已连接: domain={domain}, mode={conn.mode}")
             return (True, None)
 
     async def unregister(self, token: str, websocket=None) -> None:
@@ -377,6 +397,10 @@ class TunnelManager:
 
         websocket 传入当前退出处理的连接时做身份校验：force 抢占后注册表
         已指向新连接，旧连接的清理不得误删新注册（0.6.1 回归修复）。
+
+        0.7.0 起：注销时立刻失败该连接的在途 pending（普通请求 / 流式 /
+        HTTP 触发的 TCP 转发），避免断连后请求悬挂至超时。注意不触碰
+        _tcp_connections（服务端监听的真实 TCP 连接由自身生命周期管理）。
         """
         async with self._lock:
             conn = self._connections.get(token)
@@ -390,6 +414,61 @@ class TunnelManager:
             self._connections.pop(token, None)
             self._domain_token_map.pop(conn.domain, None)
             logger.info(f"隧道已断开: domain={conn.domain}")
+            self._fail_pending_requests_locked(conn.domain)
+
+    def _fail_pending_requests_locked(self, domain: str) -> None:
+        """失败指定域名的全部在途 pending（调用方须持有 self._lock）
+
+        仅匹配记录了归属域名的条目；_tcp_connections（真实 TCP 连接）
+        不在此清理，由连接自身生命周期管理。
+        """
+        if not domain:
+            return
+
+        # 1. 普通请求：future 以 ConnectionError 结束（forward 捕获后返回 500）
+        for request_id in [
+            rid
+            for rid, pending in self._pending_requests.items()
+            if pending.domain == domain
+        ]:
+            pending = self._pending_requests.pop(request_id, None)
+            if pending and not pending.future.done():
+                pending.future.set_exception(
+                    ConnectionError("tunnel disconnected")
+                )
+                logger.warning(
+                    f"隧道断连，在途请求已失败: domain={domain}, request_id={request_id}"
+                )
+
+        # 2. 流式请求：通过 failed 事件让消费侧立即以错误结束
+        for request_id in [
+            rid
+            for rid, pending in self._pending_stream_requests.items()
+            if pending.domain == domain
+        ]:
+            pending = self._pending_stream_requests.pop(request_id, None)
+            if pending:
+                pending.error = "tunnel disconnected"
+                pending.ended = True
+                pending.failed.set()
+                logger.warning(
+                    f"隧道断连，流式请求已终止: domain={domain}, request_id={request_id}"
+                )
+
+        # 3. HTTP 触发的 TCP 转发：以错误完成 future（forward 返回 502）
+        for conn_id in [
+            cid
+            for cid, pending in self._pending_tcp_requests.items()
+            if pending.domain == domain
+        ]:
+            pending = self._pending_tcp_requests.pop(conn_id, None)
+            if pending and not pending.future.done():
+                pending.future.set_result(
+                    {"error": "tunnel disconnected", "data": b""}
+                )
+                logger.warning(
+                    f"隧道断连，TCP 转发请求已失败: domain={domain}, conn_id={conn_id}"
+                )
 
     def get_connection_by_domain(self, domain: str) -> ActiveConnection | None:
         """根据域名获取连接"""
@@ -444,9 +523,9 @@ class TunnelManager:
             pending.future.set_exception(Exception(error))
             return True
         # 也检查流式请求
-        stream_pending = self._pending_stream_requests.pop(request_id, None)
+        stream_pending = self._pending_stream_requests.get(request_id)
         if stream_pending:
-            await stream_pending.queue.put(None)  # 发送结束信号
+            await self.fail_stream_request(request_id, error)
             return True
         return False
 
@@ -458,15 +537,46 @@ class TunnelManager:
 
     # ============== 流式请求支持（SSE） ==============
 
+    def _stream_queue_put(self, pending: PendingStreamRequest, message) -> bool:
+        """向流式队列写入一条消息（非阻塞）
+
+        队列写满（消费侧过慢）时按流错误处理：终止该流，避免阻塞
+        WebSocket 消息循环或无界积压内存。返回 False 表示写入失败。
+        """
+        try:
+            pending.queue.put_nowait(message)
+            return True
+        except asyncio.QueueFull:
+            logger.warning(
+                f"流式队列已满 (maxsize={pending.queue.maxsize})，按流错误结束: "
+                f"request_id={pending.request_id}"
+            )
+            pending.error = "stream queue overflow"
+            pending.ended = True
+            pending.failed.set()
+            return False
+
     async def create_stream_request(self, request_id: str, domain: str = "") -> PendingStreamRequest:
         """创建待响应的流式请求"""
+        maxsize = self.stream_queue_maxsize if self.stream_queue_maxsize > 0 else 0
         pending = PendingStreamRequest(
             request_id=request_id,
-            queue=asyncio.Queue(),
+            queue=asyncio.Queue(maxsize=maxsize),
             domain=domain,
         )
         self._pending_stream_requests[request_id] = pending
         return pending
+
+    async def fail_stream_request(self, request_id: str, error: str) -> bool:
+        """以错误终止流式请求（唤醒消费侧，不必等超时兜底）"""
+        pending = self._pending_stream_requests.get(request_id)
+        if pending:
+            pending.error = error
+            pending.ended = True
+            pending.failed.set()
+            self._pending_stream_requests.pop(request_id, None)
+            return True
+        return False
 
     def get_pending_stream_domain(self, request_id: str) -> str | None:
         """查询流式请求的归属隧道（不存在返回 None；跨隧道串扰校验用）"""
@@ -479,16 +589,14 @@ class TunnelManager:
         if pending:
             pending.started = True
             pending.start_message = message
-            await pending.queue.put(message)
-            return True
+            return self._stream_queue_put(pending, message)
         return False
 
     async def handle_stream_chunk(self, message: StreamChunkMessage) -> bool:
         """处理流式数据块"""
         pending = self._pending_stream_requests.get(message.id)
         if pending and pending.started and not pending.ended:
-            await pending.queue.put(message)
-            return True
+            return self._stream_queue_put(pending, message)
         return False
 
     async def handle_stream_end(self, message: StreamEndMessage) -> bool:
@@ -497,10 +605,13 @@ class TunnelManager:
         if pending:
             pending.ended = True
             pending.end_message = message
-            await pending.queue.put(message)
-            await pending.queue.put(None)  # 发送结束信号
+            ok = self._stream_queue_put(pending, message)
+            if ok:
+                # None 哨兵：消费侧读到即认为流结束。队列满时上面已按错误终止，
+                # 无需再放哨兵。
+                self._stream_queue_put(pending, None)  # 发送结束信号
             # 注意：不立即删除，等迭代器完成后再清理
-            return True
+            return ok
         return False
 
     async def cleanup_stream_request(self, request_id: str) -> None:
@@ -631,11 +742,27 @@ class TunnelManager:
         return None
 
     async def handle_tcp_response_data(self, conn_id: str, data: bytes) -> bool:
-        """累积客户端返回的 TCP 响应数据"""
+        """累积客户端返回的 TCP 响应数据
+
+        累积超过 tcp_forward_max_buffer_bytes（0 = 不限）时立即以
+        "response too large" 错误完成该请求，防止 /forward 拉大文件 OOM。
+        """
         pending = self._pending_tcp_requests.get(conn_id)
         if not pending:
             return False
         pending.chunks.append(data)
+        pending.total_bytes += len(data)
+
+        limit = self.tcp_forward_max_buffer_bytes
+        if limit > 0 and pending.total_bytes > limit:
+            logger.warning(
+                f"TCP 响应超过缓冲上限 ({limit} bytes)，终止转发: "
+                f"conn_id={conn_id}, domain={pending.domain}"
+            )
+            # 从注册表移除并以错误完成 future（forward 返回 502）
+            self._pending_tcp_requests.pop(conn_id, None)
+            if not pending.future.done():
+                pending.future.set_result({"error": "response too large", "data": b""})
         return True
 
     async def complete_tcp_request(self, conn_id: str, error: str | None = None) -> bool:
@@ -674,7 +801,10 @@ class TunnelServer:
     def __init__(self, config: TunnelServerConfig | None = None):
         self.config = config or TunnelServerConfig()
         self.db: DatabaseManager | None = None
-        self.manager = TunnelManager()
+        self.manager = TunnelManager(
+            tcp_forward_max_buffer_bytes=self.config.tcp_forward_max_buffer_bytes,
+            stream_queue_maxsize=self.config.stream_queue_maxsize,
+        )
         self.router = APIRouter(tags=["Tunnel"])
         self._tcp_servers: list[asyncio.Server] = []
         # 监听端口 -> 绑定的隧道域名（多监听器路由）
@@ -907,6 +1037,36 @@ class TunnelServer:
             if not hmac.compare_digest(provided, self.config.admin_api_key):
                 raise HTTPException(status_code=401, detail="Invalid API key")
 
+    # 请求日志中必须脱敏的 header（大小写不敏感）
+    _SENSITIVE_LOG_HEADERS = {"authorization", "cookie", "set-cookie"}
+
+    @classmethod
+    def _redact_headers_for_log(cls, headers: dict[str, str] | None) -> dict[str, str] | None:
+        """请求日志存储前的 header 脱敏：敏感凭证值替换为 "[REDACTED]"
+
+        键名大小写不敏感；其余原样保留（返回副本，不改写调用方数据）。
+        """
+        if headers is None:
+            return None
+        return {
+            key: ("[REDACTED]" if key.lower() in cls._SENSITIVE_LOG_HEADERS else value)
+            for key, value in headers.items()
+        }
+
+    @staticmethod
+    def _stringify_body_for_log(body: Any) -> str | None:
+        """请求体转字符串写入日志
+
+        None 保留为 None；其余 falsy 值（{} / 0 / "" / False）必须保留，
+        不得因 truthiness 判断而丢 body（0.6.2 及之前 {} 会被记成 NULL）。
+        """
+        if body is None:
+            return None
+        try:
+            return json.dumps(body)
+        except (TypeError, ValueError):
+            return str(body)[:10000]
+
     async def _notify_connected(self, domain: str) -> None:
         """向 as-dispatch 发送客户端连接 webhook（fire-and-forget）"""
         if not self.config.dispatch_webhook_url:
@@ -1043,6 +1203,7 @@ class TunnelServer:
                     return
 
                 tunnel_domain = tunnel.domain
+                tunnel_mode = tunnel.mode
 
                 # 更新最后连接时间
                 await repo.update_last_connected(token)
@@ -1056,6 +1217,7 @@ class TunnelServer:
                     domain=tunnel.domain,
                     token=token,
                     force=force,
+                    mode=tunnel_mode,
                 )
 
                 if not success:
@@ -1093,8 +1255,17 @@ class TunnelServer:
             # 处理消息循环
             while True:
                 raw_message = await websocket.receive_text()
-                data = json.loads(raw_message)
-                message = parse_message(data)
+                # F10：畸形消息（非法 JSON / 未知类型）只丢弃该条并告警，
+                # 不得让整条隧道断连注销（断连会让全部在途请求悬挂）
+                try:
+                    data = json.loads(raw_message)
+                    message = parse_message(data)
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        f"丢弃畸形 WS 消息: domain={tunnel_domain}, error={e}, "
+                        f"raw={raw_message[:200]!r}"
+                    )
+                    continue
 
                 if isinstance(message, PingMessage):
                     # 协议级 keepalive：客户端周期性发 Ping，必须回 Pong，
@@ -1247,6 +1418,14 @@ class TunnelServer:
         # 未配置 key 的部署保持内网模式语义不变）
         self._check_admin_api_key(api_key)
         jwt_payload = self._verify_jwt_token(authorization)
+
+        # 域名格式校验（与 check-availability 同一规则）：
+        # 非法 domain 不入库，统一 400
+        if not self.DOMAIN_PATTERN.match(request.domain or ""):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid domain format. Use letters, numbers, and hyphens only (1-63 chars, start with letter/number)",
+            )
 
         if not self.db:
             raise HTTPException(status_code=500, detail="Database not initialized")
@@ -1565,20 +1744,46 @@ class TunnelServer:
                 error=f"Tunnel not connected: {domain}",
             )
 
-        # 查询隧道模式
-        tunnel_mode = "http"  # 默认 HTTP 模式（向后兼容）
-        if self.db:
-            async with self.db.session() as session:
-                repo = TunnelRepository(session)
-                tunnel = await repo.get_by_domain(domain)
-                if tunnel:
-                    tunnel_mode = tunnel.mode
+        # 隧道模式：直接用注册时缓存在连接上的 mode（0.7.0 起，
+        # 省掉每请求一次 DB 查询；token 轮换/隧道删除后连接仍在时沿用缓存值）
+        tunnel_mode = conn.mode if conn.mode in ("http", "tcp") else "http"
 
         # 根据模式选择转发方式
         if tunnel_mode == "tcp":
             return await self._forward_tcp(domain, body, timeout)
         else:
             return await self._forward_http(domain, method, path, headers, body, timeout)
+
+    async def _write_request_log(
+        self,
+        domain: str,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None,
+        request_body_str: str | None,
+        status_code: int | None,
+        response_headers: dict[str, str] | None = None,
+        response_body: str | None = None,
+        error: str | None = None,
+        duration_ms: int = 0,
+    ) -> None:
+        """写入请求日志（独立事务；header 先脱敏）"""
+        if not self.db:
+            return
+        async with self.db.session() as session:
+            log_repo = TunnelRequestLogRepository(session)
+            await log_repo.create(
+                tunnel_domain=domain,
+                method=method,
+                path=path,
+                request_headers=self._redact_headers_for_log(headers),
+                request_body=request_body_str,
+                status_code=status_code,
+                response_headers=self._redact_headers_for_log(response_headers),
+                response_body=response_body,
+                error=error,
+                duration_ms=duration_ms,
+            )
 
     async def _forward_http(
         self,
@@ -1600,7 +1805,8 @@ class TunnelServer:
             method=method,
             path=path,
             headers=headers or {},
-            body=json.dumps(body) if body else None,
+            # F17：body is not None 才序列化——falsy body（{} / 0 / "" / False）必须保留
+            body=json.dumps(body) if body is not None else None,
             timeout=timeout,
         )
 
@@ -1626,50 +1832,44 @@ class TunnelServer:
             response = await asyncio.wait_for(future, timeout=timeout)
             duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
 
-            # 更新统计和记录日志
+            # 更新统计（独立事务：日志失败不回滚计数）
             if self.db:
-                async with self.db.session() as session:
-                    tunnel_repo = TunnelRepository(session)
-                    await tunnel_repo.increment_requests(conn.token)
-                    
-                    # 记录请求日志
-                    log_repo = TunnelRequestLogRepository(session)
-                    try:
-                        response_body_str = None
-                        if response.body:
-                            try:
-                                response_body_str = json.dumps(json.loads(response.body))
-                            except:
-                                response_body_str = str(response.body)[:10000]
-                        
-                        request_body_str = None
-                        if body:
-                            try:
-                                request_body_str = json.dumps(body)
-                            except:
-                                request_body_str = str(body)[:10000]
-                        
-                        await log_repo.create(
-                            tunnel_domain=domain,
-                            method=method,
-                            path=path,
-                            request_headers=headers,
-                            request_body=request_body_str,
-                            status_code=response.status,
-                            response_headers=response.headers,
-                            response_body=response_body_str,
-                            error=response.error,
-                            duration_ms=duration_ms,
-                        )
-                        await session.commit()
-                    except Exception as e:
-                        # 日志记录失败不应该影响请求处理
-                        logger.warning(f"记录请求日志失败: {e}")
-                        await session.rollback()
+                try:
+                    async with self.db.session() as session:
+                        tunnel_repo = TunnelRepository(session)
+                        await tunnel_repo.increment_requests(conn.token)
+                except Exception as e:
+                    logger.warning(f"更新请求计数失败: {e}")
+
+                # 记录请求日志（独立事务，尽力而为）
+                try:
+                    response_body_str = None
+                    if response.body is not None:
+                        try:
+                            # 双解析归一化 + 截断（与既有截断行为一致）
+                            response_body_str = json.dumps(json.loads(response.body))[:10000]
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            response_body_str = str(response.body)[:10000]
+
+                    await self._write_request_log(
+                        domain=domain,
+                        method=method,
+                        path=path,
+                        headers=headers,
+                        request_body_str=self._stringify_body_for_log(body),
+                        status_code=response.status,
+                        response_headers=response.headers,
+                        response_body=response_body_str,
+                        error=response.error,
+                        duration_ms=duration_ms,
+                    )
+                except Exception as e:
+                    # 日志记录失败不应该影响请求处理
+                    logger.warning(f"记录请求日志失败: {e}")
 
             # Parse body: try JSON first, fall back to raw string
             parsed_body = None
-            if response.body:
+            if response.body is not None:
                 try:
                     parsed_body = json.loads(response.body)
                 except (json.JSONDecodeError, ValueError):
@@ -1686,34 +1886,22 @@ class TunnelServer:
         except asyncio.TimeoutError:
             error_msg = "Request timeout"
             await self.manager.fail_request(request_id, error_msg)
-            
+
             # 记录错误日志
-            if self.db:
-                async with self.db.session() as session:
-                    log_repo = TunnelRequestLogRepository(session)
-                    try:
-                        request_body_str = None
-                        if body:
-                            try:
-                                request_body_str = json.dumps(body)
-                            except:
-                                request_body_str = str(body)[:10000]
-                        
-                        await log_repo.create(
-                            tunnel_domain=domain,
-                            method=method,
-                            path=path,
-                            request_headers=headers,
-                            request_body=request_body_str,
-                            status_code=504,
-                            error=error_msg,
-                            duration_ms=int(timeout * 1000),
-                        )
-                        await session.commit()
-                    except Exception as e:
-                        logger.warning(f"记录请求日志失败: {e}")
-                        await session.rollback()
-            
+            try:
+                await self._write_request_log(
+                    domain=domain,
+                    method=method,
+                    path=path,
+                    headers=headers,
+                    request_body_str=self._stringify_body_for_log(body),
+                    status_code=504,
+                    error=error_msg,
+                    duration_ms=int(timeout * 1000),
+                )
+            except Exception as e:
+                logger.warning(f"记录请求日志失败: {e}")
+
             return ForwardResponse(
                 status=504,
                 error=error_msg,
@@ -1721,34 +1909,22 @@ class TunnelServer:
         except Exception as e:
             error_msg = str(e)
             await self.manager.fail_request(request_id, error_msg)
-            
+
             # 记录错误日志
-            if self.db:
-                async with self.db.session() as session:
-                    log_repo = TunnelRequestLogRepository(session)
-                    try:
-                        request_body_str = None
-                        if body:
-                            try:
-                                request_body_str = json.dumps(body)
-                            except:
-                                request_body_str = str(body)[:10000]
-                        
-                        await log_repo.create(
-                            tunnel_domain=domain,
-                            method=method,
-                            path=path,
-                            request_headers=headers,
-                            request_body=request_body_str,
-                            status_code=500,
-                            error=error_msg,
-                            duration_ms=0,
-                        )
-                        await session.commit()
-                    except Exception as e:
-                        logger.warning(f"记录请求日志失败: {e}")
-                        await session.rollback()
-            
+            try:
+                await self._write_request_log(
+                    domain=domain,
+                    method=method,
+                    path=path,
+                    headers=headers,
+                    request_body_str=self._stringify_body_for_log(body),
+                    status_code=500,
+                    error=error_msg,
+                    duration_ms=0,
+                )
+            except Exception as log_err:
+                logger.warning(f"记录请求日志失败: {log_err}")
+
             return ForwardResponse(
                 status=500,
                 error=error_msg,
@@ -1789,8 +1965,8 @@ class TunnelServer:
             connect_msg = TcpConnectMessage(conn_id=conn_id)
             await conn.websocket.send_text(connect_msg.model_dump_json())
 
-            # 3. 发送数据
-            if body:
+            # 3. 发送数据（body is not None 即发送——falsy body 如 0 / "" 不丢）
+            if body is not None:
                 # 处理不同类型的 body
                 if isinstance(body, bytes):
                     data = body
@@ -1978,7 +2154,8 @@ class TunnelServer:
             method=method,
             path=path,
             headers=headers or {},
-            body=json.dumps(body) if body else None,
+            # F17：falsy body（{} / 0 / "" / False）必须保留
+            body=json.dumps(body) if body is not None else None,
             timeout=timeout,
         )
 
@@ -1992,19 +2169,40 @@ class TunnelServer:
             # 从队列中读取流式数据
             start_time = datetime.now()
             while True:
-                try:
-                    # 使用超时等待
-                    message = await asyncio.wait_for(
-                        pending.queue.get(),
-                        timeout=timeout
+                # 同时等待「队列新消息」与「流失败信号」（队列溢出 / 隧道断连），
+                # 失败时立即以错误结束，而非等到超时兜底
+                get_task = asyncio.ensure_future(pending.queue.get())
+                failed_task = asyncio.ensure_future(pending.failed.wait())
+                done, _ = await asyncio.wait(
+                    {get_task, failed_task},
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in (get_task, failed_task):
+                    if task not in done:
+                        task.cancel()
+                await asyncio.gather(
+                    *(t for t in (get_task, failed_task) if t not in done),
+                    return_exceptions=True,
+                )
+
+                if failed_task in done:
+                    # 流已被生产侧标记失败（队列溢出 / 隧道断连）
+                    yield StreamEndMessage(
+                        id=request_id,
+                        error=pending.error or "stream failed",
                     )
-                except asyncio.TimeoutError:
+                    break
+
+                if get_task not in done:
                     # 超时，发送错误结束消息
                     yield StreamEndMessage(
                         id=request_id,
                         error="Stream timeout",
                     )
                     break
+
+                message = get_task.result()
 
                 if message is None:
                     # 流结束
@@ -2079,30 +2277,31 @@ class TunnelServer:
         """
         把「上次快照以来的流量增量」累加写库（快照法，可安全重复触发）
 
-        只写有正增量的行；全部写完后推进快照。
+        只写有正增量的行；每个域名写库成功后立即推进该域快照——
+        中途某域失败只影响该域（下轮重发该域增量），不影响其他域，
+        也不会像整批推进那样在异常后整批重发导致重复累加。
         """
         if not self.db:
             return
 
-        deltas: list[tuple[str, int, int]] = []
-        for domain, stats in self._tunnel_bytes.items():
+        for domain, stats in list(self._tunnel_bytes.items()):
             flushed = self._flushed_bytes.get(
                 domain, {"bytes_in": 0, "bytes_out": 0}
             )
             delta_in = stats["bytes_in"] - flushed["bytes_in"]
             delta_out = stats["bytes_out"] - flushed["bytes_out"]
-            if delta_in > 0 or delta_out > 0:
-                deltas.append((domain, delta_in, delta_out))
+            if delta_in <= 0 and delta_out <= 0:
+                continue
 
-        if not deltas:
-            return
+            try:
+                async with self.db.session() as session:
+                    repo = TunnelRepository(session)
+                    await repo.increment_tunnel_bytes(domain, delta_in, delta_out)
+            except Exception as e:
+                # 该域快照不推进，下轮重试；不阻塞其他域名落库
+                logger.warning(f"流量统计落库失败（下轮重试）: domain={domain}, error={e}")
+                continue
 
-        async with self.db.session() as session:
-            repo = TunnelRepository(session)
-            for domain, delta_in, delta_out in deltas:
-                await repo.increment_tunnel_bytes(domain, delta_in, delta_out)
-
-        for domain, delta_in, delta_out in deltas:
             flushed = self._flushed_bytes.setdefault(
                 domain, {"bytes_in": 0, "bytes_out": 0}
             )
@@ -2217,11 +2416,22 @@ class TunnelServer:
             return
 
         for port, host, domain in specs:
-            tcp_server = await asyncio.start_server(
-                self._make_tcp_handler(port),
-                host=host,
-                port=port,
-            )
+            try:
+                tcp_server = await asyncio.start_server(
+                    self._make_tcp_handler(port),
+                    host=host,
+                    port=port,
+                )
+            except OSError as e:
+                # F22：端口冲突给可读报错（含 host:port 与归属域），
+                # 不再裸 OSError traceback
+                if e.errno == errno.EADDRINUSE:
+                    raise RuntimeError(
+                        f"TCP 监听端口被占用，无法绑定 {host}:{port}"
+                        f"（归属隧道: {domain or '<首个在线隧道>'}）。"
+                        f"请换端口或停掉占用该端口的进程。"
+                    ) from e
+                raise
             self._tcp_servers.append(tcp_server)
             if domain:
                 self._listener_domains[port] = domain

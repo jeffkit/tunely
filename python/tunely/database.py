@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .models import Base
@@ -48,12 +49,35 @@ class DatabaseManager:
             if db_path and db_path != ":memory:":
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
+        # SQLite 并发写调优（F7）：
+        # - connect timeout 30s：写锁被占时等待而非立刻 "database is locked"
+        # - WAL 日志模式：读写不互斥，显著降低并发写冲突
+        # 仅 sqlite 方言生效；mysql/pg 不受影响
+        self._connect_args: dict = {}
+        connect_listener = None
+        if self.database_url.startswith("sqlite"):
+            self._connect_args = {"timeout": 30}
+
+            def _set_sqlite_pragma(dbapi_connection, connection_record):
+                # SQLAlchemy 的 aiosqlite 适配连接提供同步 execute（内部桥接驱动）
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                finally:
+                    cursor.close()
+
+            connect_listener = _set_sqlite_pragma
+
         # 创建引擎
         self._engine = create_async_engine(
             self.database_url,
             echo=False,
             pool_pre_ping=True,
+            connect_args=self._connect_args,
         )
+
+        if connect_listener is not None:
+            event.listen(self._engine.sync_engine, "connect", connect_listener)
 
         # 创建会话工厂
         self._session_factory = async_sessionmaker(

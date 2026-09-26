@@ -15,6 +15,27 @@ WebSocket 透明反向代理隧道 - Python 服务端和客户端 SDK。
 pip install tunely
 ```
 
+## 安装自检
+
+uv 的缓存损坏可能导致**安装截断**——装出来的包文件不完整、部分路由缺失（uv 已知问题，参见 [astral-sh/uv#11043](https://github.com/astral-sh/uv/issues/11043)；hardlink 跨文件系统回退复制时也可能出问题）。因此装完必须自检 `server.py` 行数是否与仓库一致：
+
+```bash
+python - <<'EOF'
+import pathlib, tunely
+p = pathlib.Path(tunely.__file__).parent / "server.py"
+print(p, sum(1 for _ in p.open()))
+EOF
+```
+
+行数明显偏少即为截断，处理方式：
+
+```bash
+uv cache clean tunely
+uv pip install --no-cache --reinstall-package tunely
+```
+
+部署环境也可在 service 中设置 `Environment=UV_LINK_MODE=copy` 规避 hardlink 问题。
+
 ## 使用
 
 ### 服务端（嵌入 FastAPI）

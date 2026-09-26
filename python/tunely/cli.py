@@ -3,10 +3,10 @@ WS-Tunnel 命令行工具
 
 使用示例:
     # 启动客户端
-    ws-tunnel connect --token tun_xxx --target http://localhost:8080
+    tunely connect --token tun_xxx --target http://localhost:8080
 
     # 使用配置文件
-    ws-tunnel connect --config tunnel.yaml
+    tunely connect --config tunnel.yaml
 
     # 管理隧道
     ws-tunnel tunnel create my-agent
@@ -222,7 +222,7 @@ def tunnel_create(
             console.print(f"  模式: {data.get('mode', 'http')}")
             console.print()
             console.print("[dim]使用以下命令连接:[/dim]")
-            console.print(f"  ws-tunnel connect --token {data['token']} --target http://localhost:8080")
+            console.print(f"  tunely connect --token {data['token']} --target http://localhost:8080")
         else:
             console.print(f"[red]✗[/red] 创建失败: {response.text}")
             sys.exit(1)

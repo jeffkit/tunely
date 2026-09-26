@@ -177,16 +177,22 @@ class TunnelRequestLogRepository:
     ) -> TunnelRequestLog:
         """创建请求日志记录"""
         import json
-        
+
+        # F17：body/header 用 is not None 判断——falsy 值（{} / 0 / "" / False）必须保留，
+        # 不得因 truthiness 而丢数据
         log = TunnelRequestLog(
             tunnel_domain=tunnel_domain,
             method=method,
             path=path[:1000],  # 限制路径长度
-            request_headers=json.dumps(request_headers) if request_headers else None,
-            request_body=request_body[:10000] if request_body else None,  # 限制请求体长度
+            request_headers=(
+                json.dumps(request_headers)[:10000] if request_headers is not None else None
+            ),
+            request_body=request_body[:10000] if request_body is not None else None,  # 限制请求体长度
             status_code=status_code,
-            response_headers=json.dumps(response_headers) if response_headers else None,
-            response_body=response_body[:10000] if response_body else None,  # 限制响应体长度
+            response_headers=(
+                json.dumps(response_headers)[:10000] if response_headers is not None else None
+            ),
+            response_body=response_body[:10000] if response_body is not None else None,  # 限制响应体长度
             error=error[:2000] if error else None,  # 限制错误信息长度
             duration_ms=duration_ms,
         )

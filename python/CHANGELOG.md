@@ -6,6 +6,72 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-26
+
+稳定性/性能批次 P1（协议 wire 格式零变更）：消灭无界缓冲、修复正确性问题、
+降低热路径成本。
+
+### Fixed（正确性修复）
+
+- **F8 断连时在途请求悬挂**：隧道 WS 断连注销时，立刻失败该域名的全部在途
+  pending——普通请求 future 以 `ConnectionError("tunnel disconnected")` 结束、
+  流式请求经 failed 事件立即以错误结束、HTTP 触发的 TCP 转发以错误完成，
+  并从注册表清理。服务端监听的真实 TCP 连接（TcpConnectionState）不受影响，
+  仍由连接自身生命周期管理。
+- **F10 畸形消息不断隧道**：WS 消息循环中非法 JSON / 未知消息类型只丢弃该条
+  并告警，不再落入外层 except 导致整条隧道断连注销。
+- **F13 流量统计 flush 顺序**：逐域名写库成功后立即推进该域落库快照。
+  此前全部写完才推快照，中途异常会整批重发导致重复累加；现在单域失败只影响
+  该域（下轮重试），不阻塞其他域名落库。
+- **F17 falsy body 丢弃**：`json.dumps(body) if body else None` 类 truthiness
+  判断全部改为 `is not None`——请求 body 为 `{}` / `0` / `""` / `False` 时
+  不再被静默丢弃（HTTP / SSE 流式 / TCP 三条转发路径及请求日志存储同步修复）。
+- **F22 端口冲突友好报错**：TCP 监听端口被占用（EADDRINUSE）时抛出含具体
+  `host:port` 与归属隧道的可读错误，不再裸 OSError traceback；其他 OSError
+  原样抛出。
+
+### Security（安全加固）
+
+- **L2 请求日志脱敏与截断**：请求日志存储时对 `authorization` / `cookie` /
+  `set-cookie` 三个 header（键名大小写不敏感）值替换为 `[REDACTED]`（请求与
+  响应 header 均覆盖）；响应 JSON body 双解析归一化路径补 10000 字符截断，
+  与既有截断行为一致。
+
+### Changed（变更）
+
+- **F7 SQLite 并发写**：sqlite 方案增加 `connect_args={"timeout": 30}`，
+  并在引擎连接上启用 `PRAGMA journal_mode=WAL`（仅 sqlite 方言生效，
+  mysql/pg 不受影响）；「请求计数 increment_requests」与「请求日志写入」
+  拆成独立事务，日志失败不再回滚计数。
+- **forward mode 缓存**：隧道转发模式注册时从 DB 读一次缓存在
+  `ActiveConnection.mode` 上，`forward()` 直接用缓存路由，省掉每请求一次
+  DB 查询；token 轮换 / 隧道删除后连接仍存活时沿用缓存值。注意：连接存活
+  期间修改 mode 需重连后生效。
+- **L1 建隧道校验 domain**：`POST /api/tunnels` 校验 domain 匹配既有
+  DOMAIN_PATTERN（与 check-availability 同规则：字母/数字开头，可含中划线，
+  1-63 字符），不匹配返回 400。既有合法域名（如 dsh / smoke-dom）不受影响。
+
+### Added（新增）
+
+- **内存安全上限（防 OOM）**：
+  - `tcp_forward_max_buffer_bytes`（默认 10 MiB，0 = 不限制，env:
+    `WS_TUNNEL_TCP_FORWARD_MAX_BUFFER_BYTES`）：HTTP 触发的 TCP 转发单请求
+    响应累积缓冲超限时，该请求立即以 "response too large" 失败（502），
+    防 /forward 拉大文件打爆内存。
+  - `stream_queue_maxsize`（默认 1024，0 = 不限制，env:
+    `WS_TUNNEL_STREAM_QUEUE_MAXSIZE`）：SSE 流式单请求数据块队列上界，
+    写满即按流错误结束该流（消费侧立刻收到错误 StreamEndMessage），
+    不阻塞 WS 消息循环、不无界积压。
+- **uvloop 可选加速**：uvicorn 启动时检测 uvloop，可用则以 uvloop 事件循环
+  运行，未安装回退默认。新 optional extra `tunely[uvloop]`（不进基础依赖，
+  纯性能优化）。
+
+### 升级注意
+
+- 无 schema 变更、无 wire 协议变更，可直接升级。
+- 部署了 TCP 监听的实例若与其他进程端口冲突，现在会在启动时收到带
+  `host:port` 与归属隧道的明确报错（此前是裸 traceback）。
+
 ## [0.6.2] - 2026-09-26
 
 安全审计 P0 修复批次（服务端转发面与连接生命周期）。

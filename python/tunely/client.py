@@ -76,7 +76,8 @@ class TcpConnection:
     - 连接关闭处理
     """
 
-    def __init__(self, conn_id: str, target_host: str, target_port: int, websocket):
+    def __init__(self, conn_id: str, target_host: str, target_port: int, websocket,
+                 on_closed: Optional[Callable[["TcpConnection"], None]] = None):
         """
         初始化 TCP 连接
         
@@ -85,11 +86,13 @@ class TcpConnection:
             target_host: 目标主机
             target_port: 目标端口
             websocket: WebSocket 连接（用于发送数据回服务端）
+            on_closed: 读取结束（EOF/错误）后的清理回调（F6：从客户端连接表移除，防 fd 泄漏）
         """
         self.conn_id = conn_id
         self.target_host = target_host
         self.target_port = target_port
         self._websocket = websocket
+        self._on_closed = on_closed
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._read_task: Optional[asyncio.Task] = None
@@ -133,7 +136,26 @@ class TcpConnection:
         except Exception as e:
             logger.error(f"TCP 读取错误: {self.conn_id}, {e}")
         finally:
+            # F6：本地侧读结束（EOF/错误）也要完整收尾——回执 tcp_close、
+            # 关闭 writer、并从客户端连接表移除，否则目标侧先关连接时条目
+            # 永久滞留在 _tcp_connections，fd 泄漏。
             await self._send_close()
+            if not self._closed:
+                self._closed = True
+                if self._writer:
+                    try:
+                        self._writer.close()
+                    except Exception as e:
+                        logger.error(f"关闭 TCP writer 错误: {self.conn_id}, {e}")
+                self._notify_closed()
+
+    def _notify_closed(self) -> None:
+        """触发读取结束回调（幂等：仅在 read_loop 收尾时调用一次）"""
+        if self._on_closed:
+            try:
+                self._on_closed(self)
+            except Exception as e:
+                logger.error(f"TCP 连接清理回调失败: {self.conn_id}, {e}")
 
     async def _send_data(self, data: bytes) -> None:
         """发送数据到服务端"""
@@ -579,12 +601,13 @@ class TunnelClient:
         conn_id = message.conn_id
         logger.info(f"收到 TCP 连接请求: {conn_id}")
         
-        # 创建 TCP 连接
+        # 创建 TCP 连接（读取结束时经 on_closed 回调从连接表移除，F6）
         tcp_conn = TcpConnection(
             conn_id=conn_id,
             target_host=self._target_host,
             target_port=self._target_port,
             websocket=websocket,
+            on_closed=self._remove_tcp_connection,
         )
         
         # 尝试连接
@@ -594,6 +617,17 @@ class TunnelClient:
         else:
             # 连接失败，TcpConnection 已经发送了关闭消息
             logger.warning(f"TCP 连接失败: {conn_id}")
+
+    def _remove_tcp_connection(self, conn: "TcpConnection") -> None:
+        """
+        TcpConnection 读取结束回调：从连接表移除（F6）
+
+        目标侧先关闭连接时 _read_loop 结束，必须把条目从 _tcp_connections
+        移除，否则连接对象与 fd 永久滞留。按对象身份比对，避免移除同 conn_id
+        的新连接（服务端重连后可能复用 id 的场景以实际存活的条目为准）。
+        """
+        if self._tcp_connections.get(conn.conn_id) is conn:
+            del self._tcp_connections[conn.conn_id]
 
     async def _handle_tcp_data(self, message: TcpDataMessage) -> None:
         """

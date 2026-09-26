@@ -1,6 +1,6 @@
 [project]
 name = "tunely"
-version = "0.6.2"
+version = "0.7.0"
 description = "WebSocket Tunnel - 透明反向代理隧道，支持服务端嵌入和客户端 SDK"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,6 +42,8 @@ dependencies = [
 mysql = ["aiomysql>=0.2.0"]
 postgres = ["asyncpg>=0.29.0"]
 redis = ["redis>=5.0.0"]
+# 可选事件循环加速（纯性能优化，缺省回退 asyncio；不进基础依赖）
+uvloop = ["uvloop>=0.19"]
 all = ["tunely[mysql,postgres,redis]"]
 
 # PEP 735 依赖组：uv sync 默认安装 dev 组（CI 门禁依赖此语义；
@@ -55,11 +57,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/user/tunely"
-Documentation = "https://github.com/user/tunely#readme"
-Repository = "https://github.com/user/tunely"
-Issues = "https://github.com/user/tunely/issues"
-Changelog = "https://github.com/user/tunely/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/jeffkit/tunely"
+Documentation = "https://github.com/jeffkit/tunely#readme"
+Repository = "https://github.com/jeffkit/tunely"
+Issues = "https://github.com/jeffkit/tunely/issues"
+Changelog = "https://github.com/jeffkit/tunely/blob/main/python/CHANGELOG.md"
 
 [project.scripts]
 tunely = "tunely.cli:main"

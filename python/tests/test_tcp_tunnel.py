@@ -216,7 +216,7 @@ class TestTunnelClientTcpMode:
         from tunely.client import TunnelClient
         from tunely.config import TunnelClientConfig
         from unittest.mock import patch
-        
+
         config = TunnelClientConfig(
             server_url="ws://test",
             token="test",
@@ -224,24 +224,38 @@ class TestTunnelClientTcpMode:
         )
         client = TunnelClient(config=config)
         client._websocket = MagicMock()
-        
+
         # Mock TCP 连接
         with patch('tunely.client.asyncio.open_connection') as mock_open:
-            mock_reader = AsyncMock()
-            mock_reader.read = AsyncMock(return_value=b'')  # 模拟连接关闭
+            # F6 起：读循环 EOF（read 返回 b''）会经 on_closed 回调把连接
+            # 从 _tcp_connections 移除。这里让 read 阻塞在 Event 上模拟
+            # 「连接仍在服务」的窗口，断言注册语义后再放行收尾。
+            release = asyncio.Event()
+
+            async def _blocked_read(n: int) -> bytes:
+                await release.wait()
+                return b''
+
+            mock_reader = MagicMock()
+            mock_reader.read = _blocked_read
             mock_writer = MagicMock()
             mock_writer.close = Mock()
             mock_writer.wait_closed = AsyncMock()
             mock_open.return_value = (mock_reader, mock_writer)
-            
+
             msg = TcpConnectMessage(conn_id="conn-123")
             await client._handle_tcp_connect(msg, client._websocket)
-            
-            # 等待连接建立
-            await asyncio.sleep(0.1)
-            
+
             # 验证连接已注册
             assert "conn-123" in client._tcp_connections
+
+            # 放行读循环收尾（EOF → 回执 tcp_close 并从连接表移除）
+            release.set()
+            for _ in range(100):
+                if "conn-123" not in client._tcp_connections:
+                    break
+                await asyncio.sleep(0.01)
+            assert "conn-123" not in client._tcp_connections
 
 
 class TestTunnelModelMode:

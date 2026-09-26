@@ -224,11 +224,12 @@ class TunnelRequestLog(Base):
             "tunnel_domain": self.tunnel_domain,
             "method": self.method,
             "path": self.path,
-            "request_headers": json.loads(self.request_headers) if self.request_headers else None,
-            "request_body": self.request_body[:500] if self.request_body else None,  # 只返回前 500 字符
+            # is not None：falsy body/header（如 "" / {}）也要原样返回，不因 truthiness 丢失
+            "request_headers": json.loads(self.request_headers) if self.request_headers is not None else None,
+            "request_body": self.request_body[:500] if self.request_body is not None else None,  # 只返回前 500 字符
             "status_code": self.status_code,
-            "response_headers": json.loads(self.response_headers) if self.response_headers else None,
-            "response_body": self.response_body[:500] if self.response_body else None,  # 只返回前 500 字符
+            "response_headers": json.loads(self.response_headers) if self.response_headers is not None else None,
+            "response_body": self.response_body[:500] if self.response_body is not None else None,  # 只返回前 500 字符
             "error": self.error,
             "duration_ms": self.duration_ms,
         }

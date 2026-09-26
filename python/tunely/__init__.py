@@ -9,7 +9,7 @@ WS-Tunnel - WebSocket 透明反向代理隧道
 - 分布式部署（可选 Redis）
 """
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 
 from .protocol import (
     TunnelRequest,

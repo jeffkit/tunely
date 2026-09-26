@@ -148,11 +148,13 @@ class TestForwardModeDispatch:
         await server._create_tunnel(
             CreateTunnelRequest(domain="dispatch", mode="tcp"), api_key=None
         )
+        # 0.7.0 起 forward 按 ActiveConnection.mode 缓存路由，注册时带上 mode
         await server.manager.register(
             websocket=MagicMock(),
             tunnel_id=1,
             domain="dispatch",
             token="tok",
+            mode="tcp",
         )
 
         server._forward_tcp = AsyncMock(return_value="tcp")
@@ -193,3 +195,43 @@ class TestForwardModeDispatch:
         assert result == "http"
         server._forward_http.assert_awaited_once()
         server._forward_tcp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_forward_uses_cached_mode_after_db_row_deleted(self, server: TunnelServer):
+        """0.7.0：forward 用 ActiveConnection.mode 缓存；DB 行删除后连接仍在时沿用缓存"""
+        await server._create_tunnel(
+            CreateTunnelRequest(domain="cache-tcp", mode="tcp"), api_key=None
+        )
+        await server.manager.register(
+            websocket=MagicMock(),
+            tunnel_id=1,
+            domain="cache-tcp",
+            token="tok",
+            mode="tcp",
+        )
+        # 删除 DB 行（token 轮换/隧道吊销后连接可能仍存活）
+        await server._delete_tunnel("cache-tcp", api_key=None)
+
+        server._forward_tcp = AsyncMock(return_value="tcp")
+        server._forward_http = AsyncMock(return_value="http")
+
+        result = await server.forward(
+            domain="cache-tcp", method="GET", path="/", headers={}, body=None, timeout=5
+        )
+
+        assert result == "tcp"
+        server._forward_tcp.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_unknown_mode(self, server: TunnelServer):
+        """register 收到未知 mode 时回退 http（防御 MagicMock 等异常值）"""
+        await server.manager.register(
+            websocket=MagicMock(),
+            tunnel_id=1,
+            domain="mode-guard",
+            token="tok",
+            mode="grpc",
+        )
+        conn = server.manager.get_connection_by_token("tok")
+        assert conn is not None
+        assert conn.mode == "http"

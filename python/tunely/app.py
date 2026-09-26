@@ -52,6 +52,18 @@ def _pkg_version() -> str:
         return "unknown"
 
 
+def _uvicorn_loop() -> str:
+    """uvloop 可选加速：已安装则用 uvloop，未安装回退默认事件循环。
+
+    uvloop 不在基础依赖里（extra: tunely[uvloop]），缺失时静默降级。
+    """
+    try:
+        import uvloop  # noqa: F401
+        return "uvloop"
+    except ImportError:
+        return "auto"
+
+
 class AppSettings(BaseSettings):
     """应用配置"""
     
@@ -492,6 +504,7 @@ def run_app(
         full_app,
         host=host,
         port=port,
+        loop=_uvicorn_loop(),  # uvloop 可用则加速，不可用回退默认
         ws_ping_interval=30,   # 每 30s 向客户端发 WebSocket ping，检测静默死连接
         ws_ping_timeout=10,    # 10s 内未收到 pong 则关闭连接
     )
