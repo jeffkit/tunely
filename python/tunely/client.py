@@ -54,6 +54,17 @@ from .protocol import (
 logger = logging.getLogger(__name__)
 
 
+def normalize_path(path: str) -> str:
+    """归一化服务端下发的请求路径：确保以 "/" 开头。
+
+    防止 "@evil/" 这类不以 "/" 开头的 path 在 URL 拼接时改写 authority
+    （如 ``http://127.0.0.1:3080`` + ``@evil/`` → 请求打到 evil 主机，SSRF）。
+    """
+    if path.startswith("/"):
+        return path
+    return "/" + path
+
+
 class TcpConnection:
     """
     单个 TCP 连接管理
@@ -423,8 +434,8 @@ class TunnelClient:
         start_time = time.time()
 
         try:
-            # 构建完整 URL
-            url = f"{self.config.target_url.rstrip('/')}{request.path}"
+            # 构建完整 URL（path 先归一化，防止 "@evil/" 改写 authority）
+            url = f"{self.config.target_url.rstrip('/')}{normalize_path(request.path)}"
 
             # 解析请求体
             body = None

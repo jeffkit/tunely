@@ -100,6 +100,23 @@ def _ws_client_ip(websocket: WebSocket | None) -> str | None:
     return None
 
 
+def is_valid_forward_path(path: str) -> bool:
+    """
+    校验转发路径合法性（@-SSRF 防护）
+
+    path 会被直接拼进客户端侧的 target_url + path。若不以 "/" 开头，
+    攻击者可传 "@169.254.169.254/" 之类的值，客户端拼出
+    "http://127.0.0.1:3080@169.254.169.254/..."，host 被改写为攻击者目标，
+    形成内网 SSRF。合法 path 必须以 "/" 开头。
+    """
+    return isinstance(path, str) and path.startswith("/")
+
+
+def normalize_forward_path(path: str) -> str:
+    """归一化转发路径：缺 "/" 前缀时补上（浏览器 /t/ 路由对空/相对路径容错）"""
+    return path if is_valid_forward_path(path) else f"/{path}"
+
+
 # ============== 数据结构 ==============
 
 
@@ -121,6 +138,7 @@ class PendingRequest:
 
     request_id: str
     future: asyncio.Future
+    domain: str = ""  # 归属隧道（跨隧道串扰校验用）
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -134,6 +152,7 @@ class PendingStreamRequest:
     ended: bool = False
     start_message: StreamStartMessage | None = None
     end_message: StreamEndMessage | None = None
+    domain: str = ""  # 归属隧道（跨隧道串扰校验用）
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -170,6 +189,7 @@ class PendingTcpRequest:
     conn_id: str
     future: asyncio.Future
     chunks: list[bytes] = field(default_factory=list)
+    domain: str = ""  # 归属隧道（跨隧道串扰校验用）
     created_at: datetime = field(default_factory=datetime.now)
 
 
@@ -390,14 +410,24 @@ class TunnelManager:
         """列出所有已连接的域名"""
         return list(self._domain_token_map.keys())
 
-    async def create_pending_request(self, request_id: str) -> asyncio.Future:
+    async def create_pending_request(self, request_id: str, domain: str = "") -> asyncio.Future:
         """创建待响应的请求（普通响应）"""
         future = asyncio.get_event_loop().create_future()
         self._pending_requests[request_id] = PendingRequest(
             request_id=request_id,
             future=future,
+            domain=domain,
         )
         return future
+
+    def get_pending_request_domain(self, request_id: str) -> str | None:
+        """查询待响应请求的归属隧道（不存在返回 None；跨隧道串扰校验用）"""
+        pending = self._pending_requests.get(request_id)
+        return pending.domain if pending else None
+
+    def pending_requests_count(self) -> int:
+        """当前待响应请求数（限额用）"""
+        return len(self._pending_requests)
 
     async def complete_request(self, request_id: str, response: TunnelResponse) -> bool:
         """完成请求（普通响应）"""
@@ -428,14 +458,20 @@ class TunnelManager:
 
     # ============== 流式请求支持（SSE） ==============
 
-    async def create_stream_request(self, request_id: str) -> PendingStreamRequest:
+    async def create_stream_request(self, request_id: str, domain: str = "") -> PendingStreamRequest:
         """创建待响应的流式请求"""
         pending = PendingStreamRequest(
             request_id=request_id,
             queue=asyncio.Queue(),
+            domain=domain,
         )
         self._pending_stream_requests[request_id] = pending
         return pending
+
+    def get_pending_stream_domain(self, request_id: str) -> str | None:
+        """查询流式请求的归属隧道（不存在返回 None；跨隧道串扰校验用）"""
+        pending = self._pending_stream_requests.get(request_id)
+        return pending.domain if pending else None
 
     async def handle_stream_start(self, message: StreamStartMessage) -> bool:
         """处理流式响应开始"""
@@ -571,14 +607,28 @@ class TunnelManager:
 
     # ============== TCP Pending Request（HTTP 触发的 TCP 转发） ==============
 
-    async def create_pending_tcp_request(self, conn_id: str) -> asyncio.Future:
+    async def create_pending_tcp_request(self, conn_id: str, domain: str = "") -> asyncio.Future:
         """创建待响应的 TCP 请求"""
         future = asyncio.get_event_loop().create_future()
         self._pending_tcp_requests[conn_id] = PendingTcpRequest(
             conn_id=conn_id,
             future=future,
+            domain=domain,
         )
         return future
+
+    def get_tcp_owner_domain(self, conn_id: str) -> str | None:
+        """查询 conn_id 的归属隧道（不存在返回 None；跨隧道串扰校验用）
+
+        优先查 HTTP 触发的 pending TCP 转发，其次查服务端监听的真实 TCP 连接。
+        """
+        pending = self._pending_tcp_requests.get(conn_id)
+        if pending:
+            return pending.domain or None
+        tcp_conn = self._tcp_connections.get(conn_id)
+        if tcp_conn:
+            return tcp_conn.domain or None
+        return None
 
     async def handle_tcp_response_data(self, conn_id: str, data: bytes) -> bool:
         """累积客户端返回的 TCP 响应数据"""
@@ -761,6 +811,12 @@ class TunnelServer:
             domain: str,
             request: ForwardRequest,
         ):
+            # path 安全校验（@-SSRF）：非法 path 直接 400，不触达隧道客户端
+            if not is_valid_forward_path(request.path):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid path: must start with '/'",
+                )
             return await self.forward(
                 domain=domain,
                 method=request.method,
@@ -906,6 +962,30 @@ class TunnelServer:
                 reason=None,
             )
 
+    def _reject_cross_tunnel_message(
+        self,
+        kind: str,
+        msg_key: str,
+        owner_domain: str | None,
+        conn_domain: str | None,
+    ) -> bool:
+        """
+        跨隧道消息归属校验
+
+        owner_domain 为 None 表示没有对应的 pending 记录（交由原处理路径自然
+        no-op）；存在且与当前连接 domain 不一致时，判定为疑似跨隧道串扰，
+        告警并丢弃消息。返回 True 表示消息应被丢弃。
+        """
+        if owner_domain is None:
+            return False
+        if conn_domain is None or owner_domain == conn_domain:
+            return False
+        logger.warning(
+            f"疑似跨隧道串扰: 连接 domain={conn_domain} 发送了属于 "
+            f"domain={owner_domain} 的 {kind} 消息 (key={msg_key})，已丢弃"
+        )
+        return True
+
     async def _handle_websocket(self, websocket: WebSocket) -> None:
         """处理 WebSocket 连接"""
         await websocket.accept()
@@ -1024,19 +1104,56 @@ class TunnelServer:
                 elif isinstance(message, PongMessage):
                     await self.manager.update_heartbeat(token)
                 elif isinstance(message, TunnelResponse):
-                    await self.manager.complete_request(message.id, message)
+                    # 归属校验：只完成属于当前连接所在隧道的请求（防跨隧道串扰）
+                    if not self._reject_cross_tunnel_message(
+                        "tunnel_response",
+                        message.id,
+                        self.manager.get_pending_request_domain(message.id),
+                        tunnel_domain,
+                    ):
+                        await self.manager.complete_request(message.id, message)
                 # 流式消息处理（SSE 支持）
                 elif isinstance(message, StreamStartMessage):
-                    await self.manager.handle_stream_start(message)
+                    if not self._reject_cross_tunnel_message(
+                        "stream_start",
+                        message.id,
+                        self.manager.get_pending_stream_domain(message.id),
+                        tunnel_domain,
+                    ):
+                        await self.manager.handle_stream_start(message)
                 elif isinstance(message, StreamChunkMessage):
-                    await self.manager.handle_stream_chunk(message)
+                    if not self._reject_cross_tunnel_message(
+                        "stream_chunk",
+                        message.id,
+                        self.manager.get_pending_stream_domain(message.id),
+                        tunnel_domain,
+                    ):
+                        await self.manager.handle_stream_chunk(message)
                 elif isinstance(message, StreamEndMessage):
-                    await self.manager.handle_stream_end(message)
+                    if not self._reject_cross_tunnel_message(
+                        "stream_end",
+                        message.id,
+                        self.manager.get_pending_stream_domain(message.id),
+                        tunnel_domain,
+                    ):
+                        await self.manager.handle_stream_end(message)
                 # TCP 消息处理
                 elif isinstance(message, TcpDataMessage):
-                    await self._handle_tcp_data_from_client(message)
+                    if not self._reject_cross_tunnel_message(
+                        "tcp_data",
+                        message.conn_id,
+                        self.manager.get_tcp_owner_domain(message.conn_id),
+                        tunnel_domain,
+                    ):
+                        await self._handle_tcp_data_from_client(message)
                 elif isinstance(message, TcpCloseMessage):
-                    await self._handle_tcp_close_from_client(message)
+                    if not self._reject_cross_tunnel_message(
+                        "tcp_close",
+                        message.conn_id,
+                        self.manager.get_tcp_owner_domain(message.conn_id),
+                        tunnel_domain,
+                    ):
+                        await self._handle_tcp_close_from_client(message)
                 else:
                     logger.warning(f"未知消息类型: {type(message)}")
 
@@ -1292,6 +1409,24 @@ class TunnelServer:
                 total_requests=tunnel.total_requests,
             )
 
+    async def _close_tunnel_connection(self, domain: str, reason: str) -> bool:
+        """
+        关闭隧道的存量 WebSocket 连接（吊销隧道 / 轮换 token 后调用）
+
+        旧连接的 handler 退出时其 finally 会走 unregister 清理；
+        0.6.1 的 unregister 身份校验保证 force 抢占场景不误删新连接。
+        """
+        conn = self.manager.get_connection_by_domain(domain)
+        if conn is None:
+            return False
+        try:
+            await conn.websocket.close(code=1000, reason=reason)
+        except Exception as e:
+            logger.warning(f"关闭隧道存量连接失败（忽略）: domain={domain}, error={e}")
+            return False
+        logger.info(f"已关闭隧道存量连接: domain={domain}, reason={reason}")
+        return True
+
     async def _regenerate_token(
         self, domain: str, api_key: str | None, source_ip: str | None = None
     ) -> RegenerateTokenResponse:
@@ -1310,11 +1445,14 @@ class TunnelServer:
 
             await session.commit()
 
-            await self._record_audit(
-                "regenerate", domain=domain, source_ip=source_ip
-            )
+        # 换 token 后立刻断开存量连接（旧 token 不再可用，不应继续服务）
+        await self._close_tunnel_connection(domain, reason="token rotated")
 
-            return RegenerateTokenResponse(domain=domain, token=new_token)
+        await self._record_audit(
+            "regenerate", domain=domain, detail="rotated", source_ip=source_ip
+        )
+
+        return RegenerateTokenResponse(domain=domain, token=new_token)
 
     async def _get_tunnel_logs(
         self, domain: str, limit: int, offset: int, api_key: str | None
@@ -1368,12 +1506,18 @@ class TunnelServer:
             if not deleted:
                 raise HTTPException(status_code=404, detail="Tunnel not found")
 
+        # 删除成功后立刻断开存量连接（隧道已吊销，不应继续服务）
+        await self._close_tunnel_connection(domain, reason="tunnel revoked")
+
         # 审计必须在删除会话提交之后再写：否则 SQLite 下同库第二会话
         # 会被未提交的写锁阻塞，审计静默丢失（0.6.0 实测）
+        detail = "revoked"
+        if tunnel_token:
+            detail += ";via=tunnel-token"
         await self._record_audit(
             "delete",
             domain=domain,
-            detail="via=tunnel-token" if tunnel_token else None,
+            detail=detail,
             source_ip=source_ip,
         )
 
@@ -1402,6 +1546,17 @@ class TunnelServer:
         Returns:
             ForwardResponse
         """
+        # path 安全校验（@-SSRF）：非法 path 直接拒绝（HTTP / TCP 模式统一覆盖）
+        if not is_valid_forward_path(path):
+            return ForwardResponse(
+                status=400,
+                error="Invalid path: must start with '/'",
+            )
+
+        # 转发超时上限 clamp（forward_max_timeout，0 = 不限制）
+        if self.config.forward_max_timeout > 0:
+            timeout = min(timeout, self.config.forward_max_timeout)
+
         # 检查连接
         conn = self.manager.get_connection_by_domain(domain)
         if not conn:
@@ -1450,8 +1605,18 @@ class TunnelServer:
         )
 
         try:
+            # pending 限额：达到上限直接 503（防慢响应堆积耗尽内存）
+            if self.manager.pending_requests_count() >= self.config.max_pending_requests:
+                logger.warning(
+                    f"pending 请求数已达上限 ({self.config.max_pending_requests})，拒绝转发: domain={domain}"
+                )
+                return ForwardResponse(
+                    status=503,
+                    error=f"Too many pending requests (limit={self.config.max_pending_requests})",
+                )
+
             # 创建 Future 等待响应
-            future = await self.manager.create_pending_request(request_id)
+            future = await self.manager.create_pending_request(request_id, domain=domain)
 
             # 发送请求
             await conn.websocket.send_text(request.model_dump_json())
@@ -1618,7 +1783,7 @@ class TunnelServer:
 
         try:
             # 1. 创建待响应请求
-            future = await self.manager.create_pending_tcp_request(conn_id)
+            future = await self.manager.create_pending_tcp_request(conn_id, domain=domain)
 
             # 2. 发送 TCP 连接建立消息
             connect_msg = TcpConnectMessage(conn_id=conn_id)
@@ -1801,6 +1966,12 @@ class TunnelServer:
             yield StreamEndMessage(id="error", error=f"Tunnel not connected: {domain}")
             return
 
+        # path 安全校验（@-SSRF）：与 forward() 同源风险，直接拒绝
+        if not is_valid_forward_path(path):
+            yield StreamStartMessage(id="error", status=400, headers={})
+            yield StreamEndMessage(id="error", error="Invalid path: must start with '/'")
+            return
+
         request_id = str(uuid.uuid4())
         request = TunnelRequest(
             id=request_id,
@@ -1813,7 +1984,7 @@ class TunnelServer:
 
         try:
             # 创建流式请求
-            pending = await self.manager.create_stream_request(request_id)
+            pending = await self.manager.create_stream_request(request_id, domain=domain)
 
             # 发送请求
             await conn.websocket.send_text(request.model_dump_json())
@@ -2160,9 +2331,17 @@ class TunnelServer:
         import base64
 
         sequence = 0
+        # 空闲超时：回收「连上不发数据」的慢连接（0 = 不启用）
+        idle_timeout = self.config.tcp_idle_timeout or None
         try:
             while True:
-                data = await reader.read(65536)  # 64KB chunks
+                try:
+                    data = await asyncio.wait_for(reader.read(65536), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"TCP 连接空闲超时 ({self.config.tcp_idle_timeout}s)，关闭: conn_id={conn_id}"
+                    )
+                    break
                 if not data:
                     # 对端关闭连接
                     logger.info(f"TCP 连接对端关闭: conn_id={conn_id}")

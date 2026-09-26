@@ -32,7 +32,14 @@ class TunnelServerConfig(BaseSettings):
 
     # 请求配置
     default_timeout: float = Field(default=1800.0, description="默认请求超时（秒）")
-    max_pending_requests: int = Field(default=1000, description="最大待处理请求数")
+    max_pending_requests: int = Field(
+        default=1000,
+        description="最大待处理请求数（forward 转发面限额，达到后返回 503）",
+    )
+    forward_max_timeout: float = Field(
+        default=600.0,
+        description="forward 转发超时上限（秒）：对请求传入的 timeout 做 clamp，防止长期占用；0 = 不限制（env: WS_TUNNEL_FORWARD_MAX_TIMEOUT）",
+    )
 
     # 分布式配置（可选）
     redis_url: str | None = Field(
@@ -50,7 +57,8 @@ class TunnelServerConfig(BaseSettings):
         default=None, description="TCP 监听端口（如果设置，服务端会监听此端口并转发到隧道客户端）"
     )
     tcp_listen_host: str = Field(
-        default="0.0.0.0", description="TCP 监听地址"
+        default="127.0.0.1",
+        description="TCP 监听地址（默认仅回环，安全默认值；容器/公网部署需显式设为 0.0.0.0）",
     )
     tcp_target_domain: str | None = Field(
         default=None, description="TCP 转发目标域名（必须与某个隧道域名匹配）"
@@ -63,6 +71,10 @@ class TunnelServerConfig(BaseSettings):
     tcp_max_connections: int = Field(
         default=0,
         description="每隧道 TCP 并发连接上限（0 表示不限制；env: WS_TUNNEL_TCP_MAX_CONNECTIONS）",
+    )
+    tcp_idle_timeout: int = Field(
+        default=300,
+        description="外部 TCP 连接空闲超时（秒）：连上不发数据的慢连接超时后被服务端关闭回收；0 = 不启用（env: WS_TUNNEL_TCP_IDLE_TIMEOUT）",
     )
 
     # JWT 认证（公网模式：需要 JWT 令牌才能创建隧道）

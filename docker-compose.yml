@@ -18,7 +18,10 @@ services:
       # serve CLI 不读 TUNELY_* env，host/port/database/api-key 走 command
       # TCP 监听经 WS_TUNNEL_* env 注入；多隧道用 WS_TUNNEL_TCP_LISTEN="9080:dsh,9081:foo"
       WS_TUNNEL_TCP_LISTEN: "9080:dsh"
+      # 0.6.2 起 tcp_listen_host 默认收紧为 127.0.0.1；容器出口必须显式放开
       WS_TUNNEL_TCP_LISTEN_HOST: "0.0.0.0"
+      # 每隧道 TCP 并发连接上限（0.6.2 显式启用）
+      WS_TUNNEL_TCP_MAX_CONNECTIONS: "100"
     command:
       - serve
       - --host

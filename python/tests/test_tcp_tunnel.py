@@ -450,12 +450,12 @@ class TestTcpServerConfig:
     """测试 TCP 相关配置"""
 
     def test_default_tcp_config(self):
-        """测试默认 TCP 配置"""
+        """测试默认 TCP 配置（0.6.2 起 listen_host 默认收紧为回环地址）"""
         from tunely.config import TunnelServerConfig
 
         config = TunnelServerConfig()
         assert config.tcp_listen_port is None
-        assert config.tcp_listen_host == "0.0.0.0"
+        assert config.tcp_listen_host == "127.0.0.1"
         assert config.tcp_target_domain is None
 
     def test_custom_tcp_config(self):

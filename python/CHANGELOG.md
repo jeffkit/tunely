@@ -6,6 +6,42 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-26
+
+安全审计 P0 修复批次（服务端转发面与连接生命周期）。
+
+### Security（安全加固）
+
+- **路径校验（@-SSRF）**：`forward()` 与 `/api/tunnels/{domain}/forward`
+  拒绝非 `/` 开头的 `path`（HTTP 端点直接 400）；`/t/{domain}/` 浏览器路由
+  对空/相对路径归一化补 `/` 前缀。此前 `path` 未校验直接拼进客户端的
+  `target_url + path`，攻击者可传 `@169.254.169.254/` 改写 host 形成内网 SSRF。
+  客户端 SDK 侧同步新增 `normalize_path` 兜底。
+- **跨隧道消息归属校验**：`TunnelResponse` / `Stream*` / `Tcp*` 消息路由前
+  校验 id/conn_id 的归属隧道与当前 WS 连接一致，不匹配则告警丢弃。此前任一
+  token 持有者可伪造他人响应、注入或掐断他人 TCP 流。
+- **TCP 出口安全默认值**：`tcp_listen_host` 默认值 `0.0.0.0` → `127.0.0.1`；
+  容器/公网部署需显式设 `WS_TUNNEL_TCP_LISTEN_HOST=0.0.0.0`（docker-compose
+  示例已同步，并显式启用 `WS_TUNNEL_TCP_MAX_CONNECTIONS=100`）。
+- **吊销即断连**：`DELETE /api/tunnels/{domain}` 与
+  `POST /api/tunnels/{domain}/regenerate-token` 在 DB 变更成功后立即关闭该
+  隧道的存量 WebSocket 连接（reason: `tunnel revoked` / `token rotated`），
+  审计 detail 带 `revoked` / `rotated` 标记。此前旧客户端可继续服务。
+
+### Added（新增）
+
+- `tcp_idle_timeout`（默认 300 秒，0 = 不启用，env:
+  `WS_TUNNEL_TCP_IDLE_TIMEOUT`）：外部 TCP 连接空闲超时后服务端主动关闭，
+  回收「连上不发数据」的慢连接。
+
+### Changed（变更）
+
+- **`max_pending_requests` 正式生效**：forward 转发面的 pending 请求数达到
+  上限（默认 1000）后返回 503，不再无限堆积。
+- 新增 `forward_max_timeout`（默认 600 秒，0 = 不限制，env:
+  `WS_TUNNEL_FORWARD_MAX_TIMEOUT`）：forward 对请求传入的 timeout 做 clamp，
+  防止单请求长期占用转发面。
+
 ## [0.6.0] - 2026-09-25
 
 安全加固（鉴权/限速/限额）+ 可观测性 + 流量统计持久化 + 管理面审计。

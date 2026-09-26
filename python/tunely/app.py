@@ -32,7 +32,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .server import TunnelServer, StreamStartMessage, StreamChunkMessage, StreamEndMessage
+from .server import (
+    TunnelServer,
+    StreamStartMessage,
+    StreamChunkMessage,
+    StreamEndMessage,
+    normalize_forward_path,
+)
 from .config import TunnelServerConfig
 
 logger = logging.getLogger(__name__)
@@ -258,7 +264,8 @@ def create_full_app(
     )
     async def path_prefix_forward(request: Request, tunnel_domain: str, path: str):
         """路径前缀模式 - 通过 /t/{domain}/ 转发请求到隧道"""
-        full_path = f"/{path}"
+        # 归一化补 "/" 前缀（@-SSRF 防护：保证 path 落在路径段而非 authority 段）
+        full_path = normalize_forward_path(path)
         if request.query_params:
             full_path += f"?{request.query_params}"
         return await forward_to_tunnel(request, tunnel_domain, full_path)
