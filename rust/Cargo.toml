@@ -26,7 +26,7 @@ clap = { version = "4", features = ["derive"] }
 url = "2"
 rand = "0.8"
 rand_chacha = "0.3"
-toml = "0.8"
+toml = "1.1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dev-dependencies]
