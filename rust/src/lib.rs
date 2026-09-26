@@ -4,4 +4,6 @@
 //! 认证 + 心跳 + HTTP 转发（含 SSE 流式）+ TCP 隧道模式（tcp_connect/tcp_data/tcp_close）。
 
 pub mod client;
+pub mod config;
 pub mod protocol;
+pub mod status;

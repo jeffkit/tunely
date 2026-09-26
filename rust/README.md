@@ -25,10 +25,70 @@ tunely connect \
   --server wss://your-server/ws/tunnel \
   --token tun_xxxxx \
   --target http://127.0.0.1:3080 \
-  [--reconnect 5] [--max-reconnect 0] [--request-timeout 300] [--force]
+  [--reconnect 5] [--max-reconnect 0] [--request-timeout 300] [--force] [--config path/to/client.toml]
+
+tunely status   # 查看运行中的客户端状态
 ```
 
 Ctrl-C 优雅停止。
+
+## 配置与凭据
+
+`connect` 的 `--token/--server/--target` 均可省略，取值优先级：
+**CLI 参数 > 环境变量 > 配置文件 > 内置默认**（server=`ws://localhost:8000/ws/tunnel`，
+target=`http://localhost:8080`）。三处都拿不到 token 时报错退出（退出码 1）。
+
+### 环境变量
+
+```bash
+export TUNELY_TOKEN=tun_xxxxx
+export TUNELY_SERVER=wss://your-server/ws/tunnel
+export TUNELY_TARGET=http://127.0.0.1:3080
+tunely connect
+```
+
+### 配置文件（TOML）
+
+```bash
+# 显式指定（文件必须存在）
+tunely connect --config /etc/tunely/client.toml
+# 省略时依次尝试 ./tunely-client.toml 与 ~/.config/tunely/client.toml（存在才读取，全缺省静默跳过）
+```
+
+```toml
+# tunely-client.toml —— 所有字段均可选
+server = "wss://your-server/ws/tunnel"
+token = "tun_xxxxx"
+target = "http://127.0.0.1:3080"
+reconnect_secs = 5
+max_reconnect = 0        # 0 = 无限
+request_timeout_secs = 300
+force = false
+```
+
+### status 子命令与状态文件
+
+`connect` 运行期间在状态变化点（连接成功、断开进入重连、出错、停止）把状态写入状态文件，
+路径取 `TUNELY_STATE_FILE` 环境变量，缺省为 `~/.local/state/tunely/status.json`（目录自动创建）：
+
+```json
+{"pid": 4242, "state": "connected", "domain": "dsh.example.com",
+ "reconnect_count": 0, "last_error": null, "updated_at": "2026-09-25T03:00:00.123456Z"}
+```
+
+```bash
+$ tunely status
+tunely 状态
+  pid:             4242
+  state:           connected
+  domain:          dsh.example.com
+  reconnect_count: 0
+  last_error:      -
+  updated_at:      2026-09-25T03:00:00.123456Z
+
+$ tunely status   # 状态文件不存在时
+tunely: not running   （退出码 1）
+```
 
 ## SDK 用法
 
@@ -63,7 +123,7 @@ async fn main() {
 ## 测试
 
 ```bash
-cargo test          # 6 单测（协议 roundtrip/退避/UTF-8 流解码）+ 8 集成测试
+cargo test          # 26 单测（协议 roundtrip/退避/UTF-8 流解码、配置解析与优先级合并、状态文件读写）+ 8 集成测试
 ```
 
 集成测试用真实 WebSocket（`accept_async` 起假服务端）+ 真实本地 TCP/HTTP 目标服务，
@@ -72,4 +132,6 @@ cargo test          # 6 单测（协议 roundtrip/退避/UTF-8 流解码）+ 8 �
 ## 与其他客户端的差异
 
 - 协议消息里的 `timestamp` 等纯元数据字段不发送（协议可选，服务端不强依赖）
+- **无 WS 压缩**：底层的 tokio-tungstenite 0.24 不支持 permessage-deflate 扩展，
+  Rust 客户端不启用 WebSocket 压缩
 - 其余 wire 行为与 `typescript/` 客户端逐语义对齐（含连续被拒累积退避、force 抢占）

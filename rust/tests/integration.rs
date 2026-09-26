@@ -53,10 +53,7 @@ impl FakeConn {
             }
         })
         .await;
-        match deadline {
-            Ok(v) => v,
-            Err(_) => None,
-        }
+        deadline.unwrap_or_default()
     }
 
     async fn send(&mut self, v: Value) {
@@ -77,11 +74,13 @@ impl FakeConn {
     }
 
     async fn send_auth_ok(&mut self, domain: &str) {
-        self.send(json!({"type": "auth_ok", "domain": domain, "tunnel_id": "t-1"})).await;
+        self.send(json!({"type": "auth_ok", "domain": domain, "tunnel_id": "t-1"}))
+            .await;
     }
 
     async fn send_tcp_connect(&mut self, conn_id: &str) {
-        self.send(json!({"type": "tcp_connect", "conn_id": conn_id})).await;
+        self.send(json!({"type": "tcp_connect", "conn_id": conn_id}))
+            .await;
     }
 
     async fn send_tcp_data(&mut self, conn_id: &str, payload: &[u8], seq: u32) {
@@ -102,7 +101,11 @@ impl FakeConn {
         assert_eq!(msg["type"], "tcp_data", "应为 tcp_data: {msg}");
         assert_eq!(msg["conn_id"], conn_id, "conn_id 应原样回带: {msg}");
         let data = base64::engine::general_purpose::STANDARD
-            .decode(msg["data"].as_str().unwrap_or_else(|| panic!("tcp_data 缺 data 字段: {msg}")))
+            .decode(
+                msg["data"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("tcp_data 缺 data 字段: {msg}")),
+            )
             .unwrap();
         (data, msg["sequence"].as_u64().unwrap_or(0) as u32)
     }
@@ -183,7 +186,9 @@ async fn start_echo_target(close_after_echo: bool) -> (u16, TargetStats) {
     let stats2 = stats.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { break };
+            let Ok((socket, _)) = listener.accept().await else {
+                break;
+            };
             stats2.connections.fetch_add(1, Ordering::SeqCst);
             let stats3 = stats2.clone();
             tokio::spawn(async move {
@@ -218,7 +223,9 @@ async fn start_http_target(mode: &str) -> u16 {
     let mode = mode.to_string();
     tokio::spawn(async move {
         loop {
-            let Ok((mut socket, _)) = listener.accept().await else { break };
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
             let mode = mode.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -345,7 +352,8 @@ async fn tcp_echo_bidirectional_with_sequence() {
     assert_eq!(seq, 1);
 
     // 服务端主动关闭：客户端不回执 tcp_close
-    conn.send(json!({"type": "tcp_close", "conn_id": "c1"})).await;
+    conn.send(json!({"type": "tcp_close", "conn_id": "c1"}))
+        .await;
     let late = conn.try_next_message(Duration::from_millis(300)).await;
     assert!(late.is_none(), "服务端发起的 close 不应收到回执: {late:?}");
 
@@ -497,7 +505,7 @@ async fn http_request_forwarded_to_target() {
     assert_eq!(msg["status"], 200);
     assert_eq!(msg["body"], "ok-from-target");
     // duration_ms 为 0 时按 wire 约定省略字段（serde skip_serializing_if）
-    assert!(msg["duration_ms"].as_u64().map_or(true, |v| v < 60_000));
+    assert!(msg["duration_ms"].as_u64().is_none_or(|v| v < 60_000));
 
     h.stop().await;
 }
