@@ -1,0 +1,237 @@
+{
+  "_comment": "跨实现 wire 协议 conformance：input_json 为服务端/客户端实际发出的 compact JSON（Python 服务端 model_dump_json 风格：compact、snake_case、带 timestamp 等多余字段，验证解析端容忍）。expect 为解析后必须成立的断言：type 必须一致，fields 为「三种实现（py/rust/ts）解析同一 input_json 后都应有确定值」的字段子集。timestamp 这类纯元数据不进 fields；force=false / sequence=0 / duration_ms=0 等 Rust 侧线上省略的零值也不进 fields（见各场景）。消费方：python/tests/test_wire_conformance.py、rust/tests/wire_conformance.rs（TS 侧已有内联 conformance 测试）。",
+  "scenarios": [
+    {
+      "name": "auth_force_true",
+      "input_json": "{\"type\":\"auth\",\"token\":\"tok_dev_abc123\",\"client_version\":\"0.5.0\",\"force\":true}",
+      "expect": {
+        "type": "auth",
+        "fields": {
+          "token": "tok_dev_abc123",
+          "client_version": "0.5.0",
+          "force": true
+        }
+      }
+    },
+    {
+      "name": "auth_force_default",
+      "input_json": "{\"type\":\"auth\",\"token\":\"tok_dev_def456\",\"client_version\":\"0.5.0\"}",
+      "expect": {
+        "type": "auth",
+        "fields": {
+          "token": "tok_dev_def456",
+          "client_version": "0.5.0"
+        }
+      }
+    },
+    {
+      "name": "auth_ok_full",
+      "input_json": "{\"type\":\"auth_ok\",\"domain\":\"abc123.tunnel.example.com\",\"tunnel_id\":\"tid-20260925-001\",\"server_version\":\"0.5.0\"}",
+      "expect": {
+        "type": "auth_ok",
+        "fields": {
+          "domain": "abc123.tunnel.example.com",
+          "tunnel_id": "tid-20260925-001",
+          "server_version": "0.5.0"
+        }
+      }
+    },
+    {
+      "name": "auth_error_with_code",
+      "input_json": "{\"type\":\"auth_error\",\"error\":\"invalid token\",\"code\":\"INVALID_TOKEN\"}",
+      "expect": {
+        "type": "auth_error",
+        "fields": {
+          "error": "invalid token",
+          "code": "INVALID_TOKEN"
+        }
+      }
+    },
+    {
+      "name": "request_full",
+      "input_json": "{\"type\":\"request\",\"id\":\"req-001\",\"method\":\"POST\",\"path\":\"/api/items\",\"headers\":{\"content-type\":\"application/json\",\"x-forwarded-host\":\"abc123.tunnel.example.com\"},\"body\":\"{\\\"name\\\":\\\"widget\\\"}\",\"timeout\":30.5,\"timestamp\":\"2026-09-25T02:00:00.123456+00:00\"}",
+      "expect": {
+        "type": "request",
+        "fields": {
+          "id": "req-001",
+          "method": "POST",
+          "path": "/api/items",
+          "headers": {
+            "content-type": "application/json",
+            "x-forwarded-host": "abc123.tunnel.example.com"
+          },
+          "body": "{\"name\":\"widget\"}",
+          "timeout": 30.5
+        }
+      }
+    },
+    {
+      "name": "request_minimal_get",
+      "input_json": "{\"type\":\"request\",\"id\":\"req-002\",\"method\":\"GET\",\"path\":\"/healthz\",\"timestamp\":\"2026-09-25T02:00:00.123456+00:00\"}",
+      "expect": {
+        "type": "request",
+        "fields": {
+          "id": "req-002",
+          "method": "GET",
+          "path": "/healthz"
+        }
+      }
+    },
+    {
+      "name": "response_success",
+      "input_json": "{\"type\":\"response\",\"id\":\"req-001\",\"status\":200,\"headers\":{\"content-type\":\"application/json\"},\"body\":\"{\\\"ok\\\":true}\",\"error\":null,\"duration_ms\":42,\"timestamp\":\"2026-09-25T02:00:00.200000+00:00\"}",
+      "expect": {
+        "type": "response",
+        "fields": {
+          "id": "req-001",
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"ok\":true}",
+          "error": null,
+          "duration_ms": 42
+        }
+      }
+    },
+    {
+      "name": "response_upstream_error",
+      "input_json": "{\"type\":\"response\",\"id\":\"req-003\",\"status\":502,\"headers\":{},\"body\":null,\"error\":\"connect ECONNREFUSED 127.0.0.1:8080\",\"duration_ms\":88,\"timestamp\":\"2026-09-25T02:00:00.300000+00:00\"}",
+      "expect": {
+        "type": "response",
+        "fields": {
+          "id": "req-003",
+          "status": 502,
+          "headers": {},
+          "body": null,
+          "error": "connect ECONNREFUSED 127.0.0.1:8080",
+          "duration_ms": 88
+        }
+      }
+    },
+    {
+      "name": "stream_start_sse",
+      "input_json": "{\"type\":\"stream_start\",\"id\":\"req-sse\",\"status\":200,\"headers\":{\"content-type\":\"text/event-stream\",\"cache-control\":\"no-cache\"},\"timestamp\":\"2026-09-25T02:00:01.000000+00:00\"}",
+      "expect": {
+        "type": "stream_start",
+        "fields": {
+          "id": "req-sse",
+          "status": 200,
+          "headers": {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache"
+          }
+        }
+      }
+    },
+    {
+      "name": "stream_chunk_with_sequence",
+      "input_json": "{\"type\":\"stream_chunk\",\"id\":\"req-sse\",\"data\":\"data: hello\\n\\n\",\"sequence\":2,\"timestamp\":\"2026-09-25T02:00:01.100000+00:00\"}",
+      "expect": {
+        "type": "stream_chunk",
+        "fields": {
+          "id": "req-sse",
+          "data": "data: hello\n\n",
+          "sequence": 2
+        }
+      }
+    },
+    {
+      "name": "stream_end_normal",
+      "input_json": "{\"type\":\"stream_end\",\"id\":\"req-sse\",\"error\":null,\"duration_ms\":1500,\"total_chunks\":3,\"timestamp\":\"2026-09-25T02:00:02.000000+00:00\"}",
+      "expect": {
+        "type": "stream_end",
+        "fields": {
+          "id": "req-sse",
+          "error": null,
+          "duration_ms": 1500,
+          "total_chunks": 3
+        }
+      }
+    },
+    {
+      "name": "stream_end_error",
+      "input_json": "{\"type\":\"stream_end\",\"id\":\"req-sse-broken\",\"error\":\"upstream connection reset\",\"duration_ms\":600,\"total_chunks\":2,\"timestamp\":\"2026-09-25T02:00:02.500000+00:00\"}",
+      "expect": {
+        "type": "stream_end",
+        "fields": {
+          "id": "req-sse-broken",
+          "error": "upstream connection reset",
+          "duration_ms": 600,
+          "total_chunks": 2
+        }
+      }
+    },
+    {
+      "name": "tcp_connect_new_conn",
+      "input_json": "{\"type\":\"tcp_connect\",\"conn_id\":\"conn-7f3a\",\"timestamp\":\"2026-09-25T02:00:03.000000+00:00\"}",
+      "expect": {
+        "type": "tcp_connect",
+        "fields": {
+          "conn_id": "conn-7f3a"
+        }
+      }
+    },
+    {
+      "name": "tcp_data_sequence_zero",
+      "input_json": "{\"type\":\"tcp_data\",\"conn_id\":\"conn-7f3a\",\"data\":\"aGk=\",\"sequence\":0,\"timestamp\":\"2026-09-25T02:00:03.100000+00:00\"}",
+      "expect": {
+        "type": "tcp_data",
+        "fields": {
+          "conn_id": "conn-7f3a",
+          "data": "aGk="
+        }
+      }
+    },
+    {
+      "name": "tcp_data_sequence_five",
+      "input_json": "{\"type\":\"tcp_data\",\"conn_id\":\"conn-7f3a\",\"data\":\"aGVsbG8gdGNw\",\"sequence\":5,\"timestamp\":\"2026-09-25T02:00:03.200000+00:00\"}",
+      "expect": {
+        "type": "tcp_data",
+        "fields": {
+          "conn_id": "conn-7f3a",
+          "data": "aGVsbG8gdGNw",
+          "sequence": 5
+        }
+      }
+    },
+    {
+      "name": "tcp_close_normal",
+      "input_json": "{\"type\":\"tcp_close\",\"conn_id\":\"conn-7f3a\",\"error\":null,\"timestamp\":\"2026-09-25T02:00:04.000000+00:00\"}",
+      "expect": {
+        "type": "tcp_close",
+        "fields": {
+          "conn_id": "conn-7f3a",
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "tcp_close_with_error",
+      "input_json": "{\"type\":\"tcp_close\",\"conn_id\":\"conn-refused\",\"error\":\"connect ECONNREFUSED 127.0.0.1:8080\",\"timestamp\":\"2026-09-25T02:00:04.500000+00:00\"}",
+      "expect": {
+        "type": "tcp_close",
+        "fields": {
+          "conn_id": "conn-refused",
+          "error": "connect ECONNREFUSED 127.0.0.1:8080"
+        }
+      }
+    },
+    {
+      "name": "ping_with_timestamp",
+      "input_json": "{\"type\":\"ping\",\"timestamp\":\"2026-09-25T02:00:05.000000+00:00\"}",
+      "expect": {
+        "type": "ping",
+        "fields": {}
+      }
+    },
+    {
+      "name": "pong_with_timestamp",
+      "input_json": "{\"type\":\"pong\",\"timestamp\":\"2026-09-25T02:00:05.100000+00:00\"}",
+      "expect": {
+        "type": "pong",
+        "fields": {}
+      }
+    }
+  ]
+}
