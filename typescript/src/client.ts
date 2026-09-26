@@ -55,6 +55,16 @@ export interface TunnelClientEvents {
   onError?: (error: Error) => void;
 }
 
+/**
+ * 归一化服务端下发的请求路径：确保以 "/" 开头。
+ *
+ * 防止 "@evil/" 这类不以 "/" 开头的 path 在 URL 拼接时改写 authority
+ * （如 `http://127.0.0.1:3080` + `@evil/` → 请求打到 evil 主机，SSRF）。
+ */
+export function normalizePath(path: string): string {
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
 /** 单个本地 TCP 连接的状态（TCP 模式） */
 interface TcpConnState {
   socket: net.Socket;
@@ -328,8 +338,8 @@ export class TunnelClient {
     const startTime = Date.now();
 
     try {
-      // 构建完整 URL
-      const url = `${this.config.targetUrl.replace(/\/$/, '')}${request.path}`;
+      // 构建完整 URL（path 先归一化，防止 "@evil/" 改写 authority）
+      const url = `${this.config.targetUrl.replace(/\/$/, '')}${normalizePath(request.path)}`;
 
       // 解析请求体
       let body: string | undefined;

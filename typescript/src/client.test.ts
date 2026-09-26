@@ -73,6 +73,20 @@ function calculateBackoffDelay(
   };
 }
 
+describe('normalizePath（@-SSRF 路径拼接防护）', () => {
+  it('should prefix path starting with @ so it cannot rewrite URL authority', () => {
+    expect(normalizePath('@evil/x')).toBe('/@evil/x');
+  });
+
+  it('should keep absolute path unchanged', () => {
+    expect(normalizePath('/ok')).toBe('/ok');
+  });
+
+  it('should map empty path to root', () => {
+    expect(normalizePath('')).toBe('/');
+  });
+});
+
 describe('Header Cleaning', () => {
   it('should remove hop-by-hop headers', () => {
     const input = {
@@ -229,7 +243,7 @@ describe('Exponential Backoff', () => {
 // ws.on('close') 中检查 wasConnected，如果之前已建立连接则触发 onDisconnect。
 // ================================================================
 
-import { TunnelClient } from './client.js';
+import { TunnelClient, normalizePath } from './client.js';
 
 /** 辅助：创建真实 TunnelClient 并获取底层 MockWebSocket 实例 */
 async function createConnectedClient(): Promise<{
