@@ -511,6 +511,34 @@ async fn http_request_forwarded_to_target() {
 }
 
 #[tokio::test]
+async fn http_request_with_at_path_stays_on_target() {
+    // SSRF 回归：path="@evil/" 不改写 URL authority，请求仍打到本地目标服务
+    let mut server = FakeServer::start().await;
+    let port = start_http_target("text").await;
+    let mut h = spawn_client(&server.ws_url(), &format!("http://127.0.0.1:{port}")).await;
+
+    let mut conn = server.next_conn().await;
+    conn.expect_auth().await;
+    conn.send_auth_ok("dsh").await;
+    h.expect_connected("dsh").await;
+
+    conn.send(json!({
+        "type": "request", "id": "r-ssrf", "method": "GET", "path": "@evil/",
+        "headers": {}, "body": null, "timeout": 5
+    }))
+    .await;
+
+    let msg = conn.next_message().await;
+    assert_eq!(msg["type"], "response", "{msg}");
+    assert_eq!(msg["id"], "r-ssrf");
+    // 未修复时会尝试连接攻击者主机并以 503/500 失败；修复后正常命中本地目标
+    assert_eq!(msg["status"], 200, "{msg}");
+    assert_eq!(msg["body"], "ok-from-target", "{msg}");
+
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn sse_response_streamed() {
     let mut server = FakeServer::start().await;
     let port = start_http_target("sse").await;

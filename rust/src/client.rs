@@ -29,6 +29,18 @@ fn error(msg: impl AsRef<str>) {
     eprintln!("{}", msg.as_ref());
 }
 
+/// 归一化服务端下发的请求路径：确保以 "/" 开头。
+///
+/// 防止 "@evil/" 这类不以 "/" 开头的 path 在 URL 拼接时改写 authority
+/// （如 `http://127.0.0.1:3080` + `@evil/` → 请求打到 evil 主机，SSRF）。
+pub fn normalize_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    }
+}
+
 /// 客户端配置
 #[derive(Debug, Clone)]
 pub struct TunnelClientConfig {
@@ -467,7 +479,7 @@ fn spawn_http_request(
     let session = session.clone();
     tokio::spawn(async move {
         let start = std::time::Instant::now();
-        let url = format!("{}{}", session.target_base, path);
+        let url = format!("{}{}", session.target_base, normalize_path(&path));
         let http_method =
             reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
 
@@ -726,4 +738,25 @@ async fn cleanup_tcp(session: &Session) {
         }
     }
     tcp.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_path;
+
+    #[test]
+    fn normalize_path_prefixes_path_starting_with_at() {
+        // "@evil/x" 若直接拼接会改写 URL authority（SSRF）
+        assert_eq!(normalize_path("@evil/x"), "/@evil/x");
+    }
+
+    #[test]
+    fn normalize_path_keeps_absolute_path() {
+        assert_eq!(normalize_path("/ok"), "/ok");
+    }
+
+    #[test]
+    fn normalize_path_empty_becomes_root() {
+        assert_eq!(normalize_path(""), "/");
+    }
 }
