@@ -24,6 +24,7 @@ from tunely.cli import serve
 from tunely.config import TunnelServerConfig
 from tunely.protocol import AuthMessage, PongMessage
 from tunely.server import CreateTunnelRequest, TcpConnectionState, TunnelServer
+from tunely.server import TunnelManager
 
 
 # ============== 任务1：常数时间比较 ==============
@@ -403,3 +404,56 @@ class TestCorsDefaultTightened:
         """CLI serve 的 --cors-origins 默认值同步为空"""
         param = next(p for p in serve.params if p.name == "cors_origins")
         assert param.default == ""
+
+
+# ============== 0.6.1 回归：协议 keepalive 与注销身份校验 ==============
+
+
+@pytest.mark.asyncio
+async def test_unregister_identity_check_prevents_takeover_erasion():
+    """force 抢占后，旧连接的退出不得误删新连接的注册（0.6.1 修复）"""
+    manager = TunnelManager()
+    ws_old, ws_new = MagicMock(), MagicMock()
+
+    await manager.register(websocket=ws_old, tunnel_id=1, domain="d", token="t", force=True)
+    await manager.register(websocket=ws_new, tunnel_id=2, domain="d", token="t", force=True)
+
+    # 旧连接退出：注册表仍指向新连接，不应被误删
+    await manager.unregister("t", websocket=ws_old)
+    conn = manager.get_connection_by_domain("d")
+    assert conn is not None and conn.websocket is ws_new
+
+    # 新连接退出：正常注销
+    await manager.unregister("t", websocket=ws_new)
+    assert manager.get_connection_by_domain("d") is None
+
+
+def test_ws_ping_gets_pong_full_app():
+    """端到端：客户端协议 ping 必须收到 pong（keepalive 依赖此行为，
+    服务端消息循环曾缺 Ping 分支导致客户端无限重连——0.6.1 回归）"""
+    from fastapi.testclient import TestClient
+
+    from tunely.app import create_full_app
+
+    app = create_full_app(
+        domain="ping.test",
+        database_url="sqlite+aiosqlite:///:memory:",
+        admin_api_key="k",
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/tunnels",
+            json={"domain": "ping-dom"},
+            headers={"x-api-key": "k"},
+        )
+        assert resp.status_code == 200, resp.text
+        token = resp.json()["token"]
+
+        with client.websocket_connect("/ws/tunnel") as ws:
+            ws.send_json({"type": "auth", "token": token, "client_version": "test"})
+            auth_ok = ws.receive_json()
+            assert auth_ok["type"] == "auth_ok"
+
+            ws.send_json({"type": "ping"})
+            pong = ws.receive_json()
+            assert pong["type"] == "pong", pong

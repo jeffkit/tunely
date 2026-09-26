@@ -42,13 +42,17 @@ dependencies = [
 mysql = ["aiomysql>=0.2.0"]
 postgres = ["asyncpg>=0.29.0"]
 redis = ["redis>=5.0.0"]
+all = ["tunely[mysql,postgres,redis]"]
+
+# PEP 735 依赖组：uv sync 默认安装 dev 组（CI 门禁依赖此语义；
+# 0.6.0 曾把 pytest 放在 optional-dependencies 里导致 CI 从未绿过）
+[dependency-groups]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
     "httpx>=0.26.0",
 ]
-all = ["tunely[mysql,postgres,redis,dev]"]
 
 [project.urls]
 Homepage = "https://github.com/user/tunely"

@@ -352,13 +352,24 @@ class TunnelManager:
             logger.info(f"隧道已连接: domain={domain}")
             return (True, None)
 
-    async def unregister(self, token: str) -> None:
-        """注销隧道连接"""
+    async def unregister(self, token: str, websocket=None) -> None:
+        """注销隧道连接
+
+        websocket 传入当前退出处理的连接时做身份校验：force 抢占后注册表
+        已指向新连接，旧连接的清理不得误删新注册（0.6.1 回归修复）。
+        """
         async with self._lock:
-            conn = self._connections.pop(token, None)
-            if conn:
-                self._domain_token_map.pop(conn.domain, None)
-                logger.info(f"隧道已断开: domain={conn.domain}")
+            conn = self._connections.get(token)
+            if conn is None:
+                return
+            if websocket is not None and conn.websocket is not websocket:
+                logger.info(
+                    f"跳过注销: token={token} 已被新连接接管 (domain={conn.domain})"
+                )
+                return
+            self._connections.pop(token, None)
+            self._domain_token_map.pop(conn.domain, None)
+            logger.info(f"隧道已断开: domain={conn.domain}")
 
     def get_connection_by_domain(self, domain: str) -> ActiveConnection | None:
         """根据域名获取连接"""
@@ -1005,7 +1016,12 @@ class TunnelServer:
                 data = json.loads(raw_message)
                 message = parse_message(data)
 
-                if isinstance(message, PongMessage):
+                if isinstance(message, PingMessage):
+                    # 协议级 keepalive：客户端周期性发 Ping，必须回 Pong，
+                    # 否则客户端看门狗会误判连接死亡而重连（0.6.1 回归修复）
+                    await self.manager.update_heartbeat(token)
+                    await websocket.send_text(PongMessage().model_dump_json())
+                elif isinstance(message, PongMessage):
                     await self.manager.update_heartbeat(token)
                 elif isinstance(message, TunnelResponse):
                     await self.manager.complete_request(message.id, message)
@@ -1036,7 +1052,9 @@ class TunnelServer:
             logger.error(f"WebSocket 错误: {e}", exc_info=True)
         finally:
             if token and success:
-                await self.manager.unregister(token)
+                # 仅当注册表仍指向当前连接时才注销——force 抢占后
+                # 注册表已是新连接，旧连接的退出不得误删（0.6.1 回归修复）
+                await self.manager.unregister(token, websocket=websocket)
 
     def _verify_jwt_token(self, authorization: str | None) -> dict | None:
         """验证 JWT Bearer token，返回 payload 或 None"""
