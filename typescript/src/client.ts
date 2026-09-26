@@ -65,6 +65,12 @@ export function normalizePath(path: string): string {
   return path.startsWith('/') ? path : `/${path}`;
 }
 
+/**
+ * WS 发送背压阈值：出站缓冲超过该值时暂停发送，等待对端消化。
+ * 防止上行慢于本地产生数据时，ws 库内部缓冲无界增长。
+ */
+const WS_MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
+
 /** 单个本地 TCP 连接的状态（TCP 模式） */
 interface TcpConnState {
   socket: net.Socket;
@@ -72,6 +78,10 @@ interface TcpConnState {
   sequence: number;
   /** 是否已发送过 tcp_close（保证幂等） */
   closeSent: boolean;
+  /** 发往服务端的发送串行链：背压等待时保持 tcp_data / tcp_close 顺序 */
+  sendChain: Promise<void>;
+  /** 写入本地目标的串行链：socket 缓冲满时等 drain，保持写入顺序 */
+  writeChain: Promise<void>;
 }
 
 export class TunnelClient {
@@ -132,8 +142,7 @@ export class TunnelClient {
       try {
         await this.connectAndRun();
         if (!this.running) break;
-        this.connected = false;
-        this.events.onDisconnect?.();
+        this.notifyDisconnect();
         const reconnectDelay = this.config.reconnectInterval;
         console.warn(`连接已关闭，${(reconnectDelay / 1000).toFixed(1)}秒后重连`);
         await this.sleep(reconnectDelay);
@@ -141,8 +150,7 @@ export class TunnelClient {
       } catch (error) {
         if (!this.running) break;
 
-        this.connected = false;
-        this.events.onDisconnect?.();
+        this.notifyDisconnect();
 
         this.reconnectCount++;
         const maxAttempts = this.config.maxReconnectAttempts;
@@ -252,7 +260,7 @@ export class TunnelClient {
               break;
 
             case MessageType.PING:
-              ws.send(JSON.stringify(createPongMessage()));
+              await this.sendToWs(ws, JSON.stringify(createPongMessage()));
               break;
 
             case MessageType.PONG:
@@ -288,14 +296,12 @@ export class TunnelClient {
         clearInterval(keepaliveTimer);
         // WebSocket 断开后服务端会重新分配 conn_id，旧本地连接全部丢弃，防止泄漏
         this.cleanupTcpConnections();
-        const wasConnected = this.connected;
-        this.connected = false;
+        // 无论是正常关闭还是异常关闭，只要之前是已认证状态，都需要触发 onDisconnect
+        // 否则调用方（如 tunnelService）的状态会停留在 connected=true，导致 UI 显示误连接。
+        // F12：close handler 与 run 循环两条路径都会到达 notifyDisconnect，
+        // 由 connected 标志去重，保证每次已认证连接断开恰好触发一次。
+        this.notifyDisconnect();
         this.domain = null;
-        // 无论是正常关闭还是异常关闭，只要之前是已连接状态，都需要触发 onDisconnect
-        // 否则调用方（如 tunnelService）的状态会停留在 connected=true，导致 UI 显示误连接
-        if (wasConnected) {
-          this.events.onDisconnect?.();
-        }
         resolve();
       });
 
@@ -315,6 +321,18 @@ export class TunnelClient {
     this.consecutiveRejectCount = 0;
     console.log(`已连接: domain=${this.domain}`);
     this.events.onConnect?.(this.domain);
+  }
+
+  /**
+   * 断开通知（恰好一次，F12）：仅当从「已认证」状态跌落时触发。
+   * close handler 与 run 循环（成功/异常分支）都会到达这里，
+   * 用 connected 标志去重，保证每次已认证连接断开恰好回调一次 onDisconnect。
+   */
+  private notifyDisconnect(): void {
+    if (this.connected) {
+      this.connected = false;
+      this.events.onDisconnect?.();
+    }
   }
 
   private handleAuthError(message: AuthErrorMessage): void {
@@ -419,7 +437,7 @@ export class TunnelClient {
           undefined,
           durationMs
         );
-        ws.send(JSON.stringify(response));
+        await this.sendToWs(ws, JSON.stringify(response));
       } finally {
         clearTimeout(timeoutId);
         await dispatcher.close();
@@ -461,7 +479,7 @@ export class TunnelClient {
         );
       }
 
-      ws.send(JSON.stringify(response));
+      await this.sendToWs(ws, JSON.stringify(response));
     }
   }
 
@@ -484,7 +502,7 @@ export class TunnelClient {
       headers,
       timestamp: new Date().toISOString(),
     };
-    ws.send(JSON.stringify(startMsg));
+    await this.sendToWs(ws, JSON.stringify(startMsg));
 
     let chunkCount = 0;
     let errorMsg: string | undefined;
@@ -506,7 +524,7 @@ export class TunnelClient {
             sequence: chunkCount,
             timestamp: new Date().toISOString(),
           };
-          ws.send(JSON.stringify(chunkMsg));
+          await this.sendToWs(ws, JSON.stringify(chunkMsg));
           chunkCount++;
         }
       }
@@ -525,7 +543,7 @@ export class TunnelClient {
       total_chunks: chunkCount,
       timestamp: new Date().toISOString(),
     };
-    ws.send(JSON.stringify(endMsg));
+    await this.sendToWs(ws, JSON.stringify(endMsg));
   }
 
   // ============== TCP 模式处理方法 ==============
@@ -545,6 +563,8 @@ export class TunnelClient {
       socket: net.connect({ host: this.targetHost, port: this.targetPort }),
       sequence: 0,
       closeSent: false,
+      sendChain: Promise.resolve(),
+      writeChain: Promise.resolve(),
     };
     this.tcpConnections.set(connId, state);
 
@@ -556,7 +576,10 @@ export class TunnelClient {
         sequence: state.sequence++,
         timestamp: new Date().toISOString(),
       };
-      this.sendToWs(ws, JSON.stringify(msg));
+      // 经串行链发送：WS 背压等待时不乱序，也保证 tcp_close 不会插队到 tcp_data 前
+      state.sendChain = state.sendChain
+        .then(() => this.sendToWs(ws, JSON.stringify(msg)))
+        .catch(() => {});
     });
 
     // 连接失败（如目标端口拒绝）：向服务端回执带 error 的 tcp_close，由其关闭外部连接
@@ -577,6 +600,9 @@ export class TunnelClient {
 
   /**
    * 处理来自服务端的 TCP 数据：解码后写入本地连接
+   *
+   * 写入走串行链：socket.write() 返回 false（内核缓冲满）时等一次 'drain' 再写下一批，
+   * 防止对慢速目标无界缓冲，同时保持写入顺序。
    */
   private handleTcpData(message: TcpDataMessage): void {
     const state = this.tcpConnections.get(message.conn_id);
@@ -586,7 +612,13 @@ export class TunnelClient {
     }
 
     const data = Buffer.from(message.data, 'base64');
-    state.socket.write(data);
+    state.writeChain = state.writeChain
+      .then(async () => {
+        if (!state.socket.write(data)) {
+          await this.awaitSocketDrain(state.socket);
+        }
+      })
+      .catch(() => {});
   }
 
   /**
@@ -622,7 +654,10 @@ export class TunnelClient {
       error: error ?? null,
       timestamp: new Date().toISOString(),
     };
-    this.sendToWs(ws, JSON.stringify(msg));
+    // 经串行链发送：排在未发完的 tcp_data 之后，且幂等标记同步生效
+    state.sendChain = state.sendChain
+      .then(() => this.sendToWs(ws, JSON.stringify(msg)))
+      .catch(() => {});
   }
 
   /**
@@ -639,10 +674,45 @@ export class TunnelClient {
     this.tcpConnections.clear();
   }
 
-  private sendToWs(ws: WebSocket, data: string): void {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(data);
+  /**
+   * WS 发送背压（F: 发送端无界缓冲）：出站缓冲超过 WS_MAX_BUFFERED_AMOUNT 时
+   * 循环等待回落后再发送；连接不再 OPEN 时放弃发送（由 close 路径统一收尾）。
+   */
+  private async sendToWs(ws: WebSocket, data: string): Promise<void> {
+    if (!(await this.awaitWsWritable(ws))) {
+      return;
     }
+    ws.send(data);
+  }
+
+  /** 等待 WS 出站缓冲回落；连接离开 OPEN 状态时返回 false（应放弃发送） */
+  private async awaitWsWritable(ws: WebSocket): Promise<boolean> {
+    while (
+      ws.readyState === WebSocket.OPEN &&
+      ws.bufferedAmount > WS_MAX_BUFFERED_AMOUNT
+    ) {
+      await this.sleep(10);
+    }
+    return ws.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * 等待本地 socket 缓冲排空（'drain'）；连接关闭/出错时直接返回，放弃等待。
+   */
+  private awaitSocketDrain(socket: net.Socket): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const cleanup = () => {
+        socket.off('drain', onDrain);
+        socket.off('close', onDone);
+        socket.off('error', onDone);
+        resolve();
+      };
+      const onDrain = () => cleanup();
+      const onDone = () => cleanup();
+      socket.once('drain', onDrain);
+      socket.once('close', onDone);
+      socket.once('error', onDone);
+    });
   }
 
   private sleep(ms: number): Promise<void> {

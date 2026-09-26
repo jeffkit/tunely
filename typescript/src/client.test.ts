@@ -19,6 +19,8 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 class MockWebSocket extends EventEmitter {
   // TCP 模式的发送路径会检查 readyState === OPEN(1)
   readyState = 1;
+  // WS 发送背压路径会检查该字段（超阈值时暂缓发送）
+  bufferedAmount = 0;
   send = vi.fn();
   // close() 触发 close 事件，模拟连接被关闭（本端或对端）
   close = vi.fn(function (this: MockWebSocket) {
@@ -395,8 +397,28 @@ describe('TunnelClient - onDisconnect Bug Fix（回归测试）', () => {
     client.stop();
     await runPromise.catch(() => {});
 
-    // error 路径 + close 路径各自可能都触发，至少应有 1 次
-    expect(disconnectSpy).toHaveBeenCalled();
+    // F12 修复后：error 路径与 close 路径去重，已认证断开恰好触发一次
+    expect(disconnectSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('已认证连接断开后 onDisconnect 恰好触发一次（F12 单次回归）', async () => {
+    // 不立即 stop()：先让 run 循环走完「close → resolve → 成功分支」，
+    // 覆盖 close handler 与 run 循环可能各触发一次的双重触发路径
+    const { client, mockWs, runPromise, disconnectSpy, connectSpy } =
+      await createConnectedClient();
+
+    expect(connectSpy).toHaveBeenCalledWith('test-domain');
+
+    mockWs.emit('close');
+    // 多等几拍，让 run 循环的成功分支（曾无条件再触发一次的路径）执行完
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect(disconnectSpy).toHaveBeenCalledTimes(1);
+
+    client.stop();
+    await runPromise.catch(() => {});
+    // 停止与重连等待后计数不变：整个断开过程恰好一次
+    expect(disconnectSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -822,6 +844,98 @@ describe('TunnelClient - TCP 隧道模式', () => {
   });
 });
 
+
+// ================================================================
+// 发送背压（F: 发送端无界缓冲）
+// - WS：bufferedAmount 超过 4MB 阈值时暂缓发送，回落或连接关闭后收敛
+// - 本地 socket：write() 返回 false 时等待 'drain' 再继续
+// ================================================================
+
+describe('TunnelClient - 发送背压', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('ws.bufferedAmount 超阈值时暂缓发送，回落后恢复（WS 背压）', async () => {
+    const { client, mockWs, runPromise } = await createConnectedClient();
+    try {
+      // 出站缓冲超过 4MB 阈值
+      mockWs.bufferedAmount = 4 * 1024 * 1024 + 1;
+
+      // 服务端 ping → 客户端应回 pong，但因背压暂缓
+      mockWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping' })));
+      await new Promise((r) => setTimeout(r, 30));
+      expect(sentMessages(mockWs).some((m) => m.type === 'pong')).toBe(false);
+
+      // 缓冲回落 → 暂缓的发送恢复
+      mockWs.bufferedAmount = 0;
+      await waitUntil(() => sentMessages(mockWs).some((m) => m.type === 'pong'));
+    } finally {
+      client.stop();
+      await runPromise.catch(() => {});
+    }
+  });
+
+  it('背压等待期间连接离开 OPEN 状态则放弃发送（关闭路径）', async () => {
+    const { client, mockWs, runPromise } = await createConnectedClient();
+    try {
+      mockWs.bufferedAmount = 4 * 1024 * 1024 + 1;
+      mockWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping' })));
+      await new Promise((r) => setImmediate(r));
+
+      // 连接关闭：readyState 离开 OPEN（真实 ws 库在 close 事件前置为 CLOSED）
+      mockWs.readyState = 3;
+      mockWs.emit('close');
+      await new Promise((r) => setTimeout(r, 30));
+
+      // 暂缓中的 pong 被放弃，且等待循环退出不悬挂
+      expect(sentMessages(mockWs).some((m) => m.type === 'pong')).toBe(false);
+    } finally {
+      client.stop();
+      await runPromise.catch(() => {});
+    }
+  });
+
+  it('本地 socket 写满（write 返回 false）时等待 drain 再继续', async () => {
+    const client = new TunnelClient({
+      serverUrl: 'ws://test-server',
+      token: 'test-token',
+      targetUrl: 'http://localhost:3000',
+    });
+    const fakeSocket = new EventEmitter();
+    let drained = false;
+    const pending = (client as any).awaitSocketDrain(fakeSocket).then(() => {
+      drained = true;
+    });
+
+    await new Promise((r) => setImmediate(r));
+    expect(drained).toBe(false); // drain 前 promise 不 settle
+
+    fakeSocket.emit('drain');
+    await pending;
+    expect(drained).toBe(true);
+  });
+
+  it('等待 drain 期间连接关闭/出错时放弃等待，不悬挂', async () => {
+    const client = new TunnelClient({
+      serverUrl: 'ws://test-server',
+      token: 'test-token',
+      targetUrl: 'http://localhost:3000',
+    });
+    const fakeSocket = new EventEmitter();
+    let drained = false;
+    const pending = (client as any).awaitSocketDrain(fakeSocket).then(() => {
+      drained = true;
+    });
+
+    await new Promise((r) => setImmediate(r));
+    expect(drained).toBe(false);
+
+    fakeSocket.emit('close');
+    await pending;
+    expect(drained).toBe(true);
+  });
+});
 
 describe('TunnelClient - keepalive', () => {
   afterEach(() => {
