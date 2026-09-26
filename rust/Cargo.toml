@@ -1,6 +1,6 @@
 [package]
 name = "tunely"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "WebSocket Tunnel Client — 透明反向代理隧道（Rust 版客户端，与服务端 wire 协议对齐）"
 license = "MIT"

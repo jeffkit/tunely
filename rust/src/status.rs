@@ -54,7 +54,8 @@ pub fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-/// 写状态文件：父目录不存在则创建，整体覆盖写。
+/// 写状态文件：父目录不存在则创建；先写同目录 `.tmp` 临时文件再 `rename` 原子替换，
+/// 避免读侧（status 子命令）读到半截 JSON（F21）。
 pub fn write_status(path: &Path, data: &StatusData) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -64,7 +65,23 @@ pub fn write_status(path: &Path, data: &StatusData) -> io::Result<()> {
     let mut json = serde_json::to_string_pretty(data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     json.push('\n');
-    fs::write(path, json)
+    let tmp = tmp_path_for(path);
+    fs::write(&tmp, json)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        // rename 失败时清理临时文件，避免残留垃圾
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 同目录临时文件路径：`<name>.tmp`（rename 在同一文件系统上才是原子操作）
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "status.json".to_string());
+    path.with_file_name(format!("{name}.tmp"))
 }
 
 /// 读状态文件：文件不存在 → NotFound；内容损坏 → InvalidData。
@@ -142,6 +159,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_status(&dir.path().join("nope.json")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn write_status_is_atomic_and_leaves_no_tmp_leftover() {
+        // F21：覆盖写走「临时文件 + rename」，不残留 .tmp，且读侧始终看到完整内容
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        write_status(&path, &sample(RunState::Connected)).unwrap();
+        write_status(&path, &sample(RunState::Disconnected)).unwrap();
+
+        assert_eq!(read_status(&path).unwrap().state, RunState::Disconnected);
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["status.json".to_string()]);
     }
 
     #[test]

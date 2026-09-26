@@ -128,10 +128,14 @@ struct TcpConn {
     close_sent: AtomicBool,
 }
 
+/// WS 发送通道容量：有界队列提供背压——本地产生数据快于 WS 出口时，
+/// 生产者（HTTP/SSE/TCP 读循环）在此阻塞而不是无界占用内存。
+const TX_CHANNEL_CAPACITY: usize = 256;
+
 /// 单次 WebSocket 会话内共享的发送通道与本地连接表
 #[derive(Clone)]
 struct Session {
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
     tcp: Arc<Mutex<HashMap<String, Arc<TcpConn>>>>,
     http: reqwest::Client,
     target_base: String,
@@ -276,9 +280,16 @@ impl TunnelClient {
     }
 
     /// 停止客户端（幂等；当前连接与重连等待都会尽快退出）
+    ///
+    /// 用 notify_one 而非 notify_waiters：notify_waiters 只唤醒「已存在的等待者」
+    /// 且不存储许可，若 stop() 时恰好没有等待者（如刚进入下一轮循环的瞬间），
+    /// 唤醒会整体丢失，Ctrl-C 后要等满整个 backoff 才退出。
+    /// notify_one 会存储一个许可，保证后续任意一次 notified() 立即完成。
+    /// 运行期同一时刻至多只有一个 notified() 等待者（select 循环或 sleep_interruptible），
+    /// 单许可语义足够。
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        self.stop.notify_waiters();
+        self.stop.notify_one();
     }
 
     async fn sleep_interruptible(&self, d: Duration) {
@@ -300,7 +311,7 @@ impl TunnelClient {
             .map_err(|e| ConnectError::Io(format!("WebSocket 连接失败: {e}")))?;
 
         let (mut sink, mut stream) = ws.split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::channel::<Message>(TX_CHANNEL_CAPACITY);
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if sink.send(WsMessage::Text(msg.to_json())).await.is_err() {
@@ -324,6 +335,7 @@ impl TunnelClient {
 
         // 发送认证
         tx.send(Message::auth(&self.config.token, force))
+            .await
             .map_err(|_| ConnectError::Io("发送认证失败".into()))?;
 
         // keepalive：周期 ping + pong 看门狗。空闲长连接会被中间设备静默丢弃，
@@ -348,7 +360,7 @@ impl TunnelClient {
                         dead.notify_waiters();
                         break;
                     }
-                    if tx.send(Message::Ping {}).is_err() {
+                    if tx.send(Message::Ping {}).await.is_err() {
                         break;
                     }
                 }
@@ -412,7 +424,7 @@ impl TunnelClient {
                     break;
                 }
                 Message::Ping {} => {
-                    let _ = session.tx.send(Message::pong());
+                    let _ = session.tx.send(Message::pong()).await;
                 }
                 Message::Request {
                     id,
@@ -480,8 +492,16 @@ fn spawn_http_request(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         let url = format!("{}{}", session.target_base, normalize_path(&path));
-        let http_method =
-            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let http_method = match reqwest::Method::from_bytes(method.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                // F18：非法 HTTP 方法不能静默变 GET——回退保留，但必须留下日志
+                warn(format!(
+                    "非法 HTTP 方法 '{method}'（request {id}），回退为 GET"
+                ));
+                reqwest::Method::GET
+            }
+        };
 
         let timeout_secs = timeout.unwrap_or(session.request_timeout.as_secs_f64());
         let timeout_dur = Duration::from_secs_f64(timeout_secs.max(0.0));
@@ -528,14 +548,17 @@ fn spawn_http_request(
                 } else {
                     let body = resp.text().await.unwrap_or_default();
                     let duration = start.elapsed().as_millis() as u64;
-                    let _ = session.tx.send(Message::response(
-                        &id,
-                        status,
-                        resp_headers,
-                        Some(body),
-                        None,
-                        duration,
-                    ));
+                    let _ = session
+                        .tx
+                        .send(Message::response(
+                            &id,
+                            status,
+                            resp_headers,
+                            Some(body),
+                            None,
+                            duration,
+                        ))
+                        .await;
                 }
             }
             Err(e) => {
@@ -547,14 +570,17 @@ fn spawn_http_request(
                 } else {
                     (500, format!("{e}"))
                 };
-                let _ = session.tx.send(Message::response(
-                    &id,
-                    status,
-                    HashMap::new(),
-                    None,
-                    Some(error),
-                    duration,
-                ));
+                let _ = session
+                    .tx
+                    .send(Message::response(
+                        &id,
+                        status,
+                        HashMap::new(),
+                        None,
+                        Some(error),
+                        duration,
+                    ))
+                    .await;
             }
         }
     });
@@ -568,7 +594,10 @@ async fn handle_sse(
     mut resp: reqwest::Response,
     start: std::time::Instant,
 ) {
-    let _ = session.tx.send(Message::stream_start(id, status, headers));
+    let _ = session
+        .tx
+        .send(Message::stream_start(id, status, headers))
+        .await;
 
     let mut decoder = crate::protocol::Utf8StreamDecoder::new();
     let mut seq: u32 = 0;
@@ -579,7 +608,7 @@ async fn handle_sse(
             Ok(Some(chunk)) => {
                 let text = decoder.decode(&chunk);
                 if !text.is_empty() {
-                    let _ = session.tx.send(Message::stream_chunk(id, text, seq));
+                    let _ = session.tx.send(Message::stream_chunk(id, text, seq)).await;
                     seq += 1;
                 }
             }
@@ -592,17 +621,18 @@ async fn handle_sse(
         }
     }
 
-    // 冲洗缓存的未完成多字节序列
-    let tail = decoder.decode(&[]);
+    // 冲洗缓存的未完成多字节序列（以 U+FFFD 收尾，WHATWG 替换语义）
+    let tail = decoder.flush();
     if !tail.is_empty() {
-        let _ = session.tx.send(Message::stream_chunk(id, tail, seq));
+        let _ = session.tx.send(Message::stream_chunk(id, tail, seq)).await;
         seq += 1;
     }
 
     let duration = start.elapsed().as_millis() as u64;
     let _ = session
         .tx
-        .send(Message::stream_end(id, error_msg, duration, seq));
+        .send(Message::stream_end(id, error_msg, duration, seq))
+        .await;
 }
 
 // ============== TCP 模式 ==============
@@ -643,7 +673,8 @@ async fn handle_tcp_connect(session: &Session, conn_id: &str) {
             ));
             let _ = session
                 .tx
-                .send(Message::tcp_close(conn_id, Some(e.to_string())));
+                .send(Message::tcp_close(conn_id, Some(e.to_string())))
+                .await;
         }
     }
 }
@@ -668,6 +699,7 @@ async fn tcp_read_loop(
                 if session
                     .tx
                     .send(Message::tcp_data(conn_id, &encoded, seq))
+                    .await
                     .is_err()
                 {
                     break; // WebSocket 已断
@@ -686,7 +718,7 @@ async fn tcp_read_loop(
 async fn finish_tcp(session: &Session, conn_id: &str, conn: &Arc<TcpConn>, error: Option<String>) {
     use tokio::io::AsyncWriteExt;
     if !conn.close_sent.swap(true, Ordering::SeqCst) {
-        let _ = session.tx.send(Message::tcp_close(conn_id, error));
+        let _ = session.tx.send(Message::tcp_close(conn_id, error)).await;
     }
     {
         let mut w = conn.write.lock().await;

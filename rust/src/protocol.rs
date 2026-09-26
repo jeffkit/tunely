@@ -279,7 +279,10 @@ pub fn jitter(delay_ms: u64) -> u64 {
     ((delay_ms as f64) * f) as u64
 }
 
-/// 增量 UTF-8 解码：跨 chunk 的多字节序列缓存到下一轮（对齐 TextDecoder stream 语义）
+/// 增量 UTF-8 解码（对齐 TextDecoder stream 语义 + WHATWG 替换语义的简化版）：
+/// - 跨 chunk 的多字节序列缓存到下一轮；
+/// - 非法字节替换为 U+FFFD 并从缓冲消费（F11：否则首个非法字节会让 decode 永远返回空）；
+/// - 末尾不完整的多字节序列留给下一 chunk，流结束时用 flush() 以 U+FFFD 收尾。
 pub struct Utf8StreamDecoder {
     buf: Vec<u8>,
 }
@@ -291,21 +294,43 @@ impl Utf8StreamDecoder {
 
     pub fn decode(&mut self, chunk: &[u8]) -> String {
         self.buf.extend_from_slice(chunk);
-        let out = match std::str::from_utf8(&self.buf) {
-            Ok(s) => {
-                let owned = s.to_string();
-                self.buf.clear();
-                owned
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.buf) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.buf.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // SAFETY: valid_up_to 保证该前缀是合法 UTF-8
+                        out.push_str(unsafe { std::str::from_utf8_unchecked(&self.buf[..valid]) });
+                    }
+                    self.buf.drain(..valid);
+                    match e.error_len() {
+                        // 确定的非法序列：替换为 U+FFFD 并消费 n 字节，绝不卡死
+                        Some(n) => {
+                            out.push('\u{FFFD}');
+                            self.buf.drain(..n);
+                        }
+                        // 末尾不完整的多字节序列：缓存等待下一个 chunk
+                        None => break,
+                    }
+                }
             }
-            Err(e) if e.valid_up_to() > 0 => {
-                let valid = e.valid_up_to();
-                let owned = unsafe { String::from_utf8_unchecked(self.buf[..valid].to_vec()) };
-                self.buf.drain(..valid);
-                owned
-            }
-            Err(_) => String::new(),
-        };
+        }
         out
+    }
+
+    /// 流结束：缓冲中残留的必然是不完整多字节序列，按 WHATWG 语义替换为 U+FFFD
+    pub fn flush(&mut self) -> String {
+        if self.buf.is_empty() {
+            return String::new();
+        }
+        self.buf.clear();
+        "\u{FFFD}".to_string()
     }
 }
 
@@ -417,5 +442,35 @@ mod tests {
         out.push_str(&d.decode(b));
         out.push_str(&d.decode(bytes));
         assert_eq!(out, format!("{full}{full}"));
+    }
+
+    #[test]
+    fn utf8_decoder_replaces_invalid_bytes_with_replacement_char() {
+        // F11：非法字节替换为 U+FFFD 并推进缓冲，不卡死
+        let mut d = Utf8StreamDecoder::new();
+        let out = d.decode(&[b'a', 0xFF, b'b']);
+        assert_eq!(out, "a\u{FFFD}b");
+        // 非法字节之后的后续 chunk 仍能正常解码
+        assert_eq!(d.decode(b"ok"), "ok");
+    }
+
+    #[test]
+    fn utf8_decoder_never_stalls_on_leading_invalid_byte() {
+        // 原 bug 场景：首个字节非法时 decode 从此永远返回空
+        let mut d = Utf8StreamDecoder::new();
+        assert_eq!(d.decode(&[0xFF]), "\u{FFFD}");
+        assert_eq!(d.decode(&[0xFF]), "\u{FFFD}");
+        assert_eq!(d.decode("你好".as_bytes()), "你好");
+    }
+
+    #[test]
+    fn utf8_decoder_flush_emits_replacement_for_truncated_tail() {
+        // 流结束时残留的截断序列以 U+FFFD 收尾，且不影响后续解码
+        let mut d = Utf8StreamDecoder::new();
+        let truncated = "你".as_bytes()[..1].to_vec(); // 0xE4，截断的 3 字节序列
+        assert_eq!(d.decode(&truncated), "");
+        assert_eq!(d.flush(), "\u{FFFD}");
+        assert_eq!(d.decode(b"next"), "next");
+        assert_eq!(d.flush(), "");
     }
 }
