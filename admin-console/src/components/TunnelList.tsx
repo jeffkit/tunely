@@ -17,7 +17,7 @@ import {
 import type { ColumnsType } from 'antd/es/table'
 import type { Tunnel } from '../types'
 import { StatusBadge } from './StatusBadge'
-import { formatDate, formatRelativeTime, formatNumber } from '../utils/format'
+import { formatDate, formatRelativeTime, formatNumber, formatBytes } from '../utils/format'
 import { RequestLogs } from '../pages/RequestLogs'
 
 interface TunnelListProps {
@@ -90,12 +90,24 @@ export function TunnelList({
       ),
     },
     {
+      title: '流量',
+      key: 'traffic',
+      width: 180,
+      render: (_: any, record: Tunnel) => (
+        <Tooltip title={`流入 ${record.bytes_in ?? 0} 字节 / 流出 ${record.bytes_out ?? 0} 字节`}>
+          <span style={{ whiteSpace: 'nowrap' }}>
+            ↑ {formatBytes(record.bytes_in)} / ↓ {formatBytes(record.bytes_out)}
+          </span>
+        </Tooltip>
+      ),
+    },
+    {
       title: '请求数',
       dataIndex: 'total_requests',
       key: 'total_requests',
       width: 100,
       align: 'right',
-      render: (count: number) => formatNumber(count),
+      render: (count: number | undefined) => formatNumber(count ?? 0),
     },
     {
       title: '最后连接',
@@ -182,7 +194,7 @@ export function TunnelList({
         dataSource={tunnels}
         loading={loading}
         rowKey="domain"
-        scroll={{ x: 1200 }}
+        scroll={{ x: 1400 }}
         pagination={{
           pageSize: 20,
           showSizeChanger: true,

@@ -2,7 +2,7 @@
  * 格式化工具函数单元测试
  */
 import { describe, it, expect } from 'vitest'
-import { formatDate, formatRelativeTime, formatNumber, formatDateTime, formatDuration } from './format'
+import { formatDate, formatRelativeTime, formatNumber, formatDateTime, formatDuration, formatBytes } from './format'
 
 describe('format utils', () => {
   describe('formatDate', () => {
@@ -78,6 +78,33 @@ describe('format utils', () => {
 
     it('should handle zero', () => {
       expect(formatDuration(0)).toBe('0ms')
+    })
+  })
+
+  describe('formatBytes', () => {
+    it('should return "-" for null or undefined', () => {
+      expect(formatBytes(null)).toBe('-')
+      expect(formatBytes(undefined)).toBe('-')
+    })
+
+    it('should return "-" for invalid values', () => {
+      expect(formatBytes(NaN)).toBe('-')
+      expect(formatBytes(-1)).toBe('-')
+    })
+
+    it('should format bytes and zero', () => {
+      expect(formatBytes(0)).toBe('0 B')
+      expect(formatBytes(512)).toBe('512 B')
+      expect(formatBytes(1023)).toBe('1023 B')
+    })
+
+    it('should format KB/MB/GB', () => {
+      expect(formatBytes(1024)).toBe('1.00 KB')
+      expect(formatBytes(1536)).toBe('1.50 KB')
+      expect(formatBytes(1024 * 1024)).toBe('1.00 MB')
+      expect(formatBytes(1.5 * 1024 * 1024)).toBe('1.50 MB')
+      expect(formatBytes(3.5 * 1024 * 1024 * 1024)).toBe('3.50 GB')
+      expect(formatBytes(2 * 1024 * 1024 * 1024 * 1024)).toBe('2.00 TB')
     })
   })
 })

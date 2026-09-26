@@ -8,6 +8,9 @@ export interface Tunnel {
   created_at: string | null
   last_connected_at: string | null
   total_requests: number
+  /** 0.5.0 新增：每隧道流量统计（字节） */
+  bytes_in?: number
+  bytes_out?: number
 }
 
 export interface CreateTunnelRequest {
