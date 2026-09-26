@@ -25,6 +25,8 @@ pub struct FileConfig {
     pub max_reconnect: Option<u32>,
     pub request_timeout_secs: Option<u64>,
     pub force: Option<bool>,
+    pub keepalive_interval_secs: Option<u64>,
+    pub keepalive_timeout_secs: Option<u64>,
 }
 
 /// CLI 侧可覆盖项（None = 未提供；数值旗标不再用 clap 默认值，才能区分「没传」与「传了默认值」）
@@ -37,6 +39,8 @@ pub struct CliOverrides {
     pub max_reconnect: Option<u32>,
     pub request_timeout: Option<u64>,
     pub force: Option<bool>,
+    pub keepalive_interval: Option<u64>,
+    pub keepalive_timeout: Option<u64>,
 }
 
 /// 合并后的最终配置
@@ -49,6 +53,8 @@ pub struct Settings {
     pub max_reconnect: u32,
     pub request_timeout: u64,
     pub force: bool,
+    pub keepalive_interval: u64,
+    pub keepalive_timeout: u64,
 }
 
 /// 按 CLI > env > file > 默认 的优先级合并出最终配置；
@@ -89,6 +95,14 @@ pub fn resolve(
             .or(file.request_timeout_secs)
             .unwrap_or(300),
         force: cli.force.or(file.force).unwrap_or(false),
+        keepalive_interval: cli
+            .keepalive_interval
+            .or(file.keepalive_interval_secs)
+            .unwrap_or(25),
+        keepalive_timeout: cli
+            .keepalive_timeout
+            .or(file.keepalive_timeout_secs)
+            .unwrap_or(45),
     })
 }
 

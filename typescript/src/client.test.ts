@@ -24,6 +24,10 @@ class MockWebSocket extends EventEmitter {
   close = vi.fn(function (this: MockWebSocket) {
     this.emit('close');
   });
+  // terminate() 硬断（keepalive 超时路径），同样触发 close 事件
+  terminate = vi.fn(function (this: MockWebSocket) {
+    this.emit('close');
+  });
 }
 
 vi.mock('ws', () => ({
@@ -802,4 +806,54 @@ describe('TunnelClient - TCP 隧道模式', () => {
     await waitUntil(() => closedCount() === 2);
     await waitUntil(() => (client as any).tcpConnections.size === 0);
   });
+});
+
+
+describe('TunnelClient - keepalive', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('keepalive 超时无 pong 应 terminate 触发重连', async () => {
+    const WebSocketMock = vi.mocked((await import('ws')).default);
+    let mockWs!: MockWebSocket;
+    WebSocketMock.mockImplementationOnce(() => {
+      mockWs = new MockWebSocket();
+      return mockWs as any;
+    }).mockImplementation(() => {
+      const ws = new MockWebSocket();
+      Promise.resolve().then(() => ws.emit('close'));
+      return ws as any;
+    });
+
+    const client = new TunnelClient({
+      serverUrl: 'ws://test-server',
+      token: 'test-token',
+      targetUrl: 'http://localhost:3000',
+      reconnectInterval: 50,
+      keepaliveInterval: 50,
+      keepaliveTimeout: 150,
+    });
+    const runPromise = client.run();
+    await new Promise((r) => setImmediate(r));
+
+    mockWs.emit(
+      'message',
+      Buffer.from(JSON.stringify({ type: 'auth_ok', domain: 'd', tunnel_id: 't' }))
+    );
+    await new Promise((r) => setImmediate(r));
+
+    // ~50ms 应发出协议 ping
+    await new Promise((r) => setTimeout(r, 120));
+    const sent = (mockWs.send.mock.calls as string[][]).map((a) => JSON.parse(a[0]));
+    expect(sent.some((m) => m.type === 'ping')).toBe(true);
+
+    // 150ms 无 pong → terminate
+    await new Promise((r) => setTimeout(r, 200));
+    expect(mockWs.terminate).toHaveBeenCalled();
+
+    client.stop();
+    await runPromise.catch(() => {});
+  }, 5000);
 });

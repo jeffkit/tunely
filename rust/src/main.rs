@@ -49,6 +49,12 @@ enum Command {
         /// 强制抢占已有连接
         #[arg(short = 'f', long = "force", action = clap::ArgAction::SetTrue)]
         force: Option<bool>,
+        /// keepalive 发 ping 周期（秒）
+        #[arg(long = "keepalive-interval", default_value_t = 25)]
+        keepalive_interval: u64,
+        /// keepalive 判死超时（秒）
+        #[arg(long = "keepalive-timeout", default_value_t = 45)]
+        keepalive_timeout: u64,
         /// 配置文件路径（省略时依次尝试 ./tunely-client.toml 与 ~/.config/tunely/client.toml）
         #[arg(long = "config", value_name = "PATH")]
         config: Option<PathBuf>,
@@ -76,6 +82,8 @@ async fn main() {
             max_reconnect,
             request_timeout,
             force,
+            keepalive_interval,
+            keepalive_timeout,
             config: config_path,
         } => {
             run_connect(
@@ -87,6 +95,8 @@ async fn main() {
                     max_reconnect,
                     request_timeout,
                     force,
+                    keepalive_interval: Some(keepalive_interval),
+                    keepalive_timeout: Some(keepalive_timeout),
                 },
                 config_path,
             )
@@ -134,6 +144,8 @@ async fn run_connect(cli: CliOverrides, config_path: Option<PathBuf>) {
         max_reconnect_attempts: settings.max_reconnect,
         request_timeout: Duration::from_secs(settings.request_timeout),
         force: settings.force,
+        keepalive_interval: Duration::from_secs(settings.keepalive_interval),
+        keepalive_timeout: Duration::from_secs(settings.keepalive_timeout),
     });
 
     // 状态文件：在连接成功 / 断开进入重连 / 报错 / 停止 时更新

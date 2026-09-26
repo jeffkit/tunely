@@ -46,6 +46,10 @@ pub struct TunnelClientConfig {
     pub request_timeout: Duration,
     /// 是否总是强制抢占已有连接
     pub force: bool,
+    /// keepalive：周期性发送协议 ping，默认 25s
+    pub keepalive_interval: Duration,
+    /// keepalive：超过该时长未收到 pong 判定连接死亡并重连，默认 45s
+    pub keepalive_timeout: Duration,
 }
 
 impl Default for TunnelClientConfig {
@@ -58,6 +62,8 @@ impl Default for TunnelClientConfig {
             max_reconnect_attempts: 0,
             request_timeout: Duration::from_secs(300),
             force: false,
+            keepalive_interval: Duration::from_secs(25),
+            keepalive_timeout: Duration::from_secs(45),
         }
     }
 }
@@ -308,12 +314,46 @@ impl TunnelClient {
         tx.send(Message::auth(&self.config.token, force))
             .map_err(|_| ConnectError::Io("发送认证失败".into()))?;
 
+        // keepalive：周期 ping + pong 看门狗。空闲长连接会被中间设备静默丢弃，
+        // 客户端不发数据就永远感知不到——必须主动探测。
+        let last_pong = Arc::new(Mutex::new(std::time::Instant::now()));
+        let dead = Arc::new(Notify::new());
+        let ticker = {
+            let tx = tx.clone();
+            let last_pong = last_pong.clone();
+            let dead = dead.clone();
+            let (interval, timeout) = (
+                self.config.keepalive_interval,
+                self.config.keepalive_timeout,
+            );
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await; // interval 首个 tick 立即返回，跳过
+                loop {
+                    tick.tick().await;
+                    if last_pong.lock().await.elapsed() > timeout {
+                        dead.notify_waiters();
+                        break;
+                    }
+                    if tx.send(Message::Ping {}).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
         let failure: Arc<Mutex<Option<ConnectError>>> = Arc::new(Mutex::new(None));
 
         loop {
             let next = tokio::select! {
                 biased;
                 _ = self.stop.notified() => None,
+                _ = dead.notified() => {
+                    warn("keepalive 超时：连接已静默死亡，重连");
+                    *failure.lock().await = Some(ConnectError::Io("keepalive timeout".into()));
+                    break;
+                }
                 n = stream.next() => n,
             };
 
@@ -381,6 +421,9 @@ impl TunnelClient {
                 Message::TcpData { conn_id, data, .. } => {
                     handle_tcp_data(&session, &conn_id, &data).await
                 }
+                Message::Pong {} => {
+                    *last_pong.lock().await = std::time::Instant::now();
+                }
                 Message::TcpClose { conn_id, .. } => {
                     handle_server_tcp_close(&session, &conn_id).await
                 }
@@ -400,6 +443,7 @@ impl TunnelClient {
         cleanup_tcp(&session).await;
         drop(tx);
         writer.abort();
+        ticker.abort();
 
         let outcome = failure.lock().await.take();
         match outcome {

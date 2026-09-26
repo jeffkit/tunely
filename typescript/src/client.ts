@@ -42,6 +42,10 @@ export interface TunnelClientConfig {
   requestTimeout?: number;
   /** 是否强制抢占已有连接 */
   force?: boolean;
+  /** keepalive：周期性发送协议 ping（毫秒，默认 25000） */
+  keepaliveInterval?: number;
+  /** keepalive：超过该时长未收到 pong 判定连接死亡并重连（毫秒，默认 45000） */
+  keepaliveTimeout?: number;
 }
 
 export interface TunnelClientEvents {
@@ -86,6 +90,8 @@ export class TunnelClient {
       maxReconnectAttempts: config.maxReconnectAttempts ?? 0,
       requestTimeout: config.requestTimeout ?? 300000,
       force: config.force ?? false,
+      keepaliveInterval: config.keepaliveInterval ?? 25000,
+      keepaliveTimeout: config.keepaliveTimeout ?? 45000,
     };
     this.parseTargetUrl();
   }
@@ -200,6 +206,20 @@ export class TunnelClient {
       const ws = new WebSocket(this.config.serverUrl, { perMessageDeflate: true });
       this.ws = ws;
 
+      // keepalive：空闲长连接会被中间设备静默丢弃，必须主动探测。
+      // 周期发协议 ping；超过 keepaliveTimeout 无 pong 时强断触发重连。
+      let lastPong = Date.now();
+      const keepaliveTimer = setInterval(() => {
+        if (Date.now() - lastPong > this.config.keepaliveTimeout) {
+          console.warn('keepalive 超时：连接已静默死亡，重连');
+          ws.terminate();
+          return;
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: MessageType.PING }));
+        }
+      }, this.config.keepaliveInterval);
+
       ws.on('open', () => {
         const useForce = this.config.force || (this.wasConnectedBefore && this.consecutiveRejectCount > 0);
         const authMessage = createAuthMessage(this.config.token, useForce);
@@ -223,6 +243,10 @@ export class TunnelClient {
 
             case MessageType.PING:
               ws.send(JSON.stringify(createPongMessage()));
+              break;
+
+            case MessageType.PONG:
+              lastPong = Date.now();
               break;
 
             case MessageType.REQUEST:
@@ -251,6 +275,7 @@ export class TunnelClient {
       });
 
       ws.on('close', () => {
+        clearInterval(keepaliveTimer);
         // WebSocket 断开后服务端会重新分配 conn_id，旧本地连接全部丢弃，防止泄漏
         this.cleanupTcpConnections();
         const wasConnected = this.connected;

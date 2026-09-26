@@ -20,7 +20,11 @@ fn load_scenarios() -> Vec<Value> {
         .as_array()
         .expect("fixture 缺少 scenarios 数组")
         .clone();
-    assert!(scenarios.len() >= 15, "fixture 场景数不足 15: {}", scenarios.len());
+    assert!(
+        scenarios.len() >= 15,
+        "fixture 场景数不足 15: {}",
+        scenarios.len()
+    );
     scenarios
 }
 
@@ -30,7 +34,9 @@ fn wire_conformance_all_scenarios() {
 
     for scenario in &scenarios {
         let name = scenario["name"].as_str().expect("场景缺少 name");
-        let input_json = scenario["input_json"].as_str().expect("场景缺少 input_json");
+        let input_json = scenario["input_json"]
+            .as_str()
+            .expect("场景缺少 input_json");
         let expect = &scenario["expect"];
 
         // 解析必须成功：多余字段（如 timestamp）应被容忍
@@ -50,9 +56,9 @@ fn wire_conformance_all_scenarios() {
         // fields 子集逐键相等
         let fields = expect["fields"].as_object().expect("expect 缺少 fields");
         for (key, expected) in fields {
-            let actual_value = actual.get(key).unwrap_or_else(|| {
-                panic!("{name}: 解析后 wire 缺少字段 {key}（actual={actual}）")
-            });
+            let actual_value = actual
+                .get(key)
+                .unwrap_or_else(|| panic!("{name}: 解析后 wire 缺少字段 {key}（actual={actual}）"));
             assert_eq!(
                 actual_value, expected,
                 "{name}: 字段 {key} 不一致（actual={actual_value}, expected={expected}）"

@@ -555,3 +555,49 @@ async fn sse_response_streamed() {
 
     h.stop().await;
 }
+
+#[tokio::test]
+async fn keepalive_detects_silent_dead_connection_and_reconnects() {
+    // 服务端接受连接后对 ping 完全沉默（模拟空闲长连接被中间设备静默丢弃）
+    let mut server = FakeServer::start().await;
+    let client = Arc::new(TunnelClient::new(TunnelClientConfig {
+        server_url: server.ws_url(),
+        token: "test-token".to_string(),
+        target_url: "http://127.0.0.1:1".to_string(),
+        reconnect_interval: Duration::from_millis(50),
+        keepalive_interval: Duration::from_millis(150),
+        keepalive_timeout: Duration::from_millis(400),
+        ..Default::default()
+    }));
+    let (ctx, mut crx) = mpsc::unbounded_channel();
+    client.on_connect(move |d| {
+        let _ = ctx.send(d.to_string());
+    });
+    let task = tokio::spawn({
+        let c = client.clone();
+        async move { c.run().await }
+    });
+
+    let mut conn1 = server.next_conn().await;
+    let (_, _) = conn1.expect_auth().await;
+    conn1.send_auth_ok("dsh").await;
+    let d = tokio::time::timeout(RECV_TIMEOUT, crx.recv())
+        .await
+        .expect("等待首次 on_connect 超时")
+        .expect("channel 关闭");
+    assert_eq!(d, "dsh");
+
+    // 不回 pong → keepalive 判死 → 重连出新连接
+    let mut conn2 = server.next_conn().await;
+    let (_, force) = conn2.expect_auth().await;
+    assert!(!force, "keepalive 断开不是认证拒绝，不应 force");
+    conn2.send_auth_ok("dsh").await;
+    let d = tokio::time::timeout(RECV_TIMEOUT, crx.recv())
+        .await
+        .expect("等待重连后 on_connect 超时")
+        .expect("channel 关闭");
+    assert_eq!(d, "dsh");
+
+    client.stop();
+    let _ = tokio::time::timeout(RECV_TIMEOUT, task).await;
+}
