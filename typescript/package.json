@@ -31,7 +31,7 @@
   "author": "HITL Team",
   "license": "MIT",
   "dependencies": {
-    "commander": "^12.0.0",
+    "commander": "^15.0.0",
     "undici": "^7.24.4",
     "ws": "^8.16.0"
   },
