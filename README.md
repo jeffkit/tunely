@@ -19,15 +19,18 @@ WebSocket 透明反向代理隧道，支持服务端嵌入和客户端 SDK。
 ### 1. 安装服务端
 
 ```bash
-cd packages/ws-tunnel/python
-pip install -e .
+pip install tunely
+
+# 或从源码安装（开发模式）
+git clone https://github.com/jeffkit/tunely.git
+cd tunely/python && pip install -e .
 ```
 
 ### 2. 在 FastAPI 应用中使用
 
 ```python
 from fastapi import FastAPI
-from ws_tunnel import TunnelServer, TunnelServerConfig
+from tunely import TunnelServer, TunnelServerConfig
 
 app = FastAPI()
 
@@ -68,14 +71,21 @@ curl -X POST http://localhost:8000/api/tunnels \
 
 **Python**：
 ```bash
-ws-tunnel connect --token tun_xxxxx --target http://localhost:8080
+tunely connect --token tun_xxxxx --target http://localhost:8080
 ```
 
 **TypeScript**：
 ```bash
-cd packages/ws-tunnel/typescript
+cd typescript
 pnpm install && pnpm build
 node dist/cli.js connect --token tun_xxxxx --target http://localhost:8080
+# 或 npm 安装后：npx tunely connect --token tun_xxxxx --target http://localhost:8080
+```
+
+**Rust**：
+```bash
+cargo install tunely
+tunely connect --token tun_xxxxx --target http://localhost:8080
 ```
 
 ### 5. 转发请求
@@ -93,17 +103,16 @@ curl -X POST http://localhost:8000/api/tunnels/my-agent/forward \
 ## 项目结构
 
 ```
-packages/ws-tunnel/
+tunely/
 ├── README.md                  # 本文件
 ├── docs/
 │   ├── PROTOCOL.md           # 协议文档
 │   └── QUICKSTART.md         # 快速开始
 │
-├── python/                    # Python 实现
+├── python/                    # Python 服务端 + 客户端 SDK（PyPI: tunely）
 │   ├── pyproject.toml
 │   ├── alembic/              # 数据库迁移
-│   ├── ws_tunnel/
-│   │   ├── __init__.py
+│   ├── tunely/
 │   │   ├── protocol.py       # 协议定义
 │   │   ├── models.py         # 数据库模型
 │   │   ├── database.py       # 数据库管理
@@ -111,15 +120,31 @@ packages/ws-tunnel/
 │   │   ├── server.py         # 服务端 SDK
 │   │   ├── client.py         # 客户端 SDK
 │   │   ├── cli.py            # 命令行工具
+│   │   ├── app.py            # 独立服务应用（tunely serve）
 │   │   └── config.py         # 配置
-│   └── tests/                 # 测试
+│   ├── examples/             # 使用示例
+│   └── tests/                # 测试
 │
-└── typescript/                # TypeScript 实现
-    ├── package.json
-    └── src/
-        ├── protocol.ts       # 协议定义
-        ├── client.ts         # 客户端 SDK
-        └── cli.ts            # 命令行工具
+├── typescript/                # TypeScript 客户端 SDK（npm: tunely）
+│   ├── package.json
+│   └── src/
+│       ├── protocol.ts       # 协议定义
+│       ├── client.ts         # 客户端 SDK
+│       └── cli.ts            # 命令行工具
+│
+├── rust/                      # Rust 客户端（crates.io: tunely）
+│   ├── Cargo.toml
+│   └── src/
+│
+├── admin-console/             # Web 管理台（React 18 + Vite + Ant Design）
+│
+├── deploy/                    # systemd / launchd 部署模板
+│
+├── spec/
+│   └── conformance/          # 跨实现 wire 协议一致性用例（wire.json）
+│
+└── .github/
+    └── workflows/            # CI：test / docker / pypi / release-rust
 ```
 
 ## API 参考
@@ -132,8 +157,10 @@ packages/ws-tunnel/
 | `/api/tunnels` | POST | 创建隧道 |
 | `/api/tunnels` | GET | 列出所有隧道 |
 | `/api/tunnels/{domain}` | GET | 获取隧道详情 |
+| `/api/tunnels/{domain}` | PUT | 更新隧道 |
 | `/api/tunnels/{domain}` | DELETE | 删除隧道 |
 | `/api/tunnels/{domain}/forward` | POST | 转发请求 |
+| `/api/tunnels/{domain}/logs` | GET | 隧道请求日志 |
 
 ### 配置选项
 
@@ -157,7 +184,7 @@ packages/ws-tunnel/
 
 ## 协议版本
 
-当前协议版本：**1.0**
+当前协议版本：**1.1**（1.1 新增 SSE 流式响应与 TCP 透传消息）
 
 详见 [PROTOCOL.md](docs/PROTOCOL.md)
 

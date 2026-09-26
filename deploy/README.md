@@ -93,3 +93,64 @@ tunely connect --token <tun_xxx> --server ws://<tunely.example.com>/ws/tunnel --
 ```
 
 之后访问 `http://dsh.<tunely.example.com>/`（子域名模式）或 `http://<tunely.example.com>/t/<dsh>/`（路径前缀模式）；若配置了 `WS_TUNNEL_TCP_LISTEN`，也可直连对应 TCP 端口。
+
+## 4. 备份与恢复
+
+隧道/令牌等状态都在 SQLite（模板路径 `/var/lib/tunely/data/tunely.db`）。**令牌即凭据，备份文件请按敏感数据处理（权限 600）。**
+
+**方式一：在线备份（推荐，不停服）**
+
+SQLite 自带的 `.backup` 命令在线生成一致性快照：
+
+```bash
+sudo -u tunely sqlite3 /var/lib/tunely/data/tunely.db \
+  ".backup '/var/backups/tunely-$(date +%F).db'"
+```
+
+建议加 cron 每日一次，并保留最近 N 份。
+
+**方式二：停服冷备**
+
+```bash
+sudo systemctl stop tunely-server
+sudo cp /var/lib/tunely/data/tunely.db /var/backups/tunely-cold.db
+sudo systemctl start tunely-server
+```
+
+**恢复**
+
+```bash
+sudo systemctl stop tunely-server
+sudo -u tunely sqlite3 /var/lib/tunely/data/tunely.db "PRAGMA integrity_check;"   # 恢复前先确认坏没坏
+sudo cp /var/backups/tunely-<date>.db /var/lib/tunely/data/tunely.db
+sudo chown tunely:tunely /var/lib/tunely/data/tunely.db
+sudo systemctl start tunely-server
+journalctl -u tunely-server -n 50 --no-pager    # 确认启动无迁移/损坏报错
+curl -s http://127.0.0.1:<8000>/api/tunnels -H "x-api-key: <key>"   # 确认隧道列表完整
+```
+
+> 若使用 MySQL/PostgreSQL，改用各自原生备份工具（`mysqldump` / `pg_dump`），思路相同。
+
+## 5. 日志轮转
+
+服务端与客户端均由 systemd 拉起，日志进 **journald**，天然按 journal 自身机制管理，**无需 logrotate**。需要控制的是磁盘占用：
+
+```bash
+# 一次性清理：只保留 200M
+sudo journalctl --vacuum-size=200M
+
+# 持久限制：/etc/systemd/journald.conf 设
+#   SystemMaxUse=200M
+# 然后重启 journald 生效
+sudo systemctl restart systemd-journald
+```
+
+查看与过滤：
+
+```bash
+journalctl -u tunely-server -f          # 跟随服务端日志
+journalctl -u tunely-client --since today
+journalctl -u tunely-server -p warning  # 只看告警以上
+```
+
+> journald 默认重启后可能丢历史日志；如需持久化，确保 `/var/log/journal/` 存在（`Storage=persistent`）。

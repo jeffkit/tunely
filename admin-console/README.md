@@ -15,7 +15,7 @@ Tunely Server 的独立管理控制台，提供可视化的隧道管理功能。
 ### 安装依赖
 
 ```bash
-cd packages/ws-tunnel/admin-console
+cd admin-console
 pnpm install
 ```
 

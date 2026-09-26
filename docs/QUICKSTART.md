@@ -5,23 +5,25 @@
 ## 前提条件
 
 - Python 3.11+
+- [uv](https://docs.astral.sh/uv/)（推荐，用于依赖管理与运行测试）
 - Node.js 18+（如果使用 TypeScript 客户端）
 
 ## 步骤 1：安装服务端
 
 ```bash
-cd packages/ws-tunnel/python
-pip install -e ".[dev]"
+cd python
+uv sync                     # 安装运行依赖 + dev 组（pytest 等）
+uv run pytest tests/ -q     # 可选：跑一遍测试确认环境正常
 ```
 
 ## 步骤 2：创建示例服务器
 
-创建文件 `example_server.py`：
+创建文件 `python/example_server.py`：
 
 ```python
 import asyncio
 from fastapi import FastAPI
-from ws_tunnel import TunnelServer, TunnelServerConfig
+from tunely import TunnelServer, TunnelServerConfig
 
 app = FastAPI(title="WS-Tunnel Demo")
 
@@ -39,7 +41,7 @@ async def startup():
     await tunnel_server.initialize()
     
     # 创建示例隧道
-    from ws_tunnel.repository import TunnelRepository
+    from tunely.repository import TunnelRepository
     async with tunnel_server.db.session() as session:
         repo = TunnelRepository(session)
         existing = await repo.get_by_domain("demo-agent")
@@ -63,7 +65,7 @@ if __name__ == "__main__":
 运行服务器：
 
 ```bash
-python example_server.py
+uv run python example_server.py
 ```
 
 ## 步骤 3：创建目标服务
@@ -96,12 +98,14 @@ if __name__ == "__main__":
 python target_service.py
 ```
 
+> 目标服务只需 fastapi + uvicorn，任意虚拟环境均可（`pip install fastapi uvicorn`）。
+
 ## 步骤 4：启动客户端
 
 在新终端运行：
 
 ```bash
-ws-tunnel connect \
+tunely connect \
   --server ws://localhost:8000/ws/tunnel \
   --token demo_token_12345 \
   --target http://localhost:8080

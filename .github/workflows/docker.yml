@@ -17,7 +17,25 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    name: Python tests (uv + pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: uv run pytest tests/ -q
+
   build-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
