@@ -10,7 +10,7 @@ WS-Tunnel 数据库模型
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, Index, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, Index, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -74,6 +74,22 @@ class Tunnel(Base):
     )
     total_requests: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False, comment="总请求数"
+    )
+
+    # 流量统计（累计值，跨重启持续累加；由服务端周期性 flush 写入）
+    bytes_in: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        nullable=False,
+        server_default="0",
+        comment="累计入流量（外部→内网，字节，跨重启累计）",
+    )
+    bytes_out: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        nullable=False,
+        server_default="0",
+        comment="累计出流量（内网→外部，字节，跨重启累计）",
     )
 
     def __repr__(self) -> str:
@@ -215,4 +231,60 @@ class TunnelRequestLog(Base):
             "response_body": self.response_body[:500] if self.response_body else None,  # 只返回前 500 字符
             "error": self.error,
             "duration_ms": self.duration_ms,
+        }
+
+
+class AdminAuditLog(Base):
+    """
+    管理面审计日志表
+
+    记录管理 API 的关键操作（创建/删除/更新隧道、重新生成令牌）
+    以及 WebSocket 强制抢占（takeover），用于安全审计追踪。
+    """
+
+    __tablename__ = "admin_audit_logs"
+
+    # 主键
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # 操作时间
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+        comment="操作时间",
+    )
+
+    # 操作信息
+    action: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="操作类型: create/delete/update/regenerate/takeover",
+    )
+    domain: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, comment="目标隧道域名（可选）"
+    )
+    detail: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="操作详情（如变更字段列表）"
+    )
+    source_ip: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, comment="操作来源 IP（尽力而为）"
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AdminAuditLog(id={self.id}, action={self.action!r}, "
+            f"domain={self.domain!r})>"
+        )
+
+    def to_dict(self) -> dict:
+        """转换为字典（用于 API 返回）"""
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "action": self.action,
+            "domain": self.domain,
+            "detail": self.detail,
+            "source_ip": self.source_ip,
         }

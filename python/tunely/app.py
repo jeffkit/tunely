@@ -38,6 +38,14 @@ from .config import TunnelServerConfig
 logger = logging.getLogger(__name__)
 
 
+def _pkg_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("tunely")
+    except Exception:
+        return "unknown"
+
+
 class AppSettings(BaseSettings):
     """应用配置"""
     
@@ -67,8 +75,8 @@ class AppSettings(BaseSettings):
     request_timeout: float = 300.0
     
     # CORS 配置（用于浏览器跨域访问）
-    # 逗号分隔的允许来源列表，"*" 表示允许所有来源
-    cors_origins: str = "*"
+    # 逗号分隔的允许来源列表；"*" 表示允许所有来源；空 = 仅同源（不输出 CORS 头）
+    cors_origins: str = ""
 
 
 # 全局配置实例
@@ -186,26 +194,29 @@ def create_full_app(
     new_app = FastAPI(
         title="Tunely Server",
         description="WebSocket 隧道服务 - 通过子域名或路径前缀访问内网服务",
-        version="0.3.0",
+        version=_pkg_version(),
         lifespan=create_lifespan(tunnel_srv),
     )
     
     # ============== CORS 中间件 ==============
-    # 解析 CORS 来源配置
+    # 解析 CORS 来源配置：空 = 仅同源（不装配 CORSMiddleware）；"*" = 全部；否则逗号分隔白名单
     cors_origins = settings.cors_origins.strip()
     if cors_origins == "*":
         allow_origins = ["*"]
     else:
         allow_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
-    
-    new_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allow_origins,
-        allow_credentials=cors_origins != "*",  # credentials 与通配符互斥
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-    )
+
+    if allow_origins:
+        new_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allow_origins,
+            allow_credentials=cors_origins != "*",  # credentials 与通配符互斥
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        )
+    else:
+        logger.info("CORS 未配置（仅同源），不装配 CORSMiddleware")
     
     # 包含 TunnelServer 的路由（API 和 WebSocket）
     new_app.include_router(tunnel_srv.router)
@@ -223,7 +234,7 @@ def create_full_app(
         
         return {
             "service": "Tunely Server",
-            "version": "0.3.0",
+            "version": _pkg_version(),
             "domain": settings.domain,
             "status": "running",
         }
@@ -292,7 +303,7 @@ def create_full_app(
 app = FastAPI(
     title="Tunely Server",
     description="WebSocket 隧道服务 - 通过子域名或路径前缀访问内网服务",
-    version="0.3.0",
+    version=_pkg_version(),
 )
 
 

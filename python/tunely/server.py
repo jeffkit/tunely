@@ -40,7 +40,7 @@ from typing import Any, AsyncIterator, Literal
 
 import httpx
 import jwt as pyjwt
-from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict
 
 from .config import TunnelServerConfig
@@ -63,9 +63,41 @@ from .protocol import (
     TcpCloseMessage,
     parse_message,
 )
-from .repository import TunnelRepository, TunnelRequestLogRepository
+from .repository import TunnelRepository, TunnelRequestLogRepository, AdminAuditLogRepository
 
 logger = logging.getLogger(__name__)
+
+# 认证失败断开前的延迟（秒）：提高 token 暴力尝试成本（仅认证失败路径，
+# 业务拒绝路径如 disabled / already connected 不受影响）
+_AUTH_FAILURE_DELAY = 1.0
+
+# 流量统计落库周期（秒）：把内存计数增量累加写回 tunnels 表
+_BYTES_FLUSH_INTERVAL = 30.0
+
+
+def _client_ip(http_request: Request | None) -> str | None:
+    """尽力而为地提取客户端 IP（拿不到返回 None，不抛异常）"""
+    try:
+        if http_request is not None and http_request.client:
+            host = http_request.client.host
+            if isinstance(host, str) and host:
+                return host
+    except Exception:
+        pass
+    return None
+
+
+def _ws_client_ip(websocket: WebSocket | None) -> str | None:
+    """尽力而为地提取 WebSocket 客户端 IP（mock/测试环境下拿不到返回 None）"""
+    try:
+        client = getattr(websocket, "client", None) if websocket is not None else None
+        if client is not None:
+            host = getattr(client, "host", None)
+            if isinstance(host, str) and host:
+                return host
+    except Exception:
+        pass
+    return None
 
 
 # ============== 数据结构 ==============
@@ -453,6 +485,24 @@ class TunnelManager:
         """获取 TCP 连接"""
         return self._tcp_connections.get(conn_id)
 
+    def count_tcp_connections(self, domain: str) -> int:
+        """统计指定隧道当前活跃的外部 TCP 连接数（未 closed）"""
+        return sum(
+            1
+            for tcp_conn in self._tcp_connections.values()
+            if tcp_conn.domain == domain and not tcp_conn.closed
+        )
+
+    def list_tcp_connection_domains(self) -> list[str]:
+        """列出当前有活跃外部 TCP 连接的隧道域名（去重排序）"""
+        return sorted(
+            {
+                state.domain
+                for state in self._tcp_connections.values()
+                if not state.closed and state.domain
+            }
+        )
+
     async def close_all_tcp_connections(self) -> None:
         """关闭全部活跃外部 TCP 连接（服务端优雅停机时调用）"""
         states = list(self._tcp_connections.values())
@@ -568,9 +618,12 @@ class TunnelServer:
         self._tcp_servers: list[asyncio.Server] = []
         # 监听端口 -> 绑定的隧道域名（多监听器路由）
         self._listener_domains: dict[int, str] = {}
-        # 每隧道流量统计（内存态，重启归零）：domain -> {"bytes_in": n, "bytes_out": n}
+        # 每隧道流量统计（内存态计数，周期性落库）：domain -> {"bytes_in": n, "bytes_out": n}
         # bytes_in = 外部 → 内网服务；bytes_out = 内网服务 → 外部
         self._tunnel_bytes: dict[str, dict[str, int]] = {}
+        # 已落库快照（initialize 时从 DB 行 seed），flush 只写「当前值 - 快照」的增量
+        self._flushed_bytes: dict[str, dict[str, int]] = {}
+        self._bytes_flush_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
 
         # 注册路由
@@ -582,11 +635,29 @@ class TunnelServer:
         await self.db.initialize()
         logger.info("TunnelServer 初始化完成")
 
+        # 从 DB 行恢复流量统计初值（live 值跨重启连续）
+        await self._seed_tunnel_bytes()
+
         # 如果配置了 TCP 监听端口，启动 TCP 监听
         await self._start_tcp_listeners()
 
+        # 启动流量统计周期落库任务
+        self._start_bytes_flush_task()
+
     async def close(self) -> None:
         """关闭服务器"""
+        # 停掉流量统计周期任务，并尽力把最后的增量落库
+        if self._bytes_flush_task:
+            self._bytes_flush_task.cancel()
+            try:
+                await self._bytes_flush_task
+            except asyncio.CancelledError:
+                pass
+            self._bytes_flush_task = None
+        try:
+            await self._flush_tunnel_bytes()
+        except Exception as e:
+            logger.warning(f"停机前流量统计落库失败（忽略）: {e}")
         # 先清理活跃的外部 TCP 连接（否则 wait_closed 会等它们自然结束）
         await self.manager.close_all_tcp_connections()
         # 关闭全部 TCP 监听器
@@ -612,10 +683,13 @@ class TunnelServer:
         @self.router.post("/api/tunnels", response_model=CreateTunnelResponse)
         async def create_tunnel(
             request: CreateTunnelRequest,
+            http_request: Request,
             x_api_key: str | None = Header(None, alias="x-api-key"),
             authorization: str | None = Header(None),
         ):
-            return await self._create_tunnel(request, x_api_key, authorization)
+            return await self._create_tunnel(
+                request, x_api_key, authorization, source_ip=_client_ip(http_request)
+            )
 
         @self.router.get("/api/tunnels", response_model=list[TunnelInfo])
         async def list_tunnels(
@@ -641,26 +715,35 @@ class TunnelServer:
         async def update_tunnel(
             domain: str,
             request: UpdateTunnelRequest,
+            http_request: Request,
             x_api_key: str | None = Header(None, alias="x-api-key"),
         ):
-            return await self._update_tunnel(domain, request, x_api_key)
+            return await self._update_tunnel(
+                domain, request, x_api_key, source_ip=_client_ip(http_request)
+            )
 
         @self.router.delete("/api/tunnels/{domain}")
         async def delete_tunnel(
             domain: str,
+            http_request: Request,
             x_api_key: str | None = Header(None, alias="x-api-key"),
             x_tunnel_token: str | None = Header(None, alias="x-tunnel-token"),
         ):
-            return await self._delete_tunnel(domain, x_api_key, x_tunnel_token)
+            return await self._delete_tunnel(
+                domain, x_api_key, x_tunnel_token, source_ip=_client_ip(http_request)
+            )
 
         @self.router.post(
             "/api/tunnels/{domain}/regenerate-token", response_model=RegenerateTokenResponse
         )
         async def regenerate_token(
             domain: str,
+            http_request: Request,
             x_api_key: str | None = Header(None, alias="x-api-key"),
         ):
-            return await self._regenerate_token(domain, x_api_key)
+            return await self._regenerate_token(
+                domain, x_api_key, source_ip=_client_ip(http_request)
+            )
 
         @self.router.post("/api/tunnels/{domain}/forward", response_model=ForwardResponse)
         async def forward_request(
@@ -685,6 +768,37 @@ class TunnelServer:
         ):
             """获取隧道请求历史日志"""
             return await self._get_tunnel_logs(domain, limit, offset, x_api_key)
+
+        @self.router.get("/api/audit")
+        async def get_audit_logs(
+            limit: int = Query(50, ge=1, le=1000),
+            x_api_key: str | None = Header(None, alias="x-api-key"),
+        ):
+            """获取管理面审计日志（倒序）"""
+            return await self._get_audit_logs(limit, x_api_key)
+
+        @self.router.get(
+            "/metrics",
+            include_in_schema=False,
+        )
+        async def get_metrics():
+            """
+            Prometheus 指标端点（文本格式，无鉴权）。
+
+            注意：勿暴露公网，与 /api 同理。
+            """
+            from fastapi.responses import Response
+
+            registered = 0
+            if self.db:
+                try:
+                    async with self.db.session() as session:
+                        repo = TunnelRepository(session)
+                        registered = await repo.count_tunnels()
+                except Exception as e:
+                    logger.warning(f"读取隧道总数失败（metrics 降级为 0）: {e}")
+            text = self._render_prometheus_metrics(registered=registered)
+            return Response(content=text, media_type="text/plain; version=0.0.4")
 
         @self.router.get("/api/info")
         async def get_server_info():
@@ -720,9 +834,10 @@ class TunnelServer:
             return result
 
     def _check_admin_api_key(self, api_key: str | None) -> None:
-        """检查管理 API 密钥"""
+        """检查管理 API 密钥（常数时间比较，防时序侧信道）"""
         if self.config.admin_api_key:
-            if api_key != self.config.admin_api_key:
+            provided = api_key or ""
+            if not hmac.compare_digest(provided, self.config.admin_api_key):
                 raise HTTPException(status_code=401, detail="Invalid API key")
 
     async def _notify_connected(self, domain: str) -> None:
@@ -801,6 +916,8 @@ class TunnelServer:
                 await websocket.send_text(
                     AuthErrorMessage(error="Expected auth message").model_dump_json()
                 )
+                # 认证失败限速：延迟后关闭，提高暴力尝试成本
+                await asyncio.sleep(_AUTH_FAILURE_DELAY)
                 await websocket.close(code=1008)
                 return
 
@@ -822,6 +939,8 @@ class TunnelServer:
                     await websocket.send_text(
                         AuthErrorMessage(error="Invalid token").model_dump_json()
                     )
+                    # 认证失败限速：延迟后关闭，防止无限速暴力尝试 token
+                    await asyncio.sleep(_AUTH_FAILURE_DELAY)
                     await websocket.close(code=1008)
                     return
 
@@ -837,8 +956,9 @@ class TunnelServer:
                 # 更新最后连接时间
                 await repo.update_last_connected(token)
 
-                # 尝试注册连接
+                # 尝试注册连接（记录注册前是否已有连接，用于 takeover 审计）
                 force = getattr(message, 'force', False)
+                had_existing = self.manager.get_connection_by_token(token) is not None
                 success, error = await self.manager.register(
                     websocket=websocket,
                     tunnel_id=tunnel.id,
@@ -846,7 +966,7 @@ class TunnelServer:
                     token=token,
                     force=force,
                 )
-                
+
                 if not success:
                     await websocket.send_text(
                         AuthErrorMessage(
@@ -856,6 +976,15 @@ class TunnelServer:
                     )
                     await websocket.close(code=1008)
                     return
+
+                # 审计：force 抢占成功
+                if force and had_existing:
+                    await self._record_audit(
+                        "takeover",
+                        domain=tunnel.domain,
+                        detail="forced takeover of existing connection",
+                        source_ip=_ws_client_ip(websocket),
+                    )
 
                 # 发送认证成功
                 await websocket.send_text(
@@ -940,8 +1069,43 @@ class TunnelServer:
         except pyjwt.InvalidTokenError as e:
             raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
+    async def _record_audit(
+        self,
+        action: str,
+        domain: str | None = None,
+        detail: str | None = None,
+        source_ip: str | None = None,
+    ) -> None:
+        """记录管理面审计日志（尽力而为：失败只告警，不影响主流程）"""
+        if not self.db:
+            return
+        try:
+            async with self.db.session() as session:
+                repo = AdminAuditLogRepository(session)
+                await repo.create(
+                    action=action, domain=domain, detail=detail, source_ip=source_ip
+                )
+        except Exception as e:
+            logger.warning(f"审计日志写入失败（忽略）: action={action}, domain={domain}, error={e}")
+
+    async def _get_audit_logs(self, limit: int, api_key: str | None) -> list[dict]:
+        """查询管理面审计日志（倒序）"""
+        self._check_admin_api_key(api_key)
+
+        if not self.db:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+
+        async with self.db.session() as session:
+            repo = AdminAuditLogRepository(session)
+            logs = await repo.list_recent(limit=limit)
+            return [log.to_dict() for log in logs]
+
     async def _create_tunnel(
-        self, request: CreateTunnelRequest, api_key: str | None, authorization: str | None = None
+        self,
+        request: CreateTunnelRequest,
+        api_key: str | None,
+        authorization: str | None = None,
+        source_ip: str | None = None,
     ) -> CreateTunnelResponse:
         """创建隧道 - 支持 JWT 认证（公网模式）或无认证（内网模式）"""
         # 配置了 admin api-key 时，创建与查询/删除同样强制鉴权（0.5.0 起；
@@ -969,6 +1133,13 @@ class TunnelServer:
 
             await session.commit()
             await session.refresh(tunnel)
+
+            await self._record_audit(
+                "create",
+                domain=tunnel.domain,
+                detail=f"mode={request.mode}",
+                source_ip=source_ip,
+            )
 
             return CreateTunnelResponse(
                 domain=tunnel.domain,
@@ -1037,7 +1208,11 @@ class TunnelServer:
             )
 
     async def _update_tunnel(
-        self, domain: str, request: UpdateTunnelRequest, api_key: str | None
+        self,
+        domain: str,
+        request: UpdateTunnelRequest,
+        api_key: str | None,
+        source_ip: str | None = None,
     ) -> TunnelInfo:
         """更新隧道"""
         self._check_admin_api_key(api_key)
@@ -1075,6 +1250,15 @@ class TunnelServer:
                 await session.commit()
                 await session.refresh(tunnel)
 
+                # 审计：记录变更字段名列表
+                changed = sorted(k for k in update_values if k != "updated_at")
+                await self._record_audit(
+                    "update",
+                    domain=domain,
+                    detail=f"changed:{','.join(changed)}",
+                    source_ip=source_ip,
+                )
+
             return TunnelInfo(
                 domain=tunnel.domain,
                 name=tunnel.name,
@@ -1091,7 +1275,7 @@ class TunnelServer:
             )
 
     async def _regenerate_token(
-        self, domain: str, api_key: str | None
+        self, domain: str, api_key: str | None, source_ip: str | None = None
     ) -> RegenerateTokenResponse:
         """重新生成 Token"""
         self._check_admin_api_key(api_key)
@@ -1107,6 +1291,10 @@ class TunnelServer:
                 raise HTTPException(status_code=404, detail="Tunnel not found")
 
             await session.commit()
+
+            await self._record_audit(
+                "regenerate", domain=domain, source_ip=source_ip
+            )
 
             return RegenerateTokenResponse(domain=domain, token=new_token)
 
@@ -1130,10 +1318,11 @@ class TunnelServer:
             }
 
     async def _delete_tunnel(
-        self, 
-        domain: str, 
+        self,
+        domain: str,
         api_key: str | None,
-        tunnel_token: str | None = None
+        tunnel_token: str | None = None,
+        source_ip: str | None = None,
     ) -> dict:
         """删除隧道 - 支持 Admin API Key 或隧道自己的 Token"""
         if not self.db:
@@ -1141,27 +1330,36 @@ class TunnelServer:
 
         async with self.db.session() as session:
             repo = TunnelRepository(session)
-            
+
             # 验证权限:Admin API Key 或隧道自己的 Token
             if tunnel_token:
                 # 使用隧道 Token 验证
                 tunnel = await repo.get_by_token(tunnel_token)
                 if not tunnel or tunnel.domain != domain:
                     raise HTTPException(
-                        status_code=401, 
+                        status_code=401,
                         detail="Invalid tunnel token or domain mismatch"
                     )
                 # Token 验证通过,允许删除自己
             else:
                 # 使用 Admin API Key 验证
                 self._check_admin_api_key(api_key)
-            
+
             deleted = await repo.delete(domain)
 
             if not deleted:
                 raise HTTPException(status_code=404, detail="Tunnel not found")
 
-            return {"success": True, "domain": domain}
+        # 审计必须在删除会话提交之后再写：否则 SQLite 下同库第二会话
+        # 会被未提交的写锁阻塞，审计静默丢失（0.6.0 实测）
+        await self._record_audit(
+            "delete",
+            domain=domain,
+            detail="via=tunnel-token" if tunnel_token else None,
+            source_ip=source_ip,
+        )
+
+        return {"success": True, "domain": domain}
 
     async def forward(
         self,
@@ -1657,6 +1855,134 @@ class TunnelServer:
         stats = self._tunnel_bytes.get(domain or "", {})
         return {"bytes_in": stats.get("bytes_in", 0), "bytes_out": stats.get("bytes_out", 0)}
 
+    # ============== 流量统计持久化 ==============
+
+    async def _seed_tunnel_bytes(self) -> None:
+        """从 DB 行恢复流量统计内存计数与落库快照（live 值跨重启连续）"""
+        if not self.db:
+            return
+        try:
+            async with self.db.session() as session:
+                repo = TunnelRepository(session)
+                tunnels = await repo.list_all(limit=999999)
+            for t in tunnels:
+                if t.bytes_in or t.bytes_out:
+                    stats = {"bytes_in": int(t.bytes_in), "bytes_out": int(t.bytes_out)}
+                    self._tunnel_bytes[t.domain] = dict(stats)
+                    self._flushed_bytes[t.domain] = stats
+        except Exception as e:
+            logger.warning(f"恢复流量统计初值失败（从 0 开始）: {e}")
+
+    def _start_bytes_flush_task(self) -> None:
+        """启动流量统计周期落库任务"""
+        self._bytes_flush_task = asyncio.create_task(self._bytes_flush_loop())
+
+    async def _bytes_flush_loop(self) -> None:
+        """周期性把流量增量写库；DB 不可用时静默跳过（不刷屏，下轮重试）"""
+        while True:
+            await asyncio.sleep(_BYTES_FLUSH_INTERVAL)
+            try:
+                await self._flush_tunnel_bytes()
+            except Exception as e:
+                logger.debug(f"流量统计落库失败（下轮重试）: {e}")
+
+    async def _flush_tunnel_bytes(self) -> None:
+        """
+        把「上次快照以来的流量增量」累加写库（快照法，可安全重复触发）
+
+        只写有正增量的行；全部写完后推进快照。
+        """
+        if not self.db:
+            return
+
+        deltas: list[tuple[str, int, int]] = []
+        for domain, stats in self._tunnel_bytes.items():
+            flushed = self._flushed_bytes.get(
+                domain, {"bytes_in": 0, "bytes_out": 0}
+            )
+            delta_in = stats["bytes_in"] - flushed["bytes_in"]
+            delta_out = stats["bytes_out"] - flushed["bytes_out"]
+            if delta_in > 0 or delta_out > 0:
+                deltas.append((domain, delta_in, delta_out))
+
+        if not deltas:
+            return
+
+        async with self.db.session() as session:
+            repo = TunnelRepository(session)
+            for domain, delta_in, delta_out in deltas:
+                await repo.increment_tunnel_bytes(domain, delta_in, delta_out)
+
+        for domain, delta_in, delta_out in deltas:
+            flushed = self._flushed_bytes.setdefault(
+                domain, {"bytes_in": 0, "bytes_out": 0}
+            )
+            flushed["bytes_in"] += delta_in
+            flushed["bytes_out"] += delta_out
+
+    # ============== Prometheus 指标 ==============
+
+    @staticmethod
+    def _escape_prometheus_label(value: str) -> str:
+        """转义 label 值中的特殊字符（防 label 注入）"""
+        return (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+        )
+
+    def _render_prometheus_metrics(self, registered: int = 0) -> str:
+        """手工拼装 Prometheus 文本格式（不引入第三方依赖）"""
+        lines: list[str] = []
+
+        def emit(name: str, mtype: str, help_text: str, samples: list[tuple[str, int]]):
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {mtype}")
+            for labels, value in samples:
+                lines.append(f"{name}{labels} {value}")
+
+        emit(
+            "tunely_tunnels_registered",
+            "gauge",
+            "Total number of registered tunnels",
+            [("", registered)],
+        )
+        emit(
+            "tunely_tunnels_connected",
+            "gauge",
+            "Number of tunnels with a connected client",
+            [("", len(self.manager.list_connected_domains()))],
+        )
+        emit(
+            "tunely_tcp_connections_active",
+            "gauge",
+            "Active external TCP connections per tunnel domain",
+            [
+                (f'{{domain="{self._escape_prometheus_label(d)}"}}', self.manager.count_tcp_connections(d))
+                for d in self.manager.list_tcp_connection_domains()
+            ],
+        )
+        emit(
+            "tunely_tunnel_bytes_in",
+            "counter",
+            "Bytes forwarded from external to tunnel client (cumulative)",
+            [
+                (f'{{domain="{self._escape_prometheus_label(d)}"}}', stats.get("bytes_in", 0))
+                for d, stats in sorted(self._tunnel_bytes.items())
+            ],
+        )
+        emit(
+            "tunely_tunnel_bytes_out",
+            "counter",
+            "Bytes forwarded from tunnel client to external (cumulative)",
+            [
+                (f'{{domain="{self._escape_prometheus_label(d)}"}}', stats.get("bytes_out", 0))
+                for d, stats in sorted(self._tunnel_bytes.items())
+            ],
+        )
+
+        return "\n".join(lines) + "\n"
+
     def _resolve_tcp_listen_specs(self) -> list[tuple[int, str, str | None]]:
         """
         汇总 TCP 监听器配置，返回 [(port, host, domain | None), ...]
@@ -1757,6 +2083,15 @@ class TunnelServer:
         tunnel_conn = self.manager.get_connection_by_domain(domain)
         if not tunnel_conn:
             logger.warning(f"隧道未连接: {domain}，关闭 TCP 连接: {conn_id}")
+            writer.close()
+            return
+
+        # 每隧道 TCP 并发上限（0 = 不限制）
+        max_tcp = self.config.tcp_max_connections
+        if max_tcp > 0 and self.manager.count_tcp_connections(domain) >= max_tcp:
+            logger.warning(
+                f"隧道 {domain} TCP 并发连接已达上限 ({max_tcp})，拒绝新连接: {conn_id}"
+            )
             writer.close()
             return
 

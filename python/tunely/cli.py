@@ -41,8 +41,20 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def _pkg_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("tunely")
+    except Exception:
+        try:
+            from . import __version__ as _v
+            return _v
+        except Exception:
+            return "unknown"
+
+
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version=_pkg_version())
 def main():
     """WS-Tunnel - WebSocket 透明反向代理隧道"""
     pass
@@ -58,9 +70,9 @@ def main():
     default="sqlite+aiosqlite:///./data/tunely.db",
     help="数据库连接 URL",
 )
-@click.option("--api-key", "-k", help="管理 API 密钥")
+@click.option("--api-key", "-k", help="管理 API 密钥（未提供时回退读环境变量 WS_TUNNEL_ADMIN_API_KEY）")
 @click.option("--ws-path", default="/ws/tunnel", help="WebSocket 路径")
-@click.option("--cors-origins", default="*", help="CORS 允许的来源（逗号分隔，* 表示全部）")
+@click.option("--cors-origins", default="", help="CORS 允许的来源（逗号分隔；* 表示全部；默认空 = 仅同源）")
 @click.option("--verbose", "-v", is_flag=True, help="详细日志")
 def serve(
     host: str,
@@ -75,8 +87,12 @@ def serve(
     """启动 Tunely Server（独立隧道服务）"""
     import os
     setup_logging(verbose)
+
+    # --api-key 未显式提供时回退到环境变量（避免密钥只能经命令行传入、被 ps 看到）
+    if api_key is None:
+        api_key = os.environ.get("WS_TUNNEL_ADMIN_API_KEY")
     
-    console.print(f"[bold blue]Tunely Server v0.3.0[/bold blue]")
+    console.print(f"[bold blue]Tunely Server v{_pkg_version()}[/bold blue]")
     console.print(f"  监听: {host}:{port}")
     console.print(f"  域名: {domain}")
     console.print(f"  数据库: {database}")

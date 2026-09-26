@@ -60,6 +60,10 @@ class TunnelServerConfig(BaseSettings):
         description="多监听器配置（可选）：'port:domain[,port:domain...]'，"
         "每个端口固定绑定一条隧道；与 tcp_listen_port 可并用，同端口时本字段优先",
     )
+    tcp_max_connections: int = Field(
+        default=0,
+        description="每隧道 TCP 并发连接上限（0 表示不限制；env: WS_TUNNEL_TCP_MAX_CONNECTIONS）",
+    )
 
     # JWT 认证（公网模式：需要 JWT 令牌才能创建隧道）
     jwt_secret: str | None = Field(

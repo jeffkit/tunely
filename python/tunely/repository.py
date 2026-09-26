@@ -11,7 +11,7 @@ from typing import List, Optional
 from sqlalchemy import select, update, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import Tunnel, TunnelRequestLog
+from .models import Tunnel, TunnelRequestLog, AdminAuditLog
 
 
 class TunnelRepository:
@@ -116,6 +116,27 @@ class TunnelRepository:
         )
         return result.rowcount > 0
 
+    async def count_tunnels(self) -> int:
+        """统计隧道总数"""
+        result = await self.session.execute(select(func.count(Tunnel.id)))
+        return result.scalar_one() or 0
+
+    async def increment_tunnel_bytes(
+        self, domain: str, bytes_in_delta: int, bytes_out_delta: int
+    ) -> bool:
+        """累加隧道流量字节数（SQL UPDATE 原子累加；delta 均为 0 时不写库）"""
+        if bytes_in_delta == 0 and bytes_out_delta == 0:
+            return False
+        result = await self.session.execute(
+            update(Tunnel)
+            .where(Tunnel.domain == domain)
+            .values(
+                bytes_in=Tunnel.bytes_in + bytes_in_delta,
+                bytes_out=Tunnel.bytes_out + bytes_out_delta,
+            )
+        )
+        return result.rowcount > 0
+
     async def delete(self, domain: str) -> bool:
         """删除隧道 - 使用 SQL DELETE 语句"""
         stmt = delete(Tunnel).where(Tunnel.domain == domain)
@@ -194,9 +215,46 @@ class TunnelRequestLogRepository:
     async def count(self, tunnel_domain: str | None = None) -> int:
         """统计请求日志数量"""
         query = select(func.count(TunnelRequestLog.id))
-        
+
         if tunnel_domain:
             query = query.where(TunnelRequestLog.tunnel_domain == tunnel_domain)
-        
+
         result = await self.session.execute(query)
         return result.scalar_one() or 0
+
+
+class AdminAuditLogRepository:
+    """管理面审计日志数据仓库"""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(
+        self,
+        action: str,
+        domain: str | None = None,
+        detail: str | None = None,
+        source_ip: str | None = None,
+    ) -> AdminAuditLog:
+        """创建审计日志记录"""
+        entry = AdminAuditLog(
+            action=action[:32] if action else action,
+            domain=domain[:255] if domain else None,
+            detail=detail[:2000] if detail else None,
+            source_ip=source_ip[:64] if source_ip else None,
+        )
+        self.session.add(entry)
+        await self.session.flush()
+        await self.session.refresh(entry)
+        return entry
+
+    async def list_recent(self, limit: int = 50, offset: int = 0) -> List[AdminAuditLog]:
+        """获取最近的审计日志（按写入时间倒序）"""
+        query = (
+            select(AdminAuditLog)
+            .order_by(AdminAuditLog.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
