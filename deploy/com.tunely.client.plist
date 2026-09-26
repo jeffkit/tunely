@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  模板，需按环境替换：Tunely Rust 客户端 macOS launchd 配置
+
+  1. 前置: 客户端需先安装（cargo install tunely，可执行文件通常在 ~/.cargo/bin/tunely）
+  2. 替换下面所有 <尖括号> 占位符（注意 launchd 不展开 ~，日志与二进制路径要写绝对路径）
+  3. 安装:
+       cp com.tunely.client.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.tunely.client.plist
+     卸载:
+       launchctl unload ~/Library/LaunchAgents/com.tunely.client.plist
+  4. 日志: ~/Library/Logs/tunely.log 与 tunely.err.log
+  5. 若安装的 tunely 版本不支持 config 文件参数（旧版只认旗标），把 ProgramArguments
+     里的 config 两行换成旗标形式（token/server/target），写法见 deploy/README.md
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tunely.client</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- 占位符 &lt;用户名&gt; 替换后即 <用户名> 形式 -->
+        <string>/Users/&lt;用户名&gt;/.cargo/bin/tunely</string>
+        <string>connect</string>
+        <string>--config</string>
+        <string>/etc/tunely/client.toml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/&lt;用户名&gt;/Library/Logs/tunely.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/&lt;用户名&gt;/Library/Logs/tunely.err.log</string>
+</dict>
+</plist>

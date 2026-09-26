@@ -1,0 +1,42 @@
+# 模板，需按环境替换：Tunely Rust 客户端 systemd unit
+#
+# 前置: 客户端需先安装 —— cargo install tunely
+#   （装到 ~/.cargo/bin/tunely，复制或软链到 /usr/local/bin/tunely，
+#     例如: sudo cargo install tunely && sudo ln -sf ~/.cargo/bin/tunely /usr/local/bin/tunely）
+# 安装本 unit:
+#   sudo cp tunely-client.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tunely-client
+#
+# 所有 <尖括号> 占位符需按环境替换。
+
+[Unit]
+Description=Tunely Client (WebSocket tunnel, Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tunely
+Group=tunely
+ExecStart=/usr/local/bin/tunely connect --config /etc/tunely/client.toml
+# 客户端配置文件 /etc/tunely/client.toml 字段（与 connect 旗标一一对应）:
+#   server          = 服务端 WebSocket URL，如 "ws://tunely.example.com/ws/tunnel"
+#   token           = 隧道令牌（tunely tunnel create 输出的 tun_xxx），必填
+#   target          = 本地目标服务 URL，如 "http://127.0.0.1:8080"
+#   reconnect       = 重连间隔秒数（默认 5）
+#   max_reconnect   = 最大重连次数，0 表示无限（默认 0）
+#   request_timeout = 单请求超时秒数（默认 300）
+#   force           = 是否强制抢占已有连接（默认 false）
+# 注意: 若安装的 tunely 版本不支持 --config 子参数（旧版只有旗标），
+# 改用旗标形式：
+#ExecStart=/usr/local/bin/tunely connect --token <tun_xxx> --server <ws://tunely.example.com/ws/tunnel> --target <http://127.0.0.1:8080>
+Restart=always
+RestartSec=5
+
+# 基础加固（按需调整）
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+# 模板，需按环境替换：Tunely Server（Python 服务端）systemd unit
+#
+# 安装步骤:
+#   1. 安装服务端: uv tool install tunely（或 pipx install tunely），
+#      确认 tunely 可执行文件路径（下面 ExecStart 以 /usr/local/bin/tunely 为例）
+#   2. 准备目录与账号:
+#        sudo useradd -r -s /usr/sbin/nologin tunely
+#        sudo mkdir -p /var/lib/tunely/data /etc/tunely
+#        sudo chown -R tunely:tunely /var/lib/tunely
+#   3. 写入环境变量: 参见 deploy/README.md 生成 /etc/tunely/env（权限 600，属主 tunely）
+#   4. cp tunely-server.service /etc/systemd/system/
+#      systemctl daemon-reload && systemctl enable --now tunely-server
+#
+# 所有 <尖括号> 占位符需按环境替换。
+
+[Unit]
+Description=Tunely Server (WebSocket reverse proxy tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tunely
+Group=tunely
+# SQLite 数据库默认落在 WorkingDirectory 下的 ./data/，故指向 /var/lib/tunely
+WorkingDirectory=/var/lib/tunely
+# WS_TUNNEL_* 变量统一放在此文件（TCP 多端口监听、心跳、JWT、webhook 等），
+# 变量清单与示例见 deploy/README.md
+EnvironmentFile=/etc/tunely/env
+# 注意: serve CLI 只认命令行参数，不读 TUNELY_* 环境变量，
+# 因此 host/port/domain/database 全部用命令行传入。
+ExecStart=/usr/local/bin/tunely serve \
+    --host <0.0.0.0> \
+    --port <8000> \
+    --domain <tunely.example.com> \
+    --database <sqlite+aiosqlite:////var/lib/tunely/data/tunely.db>
+# 管理 API 密钥：推荐像上面那样省略 --api-key，改由 /etc/tunely/env 中的
+# WS_TUNNEL_ADMIN_API_KEY 提供（0.6.0 起 serve 读取该变量）。
+# 若你的版本不生效（0.5.x 及更早版本 serve 显式传 None 会覆盖 env），
+# 取消下面一行注释并把密钥写进命令行（注意 systemctl show 会泄露密钥）：
+#ExecStart=/usr/local/bin/tunely serve --host <0.0.0.0> --port <8000> --domain <tunely.example.com> --database <sqlite+aiosqlite:////var/lib/tunely/data/tunely.db> --api-key <your-admin-api-key>
+
+# 可选: 显式指定 WebSocket 端点与 CORS（默认 /ws/tunnel 与 *）
+#   --ws-path </ws/tunnel> --cors-origins <https://a.example.com,https://b.example.com>
+
+Restart=always
+RestartSec=3
+
+# 基础加固（按需调整）
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/tunely
+
+[Install]
+WantedBy=multi-user.target
