@@ -72,7 +72,11 @@ export function TunnelList({
       dataIndex: 'domain',
       key: 'domain',
       width: 200,
-      render: (domain: string) => <code>{domain}</code>,
+      render: (domain: string) => (
+        <a href={`/${domain}/`} target="_blank" rel="noreferrer" title="在新窗口打开该服务">
+          <code>{domain}</code>
+        </a>
+      ),
     },
     {
       title: '名称',

@@ -10,14 +10,14 @@ export const API_CONFIG = {
   MAX_RETRIES: 3,
 }
 
-// 轮询配置
+// 轮询配置（隧道状态变化低频，无需激进轮询）
 export const POLLING_CONFIG = {
   /** 默认轮询间隔（毫秒） */
-  DEFAULT_INTERVAL: 5000,
-  /** 活跃时轮询间隔（毫秒） */
-  ACTIVE_INTERVAL: 3000,
-  /** 不活跃时轮询间隔（毫秒） */
-  INACTIVE_INTERVAL: 10000,
+  DEFAULT_INTERVAL: 30000,
+  /** 页面有交互时的轮询间隔（毫秒） */
+  ACTIVE_INTERVAL: 15000,
+  /** 长时间无交互的轮询间隔（毫秒） */
+  INACTIVE_INTERVAL: 60000,
 }
 
 // 分页配置
