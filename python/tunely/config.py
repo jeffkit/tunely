@@ -41,10 +41,24 @@ class TunnelServerConfig(BaseSettings):
         description="forward 转发超时上限（秒）：对请求传入的 timeout 做 clamp，防止长期占用；0 = 不限制（env: WS_TUNNEL_FORWARD_MAX_TIMEOUT）",
     )
 
+    # 请求日志（落库走后台队列，不阻塞转发面）
+    request_log_enabled: bool = Field(
+        default=True,
+        description="是否把每请求日志写库（env: WS_TUNNEL_REQUEST_LOG_ENABLED）；关闭后转发面对请求日志零 DB 写",
+    )
+    request_log_retention_days: int = Field(
+        default=30,
+        description="请求日志保留天数，后台任务周期清理超期行；0 = 永久保留（env: WS_TUNNEL_REQUEST_LOG_RETENTION_DAYS）",
+    )
+
     # 内存安全上限（防 OOM）
     tcp_forward_max_buffer_bytes: int = Field(
         default=10485760,
         description="HTTP 触发的 TCP 转发单请求响应累积缓冲上限（字节），超限该请求以 'response too large' 失败；0 = 不限制（env: WS_TUNNEL_TCP_FORWARD_MAX_BUFFER_BYTES）",
+    )
+    http_max_response_bytes: int = Field(
+        default=104857600,
+        description="HTTP 模式单请求响应体上限（字节），超限以 502 拒绝（客户端/服务端都不再缓冲超限体）；0 = 不限制（env: WS_TUNNEL_HTTP_MAX_RESPONSE_BYTES）",
     )
     stream_queue_maxsize: int = Field(
         default=1024,

@@ -116,6 +116,15 @@ class TunnelRepository:
         )
         return result.rowcount > 0
 
+    async def increment_requests_by_domain(self, domain: str, count: int) -> bool:
+        """按域名批量累加请求计数（内存增量周期落库用）"""
+        result = await self.session.execute(
+            update(Tunnel)
+            .where(Tunnel.domain == domain)
+            .values(total_requests=Tunnel.total_requests + count)
+        )
+        return result.rowcount > 0
+
     async def count_tunnels(self) -> int:
         """统计隧道总数"""
         result = await self.session.execute(select(func.count(Tunnel.id)))
@@ -227,6 +236,13 @@ class TunnelRequestLogRepository:
 
         result = await self.session.execute(query)
         return result.scalar_one() or 0
+
+    async def delete_older_than(self, cutoff: datetime) -> int:
+        """删除早于 cutoff 的请求日志（保留策略后台清理用），返回删除行数"""
+        result = await self.session.execute(
+            delete(TunnelRequestLog).where(TunnelRequestLog.timestamp < cutoff)
+        )
+        return result.rowcount or 0
 
 
 class AdminAuditLogRepository:

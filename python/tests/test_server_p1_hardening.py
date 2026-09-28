@@ -172,6 +172,10 @@ class TestRequestLogRedaction:
         )
         assert resp.status == 200
 
+        # 日志走后台队列落库：等 worker 消费完再查行
+        assert await _wait_until(lambda: server._log_queue.empty())
+        await asyncio.sleep(0.05)
+
         # 直查模型行（绕过 to_dict 的 500 字符展示截断）
         async with server.db.session() as session:
             log_repo = TunnelRequestLogRepository(session)
@@ -230,7 +234,7 @@ class TestSqliteConcurrencyTuning:
 
     @pytest.mark.asyncio
     async def test_log_failure_does_not_rollback_request_counter(self, server):
-        """请求计数与日志写拆独立事务：日志失败不回滚计数"""
+        """请求计数与日志写解耦：日志落库失败不影响计数（0.7.1 起计数走内存增量）"""
         async with server.db.session() as session:
             repo = TunnelRepository(session)
             await repo.create(domain="cnt-dom", token="tok-cnt-dom")
@@ -246,13 +250,20 @@ class TestSqliteConcurrencyTuning:
             resp = await server.forward(
                 domain="cnt-dom", method="GET", path="/", headers={}
             )
-        assert resp.status == 200
+            assert resp.status == 200
+            # 在 patch 生效窗口内等 worker 消费完，确保失败发生在 create 被打桩时
+            assert await _wait_until(lambda: server._log_queue.empty())
+            await asyncio.sleep(0.05)
 
+        assert server._request_counters.get("cnt-dom") == 1  # 计数已入内存增量
+
+        # flush 后计数落库（日志失败不影响计数）
+        await server._flush_request_counters()
         async with server.db.session() as session:
             repo = TunnelRepository(session)
             row = await repo.get_by_token("tok-cnt-dom")
         assert row is not None
-        assert row.total_requests == 1  # 计数已提交
+        assert row.total_requests == 1
 
         logs = await server._get_tunnel_logs("cnt-dom", 10, 0, None)
         assert logs["total"] == 0  # 日志确实失败
