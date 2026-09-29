@@ -71,3 +71,28 @@
 
 - stream 块走 base64（+33%）而非 binary 帧：SSE 是文本为主，大块二进制留给 v2.1 再评估 binary stream 帧。
 - 小体积二进制 body 经 HTTP 模式仍有 UTF-8 replace 损坏（F4 未根治——只有超过流式阈值才走 base64 流）。彻底修 = 「协商了 chunked_http 就对非文本 content-type 一律流式」，留待后续（本期阈值规则简单优先）。
+
+## 5. UDP 会话（T4，issue #4 落地）
+
+原则：复用 v2 已有能力协商；数据面走二进制帧新帧型；**不做 base64 JSON 数据变体**（协商了 udp 就必然有 binary frame 通道）。
+
+- 能力名：`udp`。客户端声明即代表已实现；服务端注册后按连接协商门控。
+- JSON 控制面新增（text 帧）：
+  - `udp_open`（服务端→客户端）：`{type, session_id(36位uuid串), timestamp}`——外部首包到达，建会话并通知客户端建 socket；
+  - `udp_close`（双向）：`{type, session_id, reason?, timestamp}`——任一侧结束会话。
+- 数据面（binary 帧，帧版本仍 0x02）：
+  - `0x03 = udp_data`：`[0x02][0x03][16B session_id 原始 UUID][payload]`，**双向**，payload 为原始数据报字节（一帧一报文，不拼接）。
+- 服务端语义：
+  - 监听：`WS_TUNNEL_UDP_LISTEN="port:domain,..."`（与 TCP 监听同格式，独立 env；UDP/TCP 可同端口号并存）；每端口一条 asyncio DatagramEndpoint；
+  - 会话键 = `(监听端口, 外部 addr)`；首包建 session（uuid4）→ 先发 `udp_open` 再发数据帧（WS 有序，客户端先建 socket 再收数据）；
+  - 回程：客户端 `0x03` 帧 → 查 session → `sendto(外部 addr)`；session 不存在 → debug 丢弃；
+  - 回收：空闲超时 `WS_TUNNEL_UDP_SESSION_TIMEOUT`（默认 60s）→ 发 `udp_close` + 删映射，周期 sweeper；客户端先发 `udp_close` → 服务端删映射；隧道 WS 断连 → 该隧道全部会话清理；
+  - 门控：连接未协商 `udp` 时收到外部 UDP 包 → 丢弃 + warning；
+  - 上限：`WS_TUNNEL_UDP_MAX_SESSIONS`（默认 256/隧道，0=不限），超限丢包 + warning（UDP 无连接，防会话表被扫爆——**反射放大风险**：会话只回显给「已建立会话的 addr」，公网开 UDP 监听需自行评估暴露面）。
+- 客户端语义（rust + py；**TS 本期不实现、不声明**，登记表注明）：
+  - 收 `udp_open` → 建到 target(host:port) 的 UDP socket（每会话一个）+ 起收包任务；
+  - 收 `0x03` 帧 → `session.sendto(payload)`；
+  - socket 收到回包 → `0x03` 帧回服务端；socket 超时/错误或收 `udp_close`/WS 断连 → 清理会话，主动发 `udp_close`；
+  - auth 声明加 `"udp"`。
+- parse_message_fast：补 udp_open/udp_close 轻校验直构。
+- 版本：py **0.9.0** / rust **0.3.0** / ts 不动。部署顺序同 v2 纪律（服务端先行零风险）。
