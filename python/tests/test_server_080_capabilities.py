@@ -3,7 +3,7 @@
 
 - AuthMessage / AuthOkMessage 增加可选 capabilities: list[str]，缺字段 = 空集合
 - 协商语义：服务端注册表 ∩ 客户端声明 − kill 开关禁用集，只回交集
-- 服务端注册表 SERVER_CAPABILITIES 初始为空（T2/T3 实现后再注册能力名）
+- 服务端注册表 SERVER_CAPABILITIES 随实现注册能力名（现为 binary_frames + chunked_http）
 - ActiveConnection.capabilities 存协商结果（本任务只存不用）
 - 端到端：auth 带 capabilities → auth_ok 回交集；kill 开关经 env 生效
 """
@@ -26,9 +26,9 @@ def _make_server(**config_kwargs) -> TunnelServer:
 
 
 class TestNegotiateCapabilities:
-    def test_registry_has_binary_frames(self):
-        """T2 起注册表含 binary_frames（chunked_http 等 T3 实现后再注册）"""
-        assert SERVER_CAPABILITIES == ["binary_frames"]
+    def test_registry_has_implemented_capabilities(self):
+        """T3 起注册表含 binary_frames（T2）与 chunked_http（T3）"""
+        assert SERVER_CAPABILITIES == ["binary_frames", "chunked_http"]
 
     def test_intersection_semantics(self, monkeypatch):
         """交集语义：客户端声明 ∩ 服务端注册表；声明了未注册能力不启用"""
@@ -41,9 +41,9 @@ class TestNegotiateCapabilities:
         ]
 
     def test_unregistered_capability_negotiates_nothing(self):
-        """未注册进注册表的能力（chunked_http，T3 未实现）声明了也不启用"""
+        """未注册进注册表的能力（如尚不存在的 future_cap）声明了也不启用"""
         srv = _make_server()
-        assert srv._negotiate_capabilities(["chunked_http"]) == []
+        assert srv._negotiate_capabilities(["future_cap"]) == []
 
     def test_missing_or_nonlist_caps_is_empty_set(self):
         """客户端缺失声明 = 空集合；防御式：非列表输入也按空集合"""

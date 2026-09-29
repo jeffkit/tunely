@@ -314,8 +314,9 @@ class _FakeWebSocket:
 
 class TestClientBinaryFrames:
     def test_client_declares_binary_frames(self):
-        """客户端只声明已实现的能力：T2 起为 ['binary_frames']"""
-        assert TunnelClient._client_capabilities() == ["binary_frames"]
+        """客户端声明已实现的能力：binary_frames（T2）必须在声明集中"""
+        caps = TunnelClient._client_capabilities()
+        assert "binary_frames" in caps
 
     @pytest.mark.asyncio
     async def test_tcp_connection_sends_binary_frame_when_negotiated(self):

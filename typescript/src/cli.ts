@@ -56,6 +56,11 @@ program
       maxResponseBytes: process.env.TUNELY_MAX_RESPONSE_BYTES
         ? parseInt(process.env.TUNELY_MAX_RESPONSE_BYTES, 10)
         : undefined,
+      // 非 SSE 大响应流式阈值（字节）：env TUNELY_STREAM_THRESHOLD_BYTES，
+      // 0 = 从不流式，默认 1MB（协议 v2 chunked_http，仅 stream_ok 请求生效）
+      streamThresholdBytes: process.env.TUNELY_STREAM_THRESHOLD_BYTES
+        ? parseInt(process.env.TUNELY_STREAM_THRESHOLD_BYTES, 10)
+        : undefined,
     });
 
     client.on('onConnect', (domain) => {

@@ -477,6 +477,10 @@ impl TunnelClient {
                     headers,
                     body,
                     timeout,
+                    // 协议 v2 chunked_http（T3）：rust 不实现非 SSE 大响应
+                    // 流式回传、也不声明该能力——即便收到 stream_ok=true
+                    // 也照旧缓冲回 TunnelResponse（服务端补桥兜底）
+                    stream_ok: _,
                 } => {
                     if let Ok(e) = self.events.try_lock() {
                         if let Some(f) = &e.on_request {

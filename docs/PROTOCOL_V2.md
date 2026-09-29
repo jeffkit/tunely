@@ -39,22 +39,28 @@
 
 ## 2. chunked_http（T3）——非 SSE 大响应流式
 
+> **状态：已落地（2026-09-29，py 服务端 + py/ts 客户端；rust 不实现不声明）。**
+> 实现清单见 PROTOCOL.md「chunked_http 语义」小节；§4 已知边界随本能力登记。
+
 背景（侦察结论，必须写进实现者的脑子）：
-- `forward_stream` 今天对非 SSE 目标**本来就是坏的**：客户端回 `TunnelResponse` 只会完成缓冲型 future，流式消费侧干等超时（docstring 承诺的「完整响应 SingleChunk」从未实现）。T3 顺带修掉这个缺口。
-- 客户端不能自作主张切流式：`/forward`、`/t/` 的缓冲分支在等 TunnelResponse future，客户端改发流 = 对端超时。**必须由服务端在请求上标记放行。**
+- `forward_stream` 今天对非 SSE 目标**本来就是坏的**：客户端回 `TunnelResponse` 只会完成缓冲型 future，流式消费侧干等超时（docstring 承诺的「完整响应 SingleChunk」从未实现）。T3 顺带修掉这个缺口。✅（WS 循环补桥：`bridge_response_to_stream` 合成三段流消息投入流队列）
+- 客户端不能自作主张切流式：`/forward`、`/t/` 的缓冲分支在等 TunnelResponse future，客户端改发流 = 对端超时。**必须由服务端在请求上标记放行。** ✅（有测试锚定缓冲分支零变化）
 
 设计：
-- `TunnelRequest` 增加可选 `stream_ok: bool = false`（additive；由 `forward_stream` 发出，缓冲 API 永远不发）。
-- `StreamChunkMessage` 增加可选 `encoding: "plain" | "base64"`，默认 `"plain"`（additive；二进制内容用 base64 块 + 标记，v2 不给 stream 走 binary 帧，+33% 局限记入 PROTOCOL.md 已知边界）。
-- 客户端行为（py + TS；rust 无 HTTP 转发模式不涉及）：
-  - SSE：与现状一致，总是流式（不需要 stream_ok）；
+- `TunnelRequest` 增加可选 `stream_ok: bool = false`（additive；由 `forward_stream` 发出，缓冲 API 永远不发）。✅
+- `StreamChunkMessage` 增加可选 `encoding: "plain" | "base64"`，默认 `"plain"`（additive；二进制内容用 base64 块 + 标记，v2 不给 stream 走 binary 帧，+33% 局限记入 PROTOCOL.md 已知边界）。✅
+- 客户端行为（py + TS；rust 无 HTTP 转发模式不涉及）：✅
+  - SSE：与现状一致，总是流式（不需要 stream_ok）；✅
   - 非 SSE：仅当 **`request.stream_ok == true`** 且 **协商了 `chunked_http`** 且 **响应体 > 阈值**（config，py `WS_TUNNEL_CLIENT_STREAM_THRESHOLD_BYTES` / ts `TUNELY_STREAM_THRESHOLD_BYTES`，默认 1MB，0=从不流式）才切流式：
-    发 `StreamStart(status, headers)` → 数据块（文本解码 plain / 二进制 base64+标记）→ `StreamEnd(total_chunks, duration_ms)`。
-    Content-Length 未知的响应读到一半越过阈值 → 把已缓冲部分作为首批数据块就地切换。
-  - 其余情况照旧回 `TunnelResponse`（0.7.3 的客户端 cap 语义保留）。
-- 服务端：`forward_stream` 的请求带 `stream_ok=true`；**WS 循环补桥**：`TunnelResponse` 到达时若 id 在 `_pending_stream_requests` → 合成 `StreamStart + StreamChunk(全量 body, plain) + StreamEnd` 投入该流队列并清理（修复上述既有缺口）。
-- `/forward`、`/t/` 缓冲分支零改动（stream_ok 门控保证它们永远不会收到流式回答）。
+    发 `StreamStart(status, headers)` → 数据块（文本解码 plain / 二进制 base64+标记）→ `StreamEnd(total_chunks, duration_ms)`。✅
+    Content-Length 未知的响应读到一半越过阈值 → 把已缓冲部分作为首批数据块就地切换。✅
+  - 其余情况照旧回 `TunnelResponse`（0.7.3 的客户端 cap 语义保留）。✅
+- 服务端：`forward_stream` 的请求带 `stream_ok=true`；**WS 循环补桥**：`TunnelResponse` 到达时若 id 在 `_pending_stream_requests` → 合成 `StreamStart + StreamChunk(全量 body, plain) + StreamEnd` 投入该流队列并清理（修复上述既有缺口）。✅
+- `/forward`、`/t/` 缓冲分支零改动（stream_ok 门控保证它们永远不会收到流式回答）。✅
 - app.py `/t/` 的大文件代理（对非 SSE 目标发 stream_ok）= 后续项，不在本期。
+- 实现备注：TS 客户端字段名与 wire 键一致取 `stream_ok`（snake_case，同 `tunnel_id` 先例）；
+  TS 共享 dispatcher 改经 undici 同源 fetch——global fetch + 外部 Agent 会因跨拷贝
+  handler 协议不匹配丢失全部响应头（连带破坏既有 SSE 判定）。
 
 ## 3. 版本与发布
 

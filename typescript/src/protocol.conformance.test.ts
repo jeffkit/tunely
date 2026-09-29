@@ -118,8 +118,8 @@ describe('Protocol Conformance - 能力协商（协议 v2）', () => {
     expect(msg).toEqual(roundtrip(msg));
   });
 
-  it('createAuthMessage 默认声明 binary_frames：线上键为五键（含 capabilities）', () => {
-    // T2 起客户端声明已实现的能力（CLIENT_CAPABILITIES = ['binary_frames']）
+  it('createAuthMessage 默认声明已实现能力：线上键为五键（含 capabilities）', () => {
+    // T2 起声明 binary_frames，T3 起追加 chunked_http（CLIENT_CAPABILITIES）
     const wire = JSON.stringify(createAuthMessage('tok_local', false));
     const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
 
@@ -130,7 +130,7 @@ describe('Protocol Conformance - 能力协商（协议 v2）', () => {
       'token',
       'type',
     ]);
-    expect(msg.capabilities).toEqual(['binary_frames']);
+    expect(msg.capabilities).toEqual(['binary_frames', 'chunked_http']);
   });
 
   it('createAuthMessage 可覆盖 capabilities：传空数组 = 不声明任何能力（0.7.x 行为）', () => {
@@ -230,6 +230,56 @@ describe('Protocol Conformance - 流式响应消息（SSE）', () => {
     expect(msg.error).toBeNull();
     expect(msg.duration_ms).toBe(1500);
     expect(msg.total_chunks).toBe(3);
+    expect(msg).toEqual(roundtrip(msg));
+  });
+});
+
+describe('Protocol Conformance - chunked_http 字段（协议 v2 T3）', () => {
+  it('request 带 stream_ok=true：parse 得到 stream_ok 并 roundtrip（additive 字段）', () => {
+    const wire =
+      '{"type":"request","id":"req-fs","method":"POST","path":"/api/chat","headers":{},"body":null,"timeout":30,"stream_ok":true,"timestamp":"' +
+      TS +
+      '"}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.REQUEST }>;
+
+    expect(msg.type).toBe(MessageType.REQUEST);
+    expect(msg.stream_ok).toBe(true);
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('request 缺 stream_ok（0.7.x 服务端形状）：parse 成功且字段为 undefined', () => {
+    const wire =
+      '{"type":"request","id":"req-fs","method":"GET","path":"/x","headers":{},"timestamp":"' +
+      TS +
+      '"}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.REQUEST }>;
+
+    expect(msg.stream_ok).toBeUndefined();
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('stream_chunk 带 encoding=base64：parse 并 roundtrip，base64 语义锚定', () => {
+    // base64([0x00, 0x01, 0x02]) = "AAEC"（二进制内容块）
+    const wire =
+      '{"type":"stream_chunk","id":"req-bin","data":"AAEC","sequence":0,"encoding":"base64","timestamp":"' +
+      TS +
+      '"}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.STREAM_CHUNK }>;
+
+    expect(msg.type).toBe(MessageType.STREAM_CHUNK);
+    expect(msg.encoding).toBe('base64');
+    expect(Buffer.from(msg.data!, 'base64').equals(Buffer.from([0x00, 0x01, 0x02]))).toBe(true);
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('stream_chunk 缺 encoding（旧形状）：undefined，按 plain 理解', () => {
+    const wire =
+      '{"type":"stream_chunk","id":"req-sse","data":"data: hi\\n\\n","sequence":0,"timestamp":"' +
+      TS +
+      '"}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.STREAM_CHUNK }>;
+
+    expect(msg.encoding).toBeUndefined();
     expect(msg).toEqual(roundtrip(msg));
   });
 });
@@ -334,7 +384,7 @@ describe('Protocol Conformance - 客户端序列化形状（pydantic 兼容）',
     expect(msg.type).toBe('auth');
     expect(msg.token).toBe('tok_local');
     expect(msg.force).toBe(true);
-    expect(msg.capabilities).toEqual(['binary_frames']);
+    expect(msg.capabilities).toEqual(['binary_frames', 'chunked_http']);
   });
 
   it('createPongMessage：线上键为 type/timestamp，type 为 "pong"', () => {

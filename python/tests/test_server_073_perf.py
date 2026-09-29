@@ -45,9 +45,12 @@ from .test_server_p1_hardening import _make_responder, _register_conn
 # payload 函数与对应模型类的对照表
 _PAYLOAD_TABLE = [
     (request_payload("r1", "GET", "/x", {"a": "b"}, "body", 12.0), TunnelRequest),
+    # 协议 v2 T3：stream_ok / encoding 非默认值也要与 model_dump 键集一致
+    (request_payload("r2", "POST", "/y", {}, None, 5.0, stream_ok=True), TunnelRequest),
     (response_payload("r1", 200, {"a": "b"}, "ok", None, 12), TunnelResponse),
     (stream_start_payload("r1", 200, {"a": "b"}), StreamStartMessage),
     (stream_chunk_payload("r1", "chunk-数据", 3), StreamChunkMessage),
+    (stream_chunk_payload("r2", "aGk=", 1, encoding="base64"), StreamChunkMessage),
     (stream_end_payload("r1", None, 100, 5), StreamEndMessage),
     (tcp_connect_payload("c1"), TcpConnectMessage),
     (tcp_data_payload("c1", "aGk=", 7), TcpDataMessage),

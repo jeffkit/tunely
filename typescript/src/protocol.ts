@@ -71,6 +71,13 @@ export interface TunnelRequest {
   headers: Record<string, string>;
   body?: string | null;
   timeout?: number;
+  /**
+   * 协议 v2 chunked_http（T3）：服务端放行非 SSE 大响应流式回传。
+   * 仅 forward_stream 发 true；/forward、/t/ 缓冲分支恒为 false——
+   * 客户端只在 stream_ok 请求上允许切流式（否则对端缓冲 future 超时）。
+   * 键名与 wire 一致（snake_case，同 tunnel_id / duration_ms 先例）。
+   */
+  stream_ok?: boolean;
   timestamp?: string;
 }
 
@@ -100,6 +107,13 @@ export interface StreamChunkMessage {
   id: string;
   data: string;
   sequence?: number;
+  /**
+   * 协议 v2 chunked_http（T3）：data 编码。plain = UTF-8 文本
+   * （SSE / text/* / application/json）；base64 = 二进制内容字节
+   * （+33% 开销，v2 不给 stream 走 binary 帧，见 PROTOCOL_V2 §4）。
+   * 缺省按 plain 理解（旧客户端兼容）。
+   */
+  encoding?: 'plain' | 'base64';
   timestamp?: string;
 }
 
@@ -170,9 +184,10 @@ export type Message =
 /**
  * 本客户端已实现并声明的能力（协议 v2 能力协商）。
  * 铁律：只许声明已实现的能力（声明了没实现 = 服务端会用而客户端解析不了 = 事故）。
- * T2 起实现 binary_frames，故声明之；新能力实现后在此追加。
+ * T2 起实现 binary_frames；T3 起实现 chunked_http（非 SSE 大响应流式回传）。
+ * 新能力实现后在此追加。
  */
-export const CLIENT_CAPABILITIES: string[] = ['binary_frames'];
+export const CLIENT_CAPABILITIES: string[] = ['binary_frames', 'chunked_http'];
 
 export function createAuthMessage(
   token: string,

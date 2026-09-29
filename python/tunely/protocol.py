@@ -19,7 +19,7 @@ import json
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -114,6 +114,12 @@ class TunnelRequest(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict, description="HTTP 请求头")
     body: str | None = Field(default=None, description="请求体（JSON 字符串或其他）")
     timeout: float = Field(default=1800.0, description="超时时间（秒）")
+    stream_ok: bool = Field(
+        default=False,
+        description="服务端放行非 SSE 大响应流式回传（协议 v2 chunked_http，T3）。"
+        "仅 forward_stream 发 True；/forward、/t/ 缓冲分支恒为 False——"
+        "客户端只在 stream_ok 请求上允许切流式（否则对端缓冲 future 超时）",
+    )
 
     # 元信息
     timestamp: str = Field(
@@ -174,6 +180,12 @@ class StreamChunkMessage(BaseModel):
     id: str = Field(..., description="请求 ID，与 TunnelRequest.id 对应")
     data: str = Field(..., description="数据块内容")
     sequence: int = Field(default=0, description="数据块序号，从 0 开始")
+    encoding: Literal["plain", "base64"] = Field(
+        default="plain",
+        description="data 编码（协议 v2 chunked_http，T3）：plain = UTF-8 文本"
+        "（SSE / text/* / application/json）；base64 = 二进制内容字节"
+        "（+33% 开销，v2 不给 stream 走 binary 帧，见 PROTOCOL_V2 §4）",
+    )
     timestamp: str = Field(
         default_factory=lambda: datetime.now().isoformat(), description="发送时间"
     )
@@ -359,6 +371,7 @@ def request_payload(
     headers: dict[str, str] | None,
     body: str | None,
     timeout: float,
+    stream_ok: bool = False,
 ) -> dict:
     """TunnelRequest 的手工 dict 形状（键集与 model_dump 一致）"""
     return {
@@ -369,6 +382,7 @@ def request_payload(
         "headers": headers or {},
         "body": body,
         "timeout": timeout,
+        "stream_ok": stream_ok,
         "timestamp": _now_iso(),
     }
 
@@ -406,12 +420,18 @@ def stream_start_payload(
     }
 
 
-def stream_chunk_payload(request_id: str, data: str, sequence: int) -> dict:
+_STREAM_ENCODINGS = ("plain", "base64")
+
+
+def stream_chunk_payload(
+    request_id: str, data: str, sequence: int, encoding: str = "plain"
+) -> dict:
     return {
         "type": _MSG_TYPES.STREAM_CHUNK.value,
         "id": request_id,
         "data": data,
         "sequence": sequence,
+        "encoding": encoding,
         "timestamp": _now_iso(),
     }
 
@@ -490,11 +510,15 @@ def parse_message_fast(raw: str | bytes) -> BaseModel:
         sequence = data.get("sequence", 0)
         if not _is_int(sequence):
             raise ValueError("invalid stream_chunk: sequence must be int")
+        encoding = data.get("encoding", "plain")
+        if encoding not in _STREAM_ENCODINGS:
+            raise ValueError("invalid stream_chunk: encoding must be plain|base64")
         return StreamChunkMessage.model_construct(
             type=_MSG_TYPES.STREAM_CHUNK,
             id=_require_str(data, "id"),
             data=_require_str(data, "data"),
             sequence=sequence,
+            encoding=encoding,
             timestamp=data.get("timestamp") or _now_iso(),
         )
 
@@ -555,6 +579,9 @@ def parse_message_fast(raw: str | bytes) -> BaseModel:
         timeout = data.get("timeout", 1800.0)
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             raise ValueError("invalid request: timeout must be number")
+        stream_ok = data.get("stream_ok", False)
+        if not isinstance(stream_ok, bool):
+            raise ValueError("invalid request: stream_ok must be bool")
         return TunnelRequest.model_construct(
             type=_MSG_TYPES.REQUEST,
             id=_require_str(data, "id"),
@@ -563,6 +590,7 @@ def parse_message_fast(raw: str | bytes) -> BaseModel:
             headers=_opt_dict(data, "headers"),
             body=data.get("body"),
             timeout=timeout,
+            stream_ok=stream_ok,
             timestamp=data.get("timestamp") or _now_iso(),
         )
 

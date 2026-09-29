@@ -159,6 +159,12 @@ class TunnelClientConfig(BaseSettings):
         default=104857600,
         description="普通响应体内存上限（字节），超限中止读取并以 502 返回（与生产服务端 cap 对齐）；0 = 不限制（env: WS_TUNNEL_CLIENT_MAX_RESPONSE_BYTES）",
     )
+    stream_threshold_bytes: int = Field(
+        default=1048576,
+        description="非 SSE 响应超过该字节数、且协商了 chunked_http、且服务端放行"
+        "（request.stream_ok）时切换流式回传（协议 v2 chunked_http）；"
+        "0 = 从不流式（env: WS_TUNNEL_CLIENT_STREAM_THRESHOLD_BYTES）",
+    )
 
     model_config = {
         "env_prefix": "WS_TUNNEL_CLIENT_",

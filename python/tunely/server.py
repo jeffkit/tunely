@@ -104,8 +104,8 @@ _STREAM_FAILED = object()
 
 # 服务端能力注册表（协议 v2 能力协商，见 docs/PROTOCOL_V2.md §0）。
 # 认证时按「服务端注册表 ∩ 客户端声明 − disable_capabilities」回交集。
-# T2 已实现 binary_frames（WS binary 数据面帧）；T3 实现 chunked_http 后再加。
-SERVER_CAPABILITIES: list[str] = ["binary_frames"]
+# T2 binary_frames：WS binary 数据面帧；T3 chunked_http：非 SSE 大响应流式回传。
+SERVER_CAPABILITIES: list[str] = ["binary_frames", "chunked_http"]
 
 
 def _client_ip(http_request: Request | None) -> str | None:
@@ -696,6 +696,60 @@ class TunnelManager:
     async def cleanup_stream_request(self, request_id: str) -> None:
         """清理流式请求"""
         self._pending_stream_requests.pop(request_id, None)
+
+    async def bridge_response_to_stream(self, response: TunnelResponse) -> bool:
+        """协议 v2 chunked_http（T3）补桥：TunnelResponse → 流式三段消息
+
+        客户端对非 SSE 目标只回 TunnelResponse（缓冲形态）。此前该响应只会
+        完成缓冲型 future（_pending_requests），forward_stream 的流式消费侧
+        干等到超时——docstring 承诺的「完整响应 SingleChunk」从未实现。
+
+        现在：若 id 是 forward_stream 发出的流式 pending（stream_ok 请求），
+        把完整响应合成为 StreamStart + StreamChunk(全量 body, plain) +
+        StreamEnd 依次经 _stream_queue_put 投入该流队列并清理（收尾语义参照
+        handle_stream_end：置 started/ended 标记 + None 哨兵唤醒消费侧）。
+        某段队列写满时 _stream_queue_put 已按流错误终止该流，后续段不再投递。
+
+        返回 True 表示已按流式处理；False 表示不是流式请求（调用方走缓冲
+        完成路径，/forward 与 /t/ 缓冲分支行为不变）。
+        """
+        pending = self._pending_stream_requests.get(response.id)
+        if pending is None:
+            return False
+
+        start = StreamStartMessage(
+            id=response.id, status=response.status, headers=response.headers
+        )
+        chunk = None
+        if response.body is not None:
+            chunk = StreamChunkMessage(
+                id=response.id, data=response.body, sequence=0, encoding="plain"
+            )
+        end = StreamEndMessage(
+            id=response.id,
+            error=response.error,
+            duration_ms=response.duration_ms,
+            total_chunks=1 if chunk is not None else 0,
+        )
+
+        ok = self._stream_queue_put(pending, start)
+        if ok and chunk is not None:
+            ok = self._stream_queue_put(pending, chunk)
+        if ok:
+            ok = self._stream_queue_put(pending, end)
+        if ok:
+            # None 哨兵：消费侧读到即认为流结束（与 handle_stream_end 一致）
+            self._stream_queue_put(pending, None)
+
+        # 收尾标记（参照 handle_stream_start/end 的字段语义），并立即清理
+        # pending——合成流已完整，不再接受后续同名流消息。
+        # started 仅在入队成功时置位（forward_stream 以此决定是否计请求数）
+        pending.started = ok
+        pending.start_message = start
+        pending.ended = True
+        pending.end_message = end
+        self._pending_stream_requests.pop(response.id, None)
+        return True
 
     # ============== TCP 模式支持 ==============
 
@@ -1496,14 +1550,7 @@ class TunnelServer:
                 elif isinstance(message, PongMessage):
                     await self.manager.update_heartbeat(token)
                 elif isinstance(message, TunnelResponse):
-                    # 归属校验：只完成属于当前连接所在隧道的请求（防跨隧道串扰）
-                    if not self._reject_cross_tunnel_message(
-                        "tunnel_response",
-                        message.id,
-                        self.manager.get_pending_request_domain(message.id),
-                        tunnel_domain,
-                    ):
-                        await self.manager.complete_request(message.id, message)
+                    await self._handle_client_tunnel_response(message, tunnel_domain)
                 # 流式消息处理（SSE 支持）
                 elif isinstance(message, StreamStartMessage):
                     if not self._reject_cross_tunnel_message(
@@ -1592,6 +1639,30 @@ class TunnelServer:
         ):
             return
         await self._route_tcp_payload(conn_id, data)
+
+    async def _handle_client_tunnel_response(
+        self, message: TunnelResponse, tunnel_domain: str | None
+    ) -> None:
+        """处理客户端回传的 TunnelResponse（缓冲与流式两种归属）
+
+        - 归属校验覆盖两种 pending（缓冲 _pending_requests / 流式
+          _pending_stream_requests，防跨隧道串扰）；
+        - 协议 v2 chunked_http（T3）补桥：id 属于 forward_stream 的流式
+          pending（非 SSE 目标，客户端只会回缓冲形态 TunnelResponse）时，
+          合成 StreamStart + StreamChunk + StreamEnd 投入流队列——修复
+          「流式消费侧干等到超时」的既有缺口；
+        - 否则走原缓冲完成路径（/forward、/t/ 缓冲分支零行为变化）。
+        """
+        owner_domain = self.manager.get_pending_request_domain(
+            message.id
+        ) or self.manager.get_pending_stream_domain(message.id)
+        if self._reject_cross_tunnel_message(
+            "tunnel_response", message.id, owner_domain, tunnel_domain
+        ):
+            return
+        bridged = await self.manager.bridge_response_to_stream(message)
+        if not bridged:
+            await self.manager.complete_request(message.id, message)
 
     def _verify_jwt_token(self, authorization: str | None) -> dict | None:
         """验证 JWT Bearer token，返回 payload 或 None"""
@@ -2394,6 +2465,11 @@ class TunnelServer:
         如果目标不是 SSE 响应，将收到一个包含完整响应的 StreamChunkMessage，
         然后立即收到 StreamEndMessage。
 
+        协议 v2 chunked_http（T3）：本方法发出的 TunnelRequest 带
+        stream_ok=True——客户端据此允许对非 SSE 大响应切流式回传
+        （StreamStart/Chunk*/End），且仅限本请求（/forward、/t/ 缓冲分支
+        恒发 stream_ok=False，永远不会收到流式回答）。
+
         Args:
             domain: 目标隧道域名
             method: HTTP 方法
@@ -2434,11 +2510,19 @@ class TunnelServer:
             # 创建流式请求
             pending = await self.manager.create_stream_request(request_id, domain=domain)
 
-            # 发送请求（数据面快速路径：手工 dict，wire 键集不变）
+            # 发送请求（数据面快速路径：手工 dict，wire 键集不变）。
+            # stream_ok=True（协议 v2 chunked_http，T3）：放行客户端对非 SSE
+            # 大响应切流式回传；缓冲 API 不带该标记，行为不变。
             await conn.websocket.send_text(
                 dump_payload(
                     request_payload(
-                        request_id, method, path, headers, request_body_json, timeout
+                        request_id,
+                        method,
+                        path,
+                        headers,
+                        request_body_json,
+                        timeout,
+                        stream_ok=True,
                     )
                 )
             )

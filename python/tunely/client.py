@@ -407,9 +407,10 @@ class TunnelClient:
         """本客户端已实现并声明的能力（协议 v2 能力协商）。
 
         铁律：只许声明已实现的能力（声明了没实现 = 服务端会用而客户端解析不了）。
-        T2 起实现 binary_frames，故声明之；新能力实现后在此追加。
+        T2 起实现 binary_frames；T3 起实现 chunked_http（非 SSE 大响应流式回传）。
+        新能力实现后在此追加。
         """
-        return ["binary_frames"]
+        return ["binary_frames", "chunked_http"]
 
     async def _connect_and_run(self) -> None:
         """连接并运行"""
@@ -575,16 +576,54 @@ class TunnelClient:
                     )
                     return None  # SSE 响应已通过流式消息发送
                 else:
+                    # 协议 v2 chunked_http（T3）门控：stream_ok 请求 + 已协商
+                    # chunked_http + 阈值 > 0，三者齐备才可能切流式；其余情况
+                    # 走既有缓冲路径（行为与 0.7.3 完全一致）
+                    stream_eligible = (
+                        request.stream_ok
+                        and "chunked_http" in self._negotiated
+                        and self.config.stream_threshold_bytes > 0
+                    )
+                    threshold = self.config.stream_threshold_bytes
+                    declared_len: int | None = None
+                    if stream_eligible:
+                        declared_len = self._declared_content_length(response_headers)
+                        if declared_len is not None and declared_len > threshold:
+                            # Content-Length 已知且超阈值：直接走流式回传
+                            await self._stream_large_response(
+                                request.id,
+                                response.status_code,
+                                response_headers,
+                                response.aiter_bytes(),
+                                start_time,
+                            )
+                            return None  # 流式消息已发送，不回 TunnelResponse
+
                     # 普通响应：带内存上限读取（0.7.3，超限 502 并中止；
-                    # 对齐生产服务端 cap，避免大响应先把客户端内存打爆）
+                    # 对齐生产服务端 cap，避免大响应先把客户端内存打爆）。
+                    # Content-Length 未知且允许流式时同样走累积读，
+                    # 越过阈值就地切换（已缓冲字节作为首批数据块）
                     cap = self.config.max_response_bytes
-                    if cap > 0:
+                    if cap > 0 or (stream_eligible and declared_len is None):
                         chunks: list[bytes] = []
                         total = 0
                         too_large = False
-                        async for chunk in response.aiter_bytes():
+                        byte_iter = response.aiter_bytes()
+                        async for chunk in byte_iter:
                             total += len(chunk)
-                            if total > cap:
+                            if stream_eligible and total > threshold:
+                                # 越线块也是 body 的一部分，一并入首批
+                                chunks.append(chunk)
+                                await self._stream_large_response(
+                                    request.id,
+                                    response.status_code,
+                                    response_headers,
+                                    byte_iter,
+                                    start_time,
+                                    buffered=chunks,
+                                )
+                                return None
+                            if cap > 0 and total > cap:
                                 too_large = True
                                 break
                             chunks.append(chunk)
@@ -681,6 +720,97 @@ class TunnelClient:
             )
         )
         logger.debug(f"SSE 流结束: request_id={request_id}, chunks={chunk_count}, duration={duration_ms}ms")
+
+    # ============== chunked_http：非 SSE 大响应流式回传（协议 v2 T3） ==============
+
+    @staticmethod
+    def _declared_content_length(headers: dict[str, str]) -> int | None:
+        """解析 Content-Length；缺失/非法按未知长度处理（返回 None）"""
+        raw = headers.get("content-length")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_textual_content_type(headers: dict[str, str]) -> bool:
+        """块编码判定：text/* 与 application/json 走 UTF-8 明文（plain），
+        其余（二进制）走 base64 块（协议 v2 chunked_http，T3）"""
+        content_type = (headers.get("content-type") or "").lower()
+        return content_type.startswith("text/") or content_type.startswith(
+            "application/json"
+        )
+
+    async def _stream_large_response(
+        self,
+        request_id: str,
+        status: int,
+        headers: dict[str, str],
+        source,
+        start_time: float,
+        buffered: list[bytes] | None = None,
+    ) -> None:
+        """非 SSE 大响应流式回传（chunked_http）
+
+        发送 StreamStart → StreamChunk* → StreamEnd 后返回（调用方不再回
+        TunnelResponse）。块编码按 Content-Type：文本 plain，二进制 base64
+        （+33% 局限见 PROTOCOL_V2 §4）。source 为响应体的异步字节迭代器；
+        buffered 非空时（Content-Length 未知的就地切换）其拼接内容作为
+        首批数据块，随后继续消费 source 剩余部分。
+        """
+        if not self._websocket:
+            logger.error("WebSocket 未连接，无法发送流式响应")
+            return
+
+        is_text = self._is_textual_content_type(headers)
+        await self._websocket.send(
+            dump_payload(stream_start_payload(request_id, status, headers))
+        )
+        logger.debug(f"大响应流式回传开始: request_id={request_id}")
+
+        chunk_count = 0
+        error_msg = None
+
+        async def send_chunk(data: bytes) -> None:
+            nonlocal chunk_count
+            if not data:
+                return
+            if is_text:
+                payload = stream_chunk_payload(
+                    request_id, data.decode("utf-8", errors="replace"), chunk_count
+                )
+            else:
+                payload = stream_chunk_payload(
+                    request_id,
+                    base64.b64encode(data).decode("ascii"),
+                    chunk_count,
+                    encoding="base64",
+                )
+            await self._websocket.send(dump_payload(payload))
+            chunk_count += 1
+
+        try:
+            if buffered:
+                # 就地切换：越过阈值前已缓冲的字节作为首批数据块
+                await send_chunk(b"".join(buffered))
+            async for chunk in source:
+                await send_chunk(chunk)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"流式回传读取错误: {e}")
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        await self._websocket.send(
+            dump_payload(
+                stream_end_payload(request_id, error_msg, duration_ms, chunk_count)
+            )
+        )
+        logger.debug(
+            f"大响应流式回传结束: request_id={request_id}, "
+            f"chunks={chunk_count}, duration={duration_ms}ms"
+        )
 
     # ============== TCP 模式处理方法 ==============
 

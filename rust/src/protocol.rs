@@ -89,6 +89,11 @@ pub enum Message {
         /// 秒
         #[serde(default)]
         timeout: Option<f64>,
+        /// 协议 v2 chunked_http（T3）：服务端放行非 SSE 大响应流式回传。
+        /// rust 客户端不实现该能力、也不在 auth 声明（PROTOCOL.md 登记表
+        /// 已注明）；反序列化按缺省 false 容忍新 wire。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stream_ok: bool,
     },
     /// HTTP 响应（客户端 → 服务端）
     Response {
@@ -117,6 +122,11 @@ pub enum Message {
         data: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         sequence: u32,
+        /// 协议 v2 chunked_http（T3）：data 编码（"plain"=UTF-8 文本 /
+        /// "base64"=二进制字节，+33% 局限见 PROTOCOL_V2 §4）。rust 客户端
+        /// 仅发 SSE 文本块（恒 plain），缺省 None 序列化时省略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoding: Option<String>,
     },
     /// SSE 流式结束
     StreamEnd {
@@ -226,6 +236,8 @@ impl Message {
             id: id.to_string(),
             data,
             sequence,
+            // rust 仅发 SSE 文本块（plain），chunked_http 的 base64 块不适用
+            encoding: None,
         }
     }
 

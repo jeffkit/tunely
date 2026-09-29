@@ -5,7 +5,10 @@
  */
 
 import WebSocket from 'ws';
-import { Agent } from 'undici';
+// undici 的 Agent 与 fetch 必须同源使用：Node 内建 fetch + 外部 undici Agent
+// 会因跨拷贝 handler 协议不匹配丢失全部响应头（连带破坏 SSE 判定与
+// chunked_http 的 Content-Type/Content-Length 判定）
+import { Agent, fetch as undiciFetch } from 'undici';
 import * as net from 'net';
 import {
   AuthMessage,
@@ -49,6 +52,12 @@ export interface TunnelClientConfig {
   keepaliveTimeout?: number;
   /** 普通响应体内存上限（字节，默认 104857600 = 100MB；与生产服务端 cap 对齐）。0 = 不限制，超限返回 502 并中止读取 */
   maxResponseBytes?: number;
+  /**
+   * 非 SSE 响应超过该字节数、且协商了 chunked_http、且服务端放行
+   * （request.stream_ok）时切换流式回传（协议 v2 T3）。默认 1048576 = 1MB；
+   * 0 = 从不流式。env: TUNELY_STREAM_THRESHOLD_BYTES
+   */
+  streamThresholdBytes?: number;
 }
 
 // 共享 undici Agent（0.7.3：连接池跨请求复用，此前每请求新建+关闭，TLS 握手无法复用）。
@@ -132,6 +141,7 @@ export class TunnelClient {
       maxReconnectAttempts: config.maxReconnectAttempts ?? 0,
       requestTimeout: config.requestTimeout ?? 300000,
       maxResponseBytes: config.maxResponseBytes ?? 104857600,
+      streamThresholdBytes: config.streamThresholdBytes ?? 1048576,
       force: config.force ?? false,
       keepaliveInterval: config.keepaliveInterval ?? 25000,
       keepaliveTimeout: config.keepaliveTimeout ?? 45000,
@@ -458,17 +468,13 @@ export class TunnelClient {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-      const fetchOptions: RequestInit = {
-        method: request.method,
-        headers: cleanHeaders,
-        body: body,
-      };
-
       try {
-        const fetchResponse = await fetch(url, {
-          ...fetchOptions,
+        // undici 同源 fetch：dispatcher 选项类型安全，且响应头可见（见文件头注释）
+        const fetchResponse = await undiciFetch(url, {
+          method: request.method,
+          headers: cleanHeaders,
+          body: body,
           signal: controller.signal,
-          // @ts-expect-error Node.js fetch supports undici dispatcher option
           dispatcher: getSharedDispatcher(),
         });
 
@@ -486,6 +492,90 @@ export class TunnelClient {
             startTime
           );
           return; // SSE 响应已通过流式消息发送
+        }
+
+        // 协议 v2 chunked_http（T3）门控：stream_ok 请求 + 已协商 + 阈值 > 0，
+        // 三者齐备才可能对非 SSE 响应切流式；其余情况既有缓冲路径行为不变
+        // （wire 键为 snake_case 的 stream_ok，同 tunnel_id 等字段先例）
+        const threshold = this.config.streamThresholdBytes;
+        const canStream =
+          request.stream_ok === true &&
+          this.negotiated.has('chunked_http') &&
+          threshold > 0 &&
+          fetchResponse.body != null;
+
+        if (canStream) {
+          const contentType = (
+            fetchResponse.headers.get('content-type') || ''
+          ).toLowerCase();
+          const isText =
+            contentType.startsWith('text/') ||
+            contentType.startsWith('application/json');
+          const contentLengthRaw = fetchResponse.headers.get('content-length');
+          const declaredLength =
+            contentLengthRaw !== null && /^\d+$/.test(contentLengthRaw)
+              ? parseInt(contentLengthRaw, 10)
+              : null;
+
+          if (declaredLength !== null && declaredLength > threshold) {
+            // Content-Length 已知且超阈值：直接走流式回传
+            await this.streamLargeResponse(
+              request.id,
+              fetchResponse.status,
+              responseHeaders,
+              fetchResponse.body!.getReader(),
+              ws,
+              startTime,
+              isText
+            );
+            return;
+          }
+
+          if (declaredLength === null) {
+            // Content-Length 未知：边缓冲边观察，越过阈值就地切换
+            const outcome = await this.bufferOrStreamBody(
+              fetchResponse.body!.getReader(),
+              threshold,
+              this.config.maxResponseBytes ?? 104857600
+            );
+            if (outcome.mode === 'stream') {
+              await this.streamLargeResponse(
+                request.id,
+                fetchResponse.status,
+                responseHeaders,
+                outcome.reader,
+                ws,
+                startTime,
+                isText,
+                outcome.parts
+              );
+              return;
+            }
+            if (outcome.mode === 'tooLarge') {
+              const cap = this.config.maxResponseBytes ?? 104857600;
+              const response = createResponse(
+                request.id,
+                502,
+                null,
+                {},
+                `Response too large (> ${cap} bytes, client cap)`,
+                Date.now() - startTime
+              );
+              await this.sendToWs(ws, JSON.stringify(response));
+              return;
+            }
+            // 全程未超阈值：照旧回 TunnelResponse（行为与缓冲路径一致）
+            const response = createResponse(
+              request.id,
+              fetchResponse.status,
+              outcome.text,
+              responseHeaders,
+              undefined,
+              Date.now() - startTime
+            );
+            await this.sendToWs(ws, JSON.stringify(response));
+            return;
+          }
         }
 
         // 普通响应：带内存上限读取（0.7.3，超限 502 并中止；对齐生产服务端 cap）
@@ -621,6 +711,142 @@ export class TunnelClient {
       id: requestId,
       error: errorMsg,
       duration_ms: durationMs,
+      total_chunks: chunkCount,
+      timestamp: new Date().toISOString(),
+    };
+    await this.sendToWs(ws, JSON.stringify(endMsg));
+  }
+
+  // ============== chunked_http：非 SSE 大响应流式回传（协议 v2 T3） ==============
+
+  /**
+   * Content-Length 未知时的缓冲观察读（chunked_http 门控专用）：
+   * 累积读取，越过 threshold 立即返回 midStream 结果（已缓冲 parts 含越线块
+   * + 未读完的 reader，供就地切换流式）；全程未超阈值返回 text（cap 语义与
+   * readBodyCapped 一致：超限中止读取并返回 tooLarge）。
+   */
+  private async bufferOrStreamBody(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    threshold: number,
+    cap: number
+  ): Promise<
+    | { mode: 'text'; text: string }
+    | { mode: 'tooLarge' }
+    | {
+        mode: 'stream';
+        parts: Uint8Array[];
+        reader: ReadableStreamDefaultReader<Uint8Array>;
+      }
+  > {
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        parts.push(value);
+        if (total > threshold) {
+          return { mode: 'stream', parts, reader };
+        }
+        if (cap > 0 && total > cap) {
+          reader.cancel().catch(() => {});
+          return { mode: 'tooLarge' };
+        }
+      }
+    } catch (e) {
+      reader.cancel().catch(() => {});
+      throw e;
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      merged.set(part, offset);
+      offset += part.byteLength;
+    }
+    return {
+      mode: 'text',
+      text: new TextDecoder('utf-8', { fatal: false }).decode(merged),
+    };
+  }
+
+  /**
+   * 非 SSE 大响应流式回传（协议 v2 chunked_http，T3）
+   *
+   * 发送 StreamStart → StreamChunk* → StreamEnd。块编码按 Content-Type：
+   * text/* 与 application/json 走 UTF-8 明文（plain，解码器跨块保持状态），
+   * 其余走 base64（+33% 局限见 PROTOCOL_V2 §4）。buffered 非空时
+   * （Content-Length 未知的就地切换）其拼接内容作为首批数据块，
+   * 随后继续消费 reader 剩余部分。
+   */
+  private async streamLargeResponse(
+    requestId: string,
+    status: number,
+    headers: Record<string, string>,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    ws: WebSocket,
+    startTime: number,
+    isText: boolean,
+    buffered?: Uint8Array[]
+  ): Promise<void> {
+    const startMsg: StreamStartMessage = {
+      type: MessageType.STREAM_START,
+      id: requestId,
+      status,
+      headers,
+      timestamp: new Date().toISOString(),
+    };
+    await this.sendToWs(ws, JSON.stringify(startMsg));
+
+    let chunkCount = 0;
+    let errorMsg: string | undefined;
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+
+    const sendChunk = async (value: Uint8Array): Promise<void> => {
+      if (!value || value.byteLength === 0) return;
+      const data = isText
+        ? decoder.decode(value, { stream: true })
+        : Buffer.from(value).toString('base64');
+      const chunkMsg: StreamChunkMessage = {
+        type: MessageType.STREAM_CHUNK,
+        id: requestId,
+        data,
+        sequence: chunkCount,
+        encoding: isText ? 'plain' : 'base64',
+        timestamp: new Date().toISOString(),
+      };
+      await this.sendToWs(ws, JSON.stringify(chunkMsg));
+      chunkCount++;
+    };
+
+    try {
+      if (buffered && buffered.length > 0) {
+        // 就地切换：越过阈值前已缓冲的字节作为首批数据块
+        const merged = new Uint8Array(
+          buffered.reduce((n, p) => n + p.byteLength, 0)
+        );
+        let offset = 0;
+        for (const part of buffered) {
+          merged.set(part, offset);
+          offset += part.byteLength;
+        }
+        await sendChunk(merged);
+      }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) await sendChunk(value);
+      }
+    } catch (error: any) {
+      errorMsg = error.message;
+      console.error('大响应流式回传读取错误:', error);
+    }
+
+    const endMsg: StreamEndMessage = {
+      type: MessageType.STREAM_END,
+      id: requestId,
+      error: errorMsg,
+      duration_ms: Date.now() - startTime,
       total_chunks: chunkCount,
       timestamp: new Date().toISOString(),
     };

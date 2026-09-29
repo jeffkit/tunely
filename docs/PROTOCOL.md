@@ -114,6 +114,7 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `headers` | object | | HTTP 请求头 |
 | `body` | string | | 请求体（JSON 字符串） |
 | `timeout` | number | | 超时时间（秒） |
+| `stream_ok` | boolean | | 服务端放行非 SSE 大响应流式回传（协议 v2 chunked_http，见「chunked_http 语义」）；缺省 = `false` |
 | `timestamp` | string | | 请求时间（ISO 8601） |
 
 #### response（客户端 → 服务端）
@@ -189,6 +190,7 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `id` | string | ✓ | 对应的请求 ID |
 | `data` | string | ✓ | 数据块内容（一个 SSE 事件帧） |
 | `sequence` | number | | 数据块序号，从 0 递增 |
+| `encoding` | string | | `data` 的编码：`plain`（UTF-8 文本，缺省）或 `base64`（二进制内容字节，协议 v2 chunked_http，见「chunked_http 语义」） |
 | `timestamp` | string | | 发送时间 |
 
 #### stream_end（客户端 → 服务端）
@@ -321,10 +323,10 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | 能力名 | 说明 | 状态 |
 |--------|------|------|
 | `binary_frames` | 数据面（`tcp_data`）改走 WS binary 帧，去掉 base64+JSON 开销 | 已注册（v2 T2，见下节） |
-| `chunked_http` | 非 SSE 大响应按 `stream_start/chunk/end` 分块流式 | 规划中（未注册） |
+| `chunked_http` | 非 SSE 大响应按 `stream_start/chunk/end` 分块流式 | 已注册（v2 T3：服务端 + py/ts 客户端；rust 客户端不实现也不声明，见「chunked_http 语义」） |
 
-> 状态为「规划中」的能力尚未进服务端注册表（`SERVER_CAPABILITIES`），声明了也不会被协商启用；
-> 实现落地后由服务端注册并同步本表。当前注册表：`["binary_frames"]`。
+> 实现落地后才由服务端注册进 `SERVER_CAPABILITIES` 并同步本表；声明了未注册的能力不会被协商启用。
+> 当前注册表：`["binary_frames", "chunked_http"]`。
 
 ### binary_frames 帧格式（已落地）
 
@@ -341,6 +343,28 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 - 双向都用：服务端 TCP 读循环（外部→客户端）与客户端 TCP 读循环（目标→服务端）在能力启用时发 binary 帧；
 - **未协商连接收到 binary 帧 → 丢弃 + warning**（F10 语义，不断连）；畸形帧（版本/类型/长度不对）同样丢弃；
 - 未协商路径的 wire 行为与 1.x 完全一致（JSON + base64）。
+
+### chunked_http 语义（已落地）
+
+非 SSE 大响应（超过客户端流式阈值）改按 `stream_start` → `stream_chunk`* → `stream_end`
+分块回传，避免两端全量缓冲。**非 SSE 流式仅发生在 `stream_ok` 请求上**：
+
+- 服务端只有 `forward_stream`（流式 API）发出的 `request` 带 `stream_ok: true`；
+  `/forward`、`/t/` 缓冲分支恒为 `false`——这些路径的缓冲 future 只认 `response`，
+  客户端对未放行请求切流式 = 对端超时，因此客户端必须三条件齐备才切流式：
+  **`request.stream_ok == true` ∧ 本连接协商了 `chunked_http` ∧ 响应体超过阈值**
+  （阈值可配：py `WS_TUNNEL_CLIENT_STREAM_THRESHOLD_BYTES` / ts `TUNELY_STREAM_THRESHOLD_BYTES`，
+  默认 1MB，`0` = 从不流式）；
+- SSE 响应（`Content-Type: text/event-stream`）与现状一致，总是流式，不依赖 `stream_ok`；
+- 块编码（`stream_chunk.encoding`）：`Content-Type` 为 `text/*` 或 `application/json`
+  → UTF-8 文本 `plain`；其余（二进制）→ `base64`。**base64 +33% 开销是已知边界**
+  （v2 不给 stream 走 binary 帧，见 PROTOCOL_V2 §4）；
+- `Content-Length` 未知时读到一半越过阈值 → 已缓冲部分作为首批数据块就地切换；
+- 客户端未协商该能力、或服务端是旧版本时，`stream_ok` 被忽略，行为与 1.x 完全一致
+  （旧客户端照回 `response`，服务端会把它合成为单块流——非 SSE 目标经 `forward_stream`
+  也能正常拿到全量响应，不再干等到超时）；
+- **rust 客户端不实现本能力、也不声明**：即便收到 `stream_ok: true` 也照旧缓冲回
+  `response`（字段按缺省 `false` 容忍；服务端补桥兜底）。
 
 ## 连接流程（HTTP 模式）
 
@@ -406,6 +430,8 @@ Client                                  Server
 ## 版本历史
 
 - **2.0**：能力协商机制（`auth`/`auth_ok` 增加可选 `capabilities`，缺字段 = 空集合，只回交集）；
-  首个能力 `binary_frames` 落地（`tcp_data` 双向改走 WS binary 帧，`tcp_close` 保持 JSON，未协商行为不变）。
+  首个能力 `binary_frames` 落地（`tcp_data` 双向改走 WS binary 帧，`tcp_close` 保持 JSON，未协商行为不变）；
+  第二个能力 `chunked_http` 落地（非 SSE 大响应经 `stream_start/chunk/end` 流式回传，
+  仅发生在服务端标记 `stream_ok` 的请求上；`stream_chunk` 增加可选 `encoding`）。
 - **1.1**：新增 SSE 流式响应消息（`stream_start` / `stream_chunk` / `stream_end`）与 TCP 透传消息（`tcp_connect` / `tcp_data` / `tcp_close`）；`auth` 增加 `force` 抢占字段。
 - **1.0**：认证、HTTP 请求-响应、心跳。

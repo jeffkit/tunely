@@ -43,7 +43,10 @@
         "type": "auth",
         "fields": {
           "token": "tok_dev_caps",
-          "capabilities": ["binary_frames", "chunked_http"]
+          "capabilities": [
+            "binary_frames",
+            "chunked_http"
+          ]
         }
       }
     },
@@ -55,7 +58,9 @@
         "fields": {
           "domain": "abc123.tunnel.example.com",
           "tunnel_id": "tid-20260925-001",
-          "capabilities": ["binary_frames"]
+          "capabilities": [
+            "binary_frames"
+          ]
         }
       }
     },
@@ -97,6 +102,28 @@
           "id": "req-002",
           "method": "GET",
           "path": "/healthz"
+        }
+      }
+    },
+    {
+      "name": "request_stream_ok",
+      "input_json": "{\"type\":\"request\",\"id\":\"req-fs\",\"method\":\"POST\",\"path\":\"/api/chat\",\"headers\":{},\"body\":null,\"timeout\":30,\"stream_ok\":true,\"timestamp\":\"2026-09-25T02:00:00.123456+00:00\"}",
+      "expect": {
+        "type": "request",
+        "fields": {
+          "id": "req-fs",
+          "stream_ok": true
+        }
+      }
+    },
+    {
+      "name": "stream_chunk_encoding_base64",
+      "input_json": "{\"type\":\"stream_chunk\",\"id\":\"req-bin\",\"data\":\"AAEC\",\"sequence\":0,\"encoding\":\"base64\",\"timestamp\":\"2026-09-25T02:00:00.123456+00:00\"}",
+      "expect": {
+        "type": "stream_chunk",
+        "fields": {
+          "id": "req-bin",
+          "encoding": "base64"
         }
       }
     },

@@ -527,10 +527,16 @@ function sentOf(mockWs: MockWebSocket, type: string, connId?: string): any[] {
   );
 }
 
-/** 创建 targetUrl 指向指定地址的已连接客户端（TCP 测试专用） */
+/** 按 request id 过滤（response/stream_* 消息用 id 关联，而非 conn_id） */
+function sentOfId(mockWs: MockWebSocket, type: string, id: string): any[] {
+  return sentMessages(mockWs).filter((m) => m.type === type && m.id === id);
+}
+
+/** 创建 targetUrl 指向指定地址的已连接客户端（TCP/HTTP 测试专用） */
 async function createTcpTestClient(
   targetUrl: string,
-  authOkExtras: Record<string, unknown> = {}
+  authOkExtras: Record<string, unknown> = {},
+  configExtras: Record<string, unknown> = {}
 ): Promise<{
   client: TunnelClient;
   mockWs: MockWebSocket;
@@ -553,6 +559,7 @@ async function createTcpTestClient(
     token: 'test-token',
     targetUrl,
     reconnectInterval: 100,
+    ...configExtras,
   });
 
   const runPromise = client.run();
@@ -1044,7 +1051,7 @@ describe('TunnelClient - binary_frames（协议 v2）', () => {
       );
       expect(authCall).toBeDefined();
       const auth = JSON.parse(authCall![0]);
-      expect(auth.capabilities).toEqual(['binary_frames']);
+      expect(auth.capabilities).toContain('binary_frames');
     } finally {
       client.stop();
       await runPromise.catch(() => {});
@@ -1210,5 +1217,209 @@ describe('TunnelClient - binary_frames（协议 v2）', () => {
       client.stop();
       await runPromise.catch(() => {});
     }
+  });
+});
+// ================================================================
+// 协议 v2 chunked_http（T3）：非 SSE 大响应流式回传
+// - 门控三条件：request.stream_ok + 协商 chunked_http + 阈值 > 0；
+// - Content-Length 已知超阈值直接流式；未知长度越过阈值就地切换；
+// - 文本 plain / 二进制 base64；阈值内照旧回 TunnelResponse。
+// 本地目标侧用 Node http 起真实回环服务（fetch 直连）。
+// ================================================================
+
+import * as http from 'http';
+
+/** 启动临时 HTTP 服务（127.0.0.1 随机端口） */
+async function startHttpServer(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** 下发一条 request 消息给客户端 */
+function emitRequest(
+  mockWs: MockWebSocket,
+  request: Record<string, unknown>
+): void {
+  mockWs.emit(
+    'message',
+    Buffer.from(JSON.stringify({ type: 'request', method: 'GET', path: '/', headers: {}, ...request }))
+  );
+}
+
+describe('TunnelClient - chunked_http（协议 v2 T3）', () => {
+  let locals: Array<() => Promise<void> | void>;
+
+  beforeEach(() => {
+    locals = [];
+  });
+
+  afterEach(async () => {
+    for (const dispose of [...locals].reverse()) {
+      await dispose();
+    }
+    vi.clearAllMocks();
+  });
+
+  async function setup(
+    targetUrl: string,
+    authOkExtras: Record<string, unknown>,
+    configExtras: Record<string, unknown>
+  ) {
+    const { client, mockWs, runPromise } = await createTcpTestClient(
+      targetUrl,
+      authOkExtras,
+      configExtras
+    );
+    locals.push(async () => {
+      client.stop();
+      await runPromise.catch(() => {});
+    });
+    return { client, mockWs };
+  }
+
+  it('门控：已协商 + stream_ok + 已知长度超阈值 → 发 StreamStart/Chunk/End 序列（plain）', async () => {
+    const big = 'y'.repeat(100);
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(big),
+      });
+      res.end(big);
+    });
+    locals.push(close);
+
+    const { mockWs } = await setup(url, { capabilities: ['chunked_http'] }, { streamThresholdBytes: 16 });
+    emitRequest(mockWs, { id: 'req-ch-1', stream_ok: true });
+
+    await waitUntil(() => sentOf(mockWs, 'stream_end').length >= 1);
+    const starts = sentOf(mockWs, 'stream_start');
+    const chunks = sentOf(mockWs, 'stream_chunk');
+    const ends = sentOf(mockWs, 'stream_end');
+    expect(starts).toHaveLength(1);
+    expect(chunks).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(starts[0].status).toBe(200);
+    expect(starts[0].id).toBe('req-ch-1');
+    expect(chunks[0].data).toBe(big);
+    expect(chunks[0].encoding).toBe('plain');
+    expect(chunks[0].sequence).toBe(0);
+    expect(ends[0].total_chunks).toBe(1);
+    // 流式路径不再回 response
+    expect(sentOfId(mockWs, 'response', 'req-ch-1')).toHaveLength(0);
+  });
+
+  it('门控：未协商 chunked_http → 照旧回 response（不发流式）', async () => {
+    const big = 'y'.repeat(100);
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'Content-Length': Buffer.byteLength(big) });
+      res.end(big);
+    });
+    locals.push(close);
+
+    // auth_ok 不带 capabilities（0.7.x 服务端形状）
+    const { mockWs } = await setup(url, {}, { streamThresholdBytes: 16 });
+    emitRequest(mockWs, { id: 'req-ch-2', stream_ok: true });
+
+    await waitUntil(() => sentOfId(mockWs, 'response', 'req-ch-2').length >= 1);
+    expect(sentOfId(mockWs, 'response', 'req-ch-2')[0].body).toBe(big);
+    expect(sentOf(mockWs, 'stream_start')).toHaveLength(0);
+  });
+
+  it('门控：stream_ok 缺省 → 照旧回 response（缓冲 API 永不收流）', async () => {
+    const big = 'y'.repeat(100);
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'Content-Length': Buffer.byteLength(big) });
+      res.end(big);
+    });
+    locals.push(close);
+
+    const { mockWs } = await setup(url, { capabilities: ['chunked_http'] }, { streamThresholdBytes: 16 });
+    emitRequest(mockWs, { id: 'req-ch-3' }); // 无 stream_ok
+
+    await waitUntil(() => sentOfId(mockWs, 'response', 'req-ch-3').length >= 1);
+    expect(sentOfId(mockWs, 'response', 'req-ch-3')[0].body).toBe(big);
+    expect(sentOf(mockWs, 'stream_start')).toHaveLength(0);
+  });
+
+  it('门控：阈值 0 = 从不流式', async () => {
+    const big = 'y'.repeat(100);
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'Content-Length': Buffer.byteLength(big) });
+      res.end(big);
+    });
+    locals.push(close);
+
+    const { mockWs } = await setup(url, { capabilities: ['chunked_http'] }, { streamThresholdBytes: 0 });
+    emitRequest(mockWs, { id: 'req-ch-4', stream_ok: true });
+
+    await waitUntil(() => sentOfId(mockWs, 'response', 'req-ch-4').length >= 1);
+    expect(sentOf(mockWs, 'stream_start')).toHaveLength(0);
+  });
+
+  it('门控：已知长度未超阈值 → 照旧回 response', async () => {
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': 5 });
+      res.end('small');
+    });
+    locals.push(close);
+
+    const { mockWs } = await setup(url, { capabilities: ['chunked_http'] }, { streamThresholdBytes: 16 });
+    emitRequest(mockWs, { id: 'req-ch-5', stream_ok: true });
+
+    await waitUntil(() => sentOfId(mockWs, 'response', 'req-ch-5').length >= 1);
+    expect(sentOfId(mockWs, 'response', 'req-ch-5')[0].body).toBe('small');
+    expect(sentOf(mockWs, 'stream_start')).toHaveLength(0);
+  });
+
+  it('二进制 content-type → encoding=base64，可解码回原始字节', async () => {
+    const payload = Buffer.from([0, 1, 2, 250, 251, 252, 253, 254, 255, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': payload.length,
+      });
+      res.end(payload);
+    });
+    locals.push(close);
+
+    const { mockWs } = await setup(url, { capabilities: ['chunked_http'] }, { streamThresholdBytes: 16 });
+    emitRequest(mockWs, { id: 'req-ch-6', stream_ok: true });
+
+    await waitUntil(() => sentOf(mockWs, 'stream_end').length >= 1);
+    const chunk = sentOf(mockWs, 'stream_chunk')[0];
+    expect(chunk.encoding).toBe('base64');
+    expect(Buffer.from(chunk.data, 'base64').equals(payload)).toBe(true);
+    expect(sentOf(mockWs, 'stream_chunk')[0].sequence).toBe(0);
+  });
+
+  it('Content-Length 未知：越过阈值就地切换，已缓冲字节作首批数据块', async () => {
+    const part1 = 'a'.repeat(10);
+    const part2 = 'b'.repeat(10); // 累计 20 > 阈值 16
+    const { url, close } = await startHttpServer((req, res) => {
+      // 不带 Content-Length → Node 走 chunked transfer-encoding（长度未知）
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.write(part1);
+      res.write(part2);
+      res.end();
+    });
+    locals.push(close);
+
+    const { mockWs } = await setup(url, { capabilities: ['chunked_http'] }, { streamThresholdBytes: 16 });
+    emitRequest(mockWs, { id: 'req-ch-7', stream_ok: true });
+
+    await waitUntil(() => sentOf(mockWs, 'stream_end').length >= 1);
+    const chunks = sentOf(mockWs, 'stream_chunk');
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].data).toBe(part1 + part2);
+    expect(chunks[0].encoding).toBe('plain');
+    expect(sentOf(mockWs, 'stream_end')[0].total_chunks).toBe(1);
+    expect(sentOfId(mockWs, 'response', 'req-ch-7')).toHaveLength(0);
   });
 });
