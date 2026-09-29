@@ -855,15 +855,18 @@ class TunnelManager:
         if states:
             logger.info(f"已关闭 {len(states)} 个活跃 TCP 连接")
 
-    async def remove_tcp_connection(self, conn_id: str) -> None:
+    async def remove_tcp_connection(self, conn_id: str) -> bool:
         """移除 TCP 连接
 
         写队列里的存量数据交给 reaper 异步收尾（最多再等 5s 发完），
         调用方（隧道 WS 消息循环 / 外部连接清理）不被慢接收方阻塞。
+
+        返回 True 表示本次调用真正移除；False = 连接已不存在
+        （对端先一步关闭，并发关闭竞态下的正常时序）。
         """
         tcp_conn = self._tcp_connections.pop(conn_id, None)
         if not tcp_conn:
-            return
+            return False
         logger.info(f"移除 TCP 连接: {conn_id}")
         tcp_conn.closed = True
         # 取消读取任务
@@ -883,6 +886,7 @@ class TunnelManager:
                 tcp_conn.writer.close()
             except Exception:
                 pass
+        return True
 
     async def _reap_tcp_writer(self, tcp_conn: TcpConnectionState) -> None:
         """等写循环发完存量后关闭外部连接（有界等待，超时强杀）"""
@@ -935,7 +939,8 @@ class TunnelManager:
         """
         tcp_conn = self._tcp_connections.get(conn_id)
         if not tcp_conn or tcp_conn.closed:
-            logger.warning(f"TCP 连接不存在或已关闭: {conn_id}")
+            # 在途数据竞到关闭之后（并发关闭竞态）属正常时序，debug 防刷屏
+            logger.debug(f"TCP 连接不存在或已关闭: {conn_id}")
             return False
 
         try:
@@ -3167,14 +3172,18 @@ class TunnelServer:
         except Exception as e:
             logger.error(f"TCP 连接处理错误: conn_id={conn_id}, {e}")
         finally:
-            # 通知客户端关闭连接
-            try:
-                await tunnel_conn.websocket.send_text(
-                    dump_payload(tcp_close_payload(conn_id))
-                )
-            except Exception:
-                pass
-            await self.manager.remove_tcp_connection(conn_id)
+            # 通知客户端关闭连接。仅当移除动作发生在本协程时才回发：
+            # 客户端（目标侧）先发起的关闭会经 WS 消息循环移除连接并取消
+            # 读任务，本协程的 finally 随之触发——此时客户端早已清理本地
+            # 映射，回发 tcp_close 只会被其当「未知连接」丢弃（churn 期
+            # keepalive 空闲连接批量回收时即成回声风暴）。
+            if await self.manager.remove_tcp_connection(conn_id):
+                try:
+                    await tunnel_conn.websocket.send_text(
+                        dump_payload(tcp_close_payload(conn_id))
+                    )
+                except Exception:
+                    pass
 
     async def _tcp_read_loop(
         self,
@@ -3492,7 +3501,8 @@ class TunnelServer:
             if tcp_conn and tcp_conn.domain:
                 self._count_tunnel_bytes(tcp_conn.domain, "bytes_in", len(data))
         else:
-            logger.warning(f"无法路由 TCP 数据: conn_id={conn_id}")
+            # 并发关闭竞态下在途数据竞到移除之后，属正常时序，debug 防刷屏
+            logger.debug(f"无法路由 TCP 数据: conn_id={conn_id}")
 
     async def _handle_tcp_close_from_client(self, message: TcpCloseMessage) -> None:
         """
@@ -3502,12 +3512,15 @@ class TunnelServer:
         1. HTTP 触发的 TCP 转发 -> 完成 PendingTcpRequest（解析 Future）
         2. 服务端 TCP 监听 -> 关闭真实 TCP 连接
         """
-        logger.info(f"客户端请求关闭 TCP 连接: {message.conn_id}")
-
         # 优先检查是否有待响应的 HTTP 触发的 TCP 请求
         if await self.manager.complete_tcp_request(message.conn_id, error=message.error):
             logger.info(f"TCP 请求已完成: conn_id={message.conn_id}")
             return
 
-        # 其次关闭真实 TCP 连接
-        await self.manager.remove_tcp_connection(message.conn_id)
+        # 其次关闭真实 TCP 连接。返回 False = 外部关闭路径已先移除
+        # （目标侧先断时客户端关闭与外部 EOF 的并发竞态），降为 debug
+        # 防止 churn 期刷屏
+        if await self.manager.remove_tcp_connection(message.conn_id):
+            logger.info(f"客户端请求关闭 TCP 连接: {message.conn_id}")
+        else:
+            logger.debug(f"忽略重复/迟到的 tcp_close: {message.conn_id}")

@@ -32,6 +32,13 @@ fn warn(msg: impl AsRef<str>) {
 fn error(msg: impl AsRef<str>) {
     eprintln!("{}", msg.as_ref());
 }
+/// 竞态噪音专用：并发关闭窗口里服务端迟到帧命中的连接属正常时序，
+/// 默认静默，设 TUNELY_DEBUG=1 才输出（防 churn 期刷屏）
+fn debug(msg: impl AsRef<str>) {
+    if std::env::var_os("TUNELY_DEBUG").is_some() {
+        eprintln!("{}", msg.as_ref());
+    }
+}
 
 /// 归一化服务端下发的请求路径：确保以 "/" 开头。
 ///
@@ -855,7 +862,8 @@ async fn handle_tcp_data(session: &Session, conn_id: &str, data: &str) {
 async fn handle_tcp_data_bytes(session: &Session, conn_id: &str, bytes: &[u8]) {
     let conn = session.tcp.lock().await.get(conn_id).cloned();
     let Some(conn) = conn else {
-        warn(format!("收到未知 TCP 连接的数据: {conn_id}"));
+        // 在途数据竞到本地关闭之后（并发关闭竞态的正常时序）
+        debug(format!("收到未知 TCP 连接的数据: {conn_id}"));
         return;
     };
     use tokio::io::AsyncWriteExt;
@@ -866,7 +874,8 @@ async fn handle_tcp_data_bytes(session: &Session, conn_id: &str, bytes: &[u8]) {
 async fn handle_server_tcp_close(session: &Session, conn_id: &str) {
     let conn = session.tcp.lock().await.remove(conn_id);
     let Some(conn) = conn else {
-        warn(format!("尝试关闭未知 TCP 连接: {conn_id}"));
+        // 服务端迟到帧（本端已先关闭/已收到过 close），并发关闭竞态的正常时序
+        debug(format!("尝试关闭未知 TCP 连接: {conn_id}"));
         return;
     };
     // 服务端主动关闭：不回执 tcp_close
