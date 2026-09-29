@@ -64,6 +64,11 @@ class AuthMessage(BaseModel):
         "历史默认值 0.1.0 是假值，0.7.2 起改为 unknown）",
     )
     force: bool = Field(default=False, description="是否强制抢占已有连接")
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description="客户端支持的能力（协议 v2 协商）；缺字段/空数组 = 不声明任何能力。"
+        "铁律：客户端只许声明自己已实现的能力",
+    )
 
 
 class AuthOkMessage(BaseModel):
@@ -75,6 +80,11 @@ class AuthOkMessage(BaseModel):
     server_version: str = Field(
         default="0.1.0",
         description="服务端版本（服务端发送时必填真实版本；默认值仅为兼容旧客户端解析）",
+    )
+    capabilities: list[str] = Field(
+        default_factory=list,
+        description="协商启用的能力 = 服务端注册表 ∩ 客户端声明 ∩ 未被 kill 开关禁用；"
+        "缺字段按空集合解析（协议 v2，无能力时服务端可省略）",
     )
 
 

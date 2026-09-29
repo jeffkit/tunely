@@ -79,6 +79,60 @@ describe('Protocol Conformance - 认证消息', () => {
   });
 });
 
+describe('Protocol Conformance - 能力协商（协议 v2）', () => {
+  it('auth 带 capabilities：parse 得到数组并 roundtrip', () => {
+    const wire =
+      '{"type":"auth","token":"tok_dev_abc123","client_version":"0.5.0","force":false,"capabilities":["binary_frames","chunked_http"]}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
+
+    expect(msg.type).toBe(MessageType.AUTH);
+    expect(msg.capabilities).toEqual(['binary_frames', 'chunked_http']);
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('auth 缺 capabilities 字段：parse 成功且字段为 undefined（缺字段 = 空集合）', () => {
+    const wire =
+      '{"type":"auth","token":"tok_dev_abc123","client_version":"0.5.0"}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
+
+    expect(msg.capabilities).toBeUndefined();
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('auth_ok 带 capabilities：parse 得到数组并 roundtrip', () => {
+    const wire =
+      '{"type":"auth_ok","domain":"abc123.tunnel.example.com","tunnel_id":"tid-20260925-001","server_version":"0.5.0","capabilities":["binary_frames"]}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH_OK }>;
+
+    expect(msg.type).toBe(MessageType.AUTH_OK);
+    expect(msg.capabilities).toEqual(['binary_frames']);
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('auth_ok 缺 capabilities 字段（0.7.3 服务端形状）：parse 成功', () => {
+    const wire =
+      '{"type":"auth_ok","domain":"abc123.tunnel.example.com","tunnel_id":"tid-20260925-001","server_version":"0.7.3"}';
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH_OK }>;
+
+    expect(msg.capabilities).toBeUndefined();
+    expect(msg).toEqual(roundtrip(msg));
+  });
+
+  it('createAuthMessage 不声明任何能力：线上键仍为 type/token/client_version/force 四键', () => {
+    // T1 铁律：客户端一律不发 capabilities（undefined 被 JSON.stringify 丢弃 = 缺省空集合）
+    const wire = JSON.stringify(createAuthMessage('tok_local', false));
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
+
+    expect(Object.keys(msg).sort()).toEqual([
+      'client_version',
+      'force',
+      'token',
+      'type',
+    ]);
+    expect(msg.capabilities).toBeUndefined();
+  });
+});
+
 describe('Protocol Conformance - 请求-响应消息', () => {
   it('request：method / path / headers / body / timeout / timestamp 并 roundtrip', () => {
     const wire =

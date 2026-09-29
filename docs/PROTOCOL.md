@@ -47,6 +47,7 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `token` | string | ✓ | 隧道令牌 |
 | `client_version` | string | | 客户端版本 |
 | `force` | boolean | | 是否强制抢占已有连接（默认 `false`；`true` 时服务端会踢掉当前连接） |
+| `capabilities` | string[] | | 客户端支持的能力（协议 v2 协商，见「能力协商」；缺省 = 空集合） |
 
 #### auth_ok（服务端 → 客户端）
 
@@ -55,7 +56,8 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
   "type": "auth_ok",
   "domain": "my-agent",
   "tunnel_id": "123",
-  "server_version": "0.1.0"
+  "server_version": "0.1.0",
+  "capabilities": ["binary_frames"]
 }
 ```
 
@@ -65,6 +67,7 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `domain` | string | ✓ | 分配的域名 |
 | `tunnel_id` | string | ✓ | 隧道 ID |
 | `server_version` | string | | 服务端版本 |
+| `capabilities` | string[] | | 协商启用的能力（协议 v2，见「能力协商」；缺省 = 空集合） |
 
 #### auth_error（服务端 → 客户端）
 
@@ -297,6 +300,32 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 }
 ```
 
+## 能力协商（协议 v2）
+
+`auth` 与 `auth_ok` 携带可选的 `capabilities: string[]`，用于在认证时协商本连接启用哪些新行为。
+机制先于内容：协商通道自 2.0 起生效，具体能力随实现逐步注册。
+
+**规则（铁律）：**
+
+1. **字段缺失 = 空集合**。任何一端不带 `capabilities` 都按「未声明任何能力」理解，行为与旧版本完全一致。
+2. **只回交集**。`auth_ok.capabilities` = 服务端能力注册表 ∩ 客户端声明 − 服务端 kill 开关禁用集
+   （`WS_TUNNEL_DISABLE_CAPABILITIES`，逗号分隔）。客户端声明了但服务端未注册（未实现）的能力不会出现在结果里。
+3. **客户端只许声明自己已实现的能力**。声明了没实现 = 服务端会用而客户端解析不了 = 事故。
+   新客户端版本把已实现的能力名加入声明；未实现前保持空集合/缺省。
+4. **新行为必须门控**。只有 `auth_ok.capabilities` 里出现的能力，双方才可启用对应新行为；
+   未协商路径保持旧版本行为不变。
+5. **命名规则**：能力名为小写下划线（snake_case），如 `binary_frames`；新增能力必须先在下表登记。
+
+**能力登记表：**
+
+| 能力名 | 说明 | 状态 |
+|--------|------|------|
+| `binary_frames` | 数据面（`tcp_data`）改走 WS binary 帧，去掉 base64+JSON 开销 | 规划中（未注册） |
+| `chunked_http` | 非 SSE 大响应按 `stream_start/chunk/end` 分块流式 | 规划中（未注册） |
+
+> 状态为「规划中」的能力尚未进服务端注册表（`SERVER_CAPABILITIES`），声明了也不会被协商启用；
+> 实现落地后由服务端注册并同步本表。当前注册表为空列表。
+
 ## 连接流程（HTTP 模式）
 
 ```
@@ -360,5 +389,6 @@ Client                                  Server
 
 ## 版本历史
 
+- **2.0**：能力协商机制先行（`auth`/`auth_ok` 增加可选 `capabilities`，缺字段 = 空集合，只回交集）；二进制帧等新帧格式随后续任务逐能力落地。
 - **1.1**：新增 SSE 流式响应消息（`stream_start` / `stream_chunk` / `stream_end`）与 TCP 透传消息（`tcp_connect` / `tcp_data` / `tcp_close`）；`auth` 增加 `force` 抢占字段。
 - **1.0**：认证、HTTP 请求-响应、心跳。

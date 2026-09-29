@@ -66,3 +66,90 @@ fn wire_conformance_all_scenarios() {
         }
     }
 }
+
+// ============== 协议 v2 能力协商（capabilities）conformance ==============
+
+/// 缺 capabilities 字段反序列化：Auth 默认空 vec（旧 wire 安全）
+#[test]
+fn auth_without_capabilities_defaults_empty() {
+    let msg = Message::parse(r#"{"type":"auth","token":"tok","client_version":"0.1.0","force":false}"#)
+        .expect("缺 capabilities 的 auth 必须可解析");
+    match msg {
+        Message::Auth { capabilities, .. } => assert!(capabilities.is_empty()),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// 缺 capabilities 字段反序列化：AuthOk 默认空 vec（0.7.3 服务端 wire 安全）
+#[test]
+fn auth_ok_without_capabilities_defaults_empty() {
+    let msg = Message::parse(
+        r#"{"type":"auth_ok","domain":"d","tunnel_id":"t1","server_version":"0.7.3"}"#,
+    )
+    .expect("缺 capabilities 的 auth_ok 必须可解析");
+    match msg {
+        Message::AuthOk { capabilities, .. } => assert!(capabilities.is_empty()),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// 带 capabilities 字段正常解析（服务端/对端发来的新形状）
+#[test]
+fn auth_with_capabilities_parses() {
+    let msg = Message::parse(
+        r#"{"type":"auth","token":"tok","capabilities":["binary_frames","chunked_http"]}"#,
+    )
+    .expect("带 capabilities 的 auth 必须可解析");
+    match msg {
+        Message::Auth { capabilities, .. } => {
+            assert_eq!(capabilities, vec!["binary_frames", "chunked_http"])
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let ok = Message::parse(
+        r#"{"type":"auth_ok","domain":"d","tunnel_id":"t1","capabilities":["binary_frames"]}"#,
+    )
+    .expect("带 capabilities 的 auth_ok 必须可解析");
+    match ok {
+        Message::AuthOk { capabilities, .. } => {
+            assert_eq!(capabilities, vec!["binary_frames"])
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// 发送侧 wire 最小变化：auth() 构造的空 capabilities 不出现在线上 JSON
+#[test]
+fn auth_serialization_omits_empty_capabilities() {
+    let wire = Message::auth("tok", false).to_json();
+    assert!(
+        !wire.contains("capabilities"),
+        "空 capabilities 不应上线: {wire}"
+    );
+
+    let ok = Message::AuthOk {
+        domain: "d".into(),
+        tunnel_id: "t1".into(),
+        server_version: Some("0.7.3".into()),
+        capabilities: vec![],
+    };
+    assert!(
+        !ok.to_json().contains("capabilities"),
+        "空 capabilities 不应上线: {}",
+        ok.to_json()
+    );
+
+    // 非空 capabilities 正常序列化（供 T2/T3 客户端声明用）
+    let ok2 = Message::AuthOk {
+        domain: "d".into(),
+        tunnel_id: "t1".into(),
+        server_version: None,
+        capabilities: vec!["binary_frames".into()],
+    };
+    let wire2 = ok2.to_json();
+    assert!(
+        wire2.contains(r#""capabilities":["binary_frames"]"#),
+        "{wire2}"
+    );
+}

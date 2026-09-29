@@ -100,6 +100,12 @@ _TCP_WRITE_QUEUE_MAXSIZE = 64
 # 不再每 chunk 双 task 等待「新消息 vs 失败事件」）
 _STREAM_FAILED = object()
 
+# 服务端能力注册表（协议 v2 能力协商，见 docs/PROTOCOL_V2.md §0）。
+# 认证时按「服务端注册表 ∩ 客户端声明 − disable_capabilities」回交集。
+# 初始为空：T2 实现 binary_frames 后加 "binary_frames"，T3 实现 chunked_http 后加
+# "chunked_http"——注册进这里之前，客户端声明了也不会被协商启用。
+SERVER_CAPABILITIES: list[str] = []
+
 
 def _client_ip(http_request: Request | None) -> str | None:
     """尽力而为地提取客户端 IP（拿不到返回 None，不抛异常）"""
@@ -161,6 +167,9 @@ class ActiveConnection:
     # 用于升级前核对现网客户端版本分布（ROLLING_UPGRADE.md 0.7.2）。
     # 注意：历史 TS/py 客户端曾硬编码/默认 "0.1.0"，该值不可信到 0.2.7/0.7.2 前
     client_version: str = "unknown"
+    # 协商启用的能力（AuthOk.capabilities 的连接侧快照，协议 v2）。
+    # 后续 T2/T3 按「该连接是否协商了 X」门控新行为——本任务只存不用。
+    capabilities: frozenset[str] = field(default_factory=frozenset)
     connected_at: datetime = field(default_factory=datetime.now)
     last_heartbeat: datetime = field(default_factory=datetime.now)
 
@@ -377,6 +386,7 @@ class TunnelManager:
         force: bool = False,
         mode: str = "http",
         client_version: str = "unknown",
+        capabilities: frozenset[str] = frozenset(),
     ) -> tuple[bool, str | None]:
         """
         注册隧道连接
@@ -389,6 +399,7 @@ class TunnelManager:
             force: 是否强制抢占已有连接
             mode: 隧道转发模式（http/tcp，注册时从 DB 读一次缓存，forward 路由用）
             client_version: 客户端自报版本（AuthMessage.client_version）
+            capabilities: 协商启用的能力（协议 v2，AuthOk 回的交集）
 
         Returns:
             (success, error_message) - 成功返回 (True, None)，失败返回 (False, error_message)
@@ -428,6 +439,7 @@ class TunnelManager:
                 token=token,
                 mode=mode if mode in ("http", "tcp") else "http",
                 client_version=client_version or "unknown",
+                capabilities=frozenset(capabilities or ()),
             )
             self._connections[token] = conn
             self._domain_token_map[domain] = token
@@ -1315,6 +1327,24 @@ class TunnelServer:
         )
         return True
 
+    def _negotiate_capabilities(self, client_caps: list) -> list[str]:
+        """协议 v2 能力协商：服务端注册表 ∩ 客户端声明 − kill 开关禁用集。
+
+        铁律（docs/PROTOCOL.md「能力协商」）：字段缺失 = 空集合；只回交集——
+        客户端声明了但服务端未注册（未实现）的能力不会启用。
+        禁用集来自 config.disable_capabilities（逗号分隔，strip 后剔除）。
+        防御式：非列表输入按空集合处理，畸形声明不影响认证。
+        """
+        disabled = {
+            name.strip()
+            for name in (self.config.disable_capabilities or "").split(",")
+            if name.strip()
+        }
+        if not isinstance(client_caps, (list, tuple, set, frozenset)):
+            return []
+        client_set = {c for c in client_caps if isinstance(c, str)}
+        return sorted((set(SERVER_CAPABILITIES) & client_set) - disabled)
+
     async def _handle_websocket(self, websocket: WebSocket) -> None:
         """处理 WebSocket 连接"""
         await websocket.accept()
@@ -1380,6 +1410,11 @@ class TunnelServer:
                 # 尝试注册连接（记录注册前是否已有连接，用于 takeover 审计）
                 force = getattr(message, 'force', False)
                 had_existing = self.manager.get_connection_by_token(token) is not None
+                # 协议 v2 能力协商：客户端缺失/空声明按空集合，AuthOk 只回交集；
+                # 协商结果同时存入 ActiveConnection（后续按连接门控，本任务只存不用）
+                negotiated_caps = self._negotiate_capabilities(
+                    getattr(message, "capabilities", None) or []
+                )
                 success, error = await self.manager.register(
                     websocket=websocket,
                     tunnel_id=tunnel.id,
@@ -1388,6 +1423,7 @@ class TunnelServer:
                     force=force,
                     mode=tunnel_mode,
                     client_version=getattr(message, "client_version", None) or "unknown",
+                    capabilities=frozenset(negotiated_caps),
                 )
 
                 if not success:
@@ -1415,6 +1451,7 @@ class TunnelServer:
                         domain=tunnel.domain,
                         tunnel_id=str(tunnel.id),
                         server_version=self._server_version(),
+                        capabilities=negotiated_caps,
                     ).model_dump_json()
                 )
 

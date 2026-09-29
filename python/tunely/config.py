@@ -101,6 +101,12 @@ class TunnelServerConfig(BaseSettings):
         description="外部 TCP 连接空闲超时（秒）：连上不发数据的慢连接超时后被服务端关闭回收；0 = 不启用（env: WS_TUNNEL_TCP_IDLE_TIMEOUT）",
     )
 
+    # 协议 v2 能力协商（kill 开关）
+    disable_capabilities: str | None = Field(
+        default=None,
+        description="逗号分隔的能力名，从服务端能力注册表剔除（kill 开关）；env: WS_TUNNEL_DISABLE_CAPABILITIES",
+    )
+
     # JWT 认证（公网模式：需要 JWT 令牌才能创建隧道）
     jwt_secret: str | None = Field(
         default=None, description="JWT 共享密钥（设置后创建隧道需要 Bearer JWT 认证）"

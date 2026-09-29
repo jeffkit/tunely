@@ -37,6 +37,29 @@
       }
     },
     {
+      "name": "auth_with_capabilities",
+      "input_json": "{\"type\":\"auth\",\"token\":\"tok_dev_caps\",\"client_version\":\"0.5.0\",\"force\":false,\"capabilities\":[\"binary_frames\",\"chunked_http\"]}",
+      "expect": {
+        "type": "auth",
+        "fields": {
+          "token": "tok_dev_caps",
+          "capabilities": ["binary_frames", "chunked_http"]
+        }
+      }
+    },
+    {
+      "name": "auth_ok_with_capabilities",
+      "input_json": "{\"type\":\"auth_ok\",\"domain\":\"abc123.tunnel.example.com\",\"tunnel_id\":\"tid-20260925-001\",\"server_version\":\"0.5.0\",\"capabilities\":[\"binary_frames\"]}",
+      "expect": {
+        "type": "auth_ok",
+        "fields": {
+          "domain": "abc123.tunnel.example.com",
+          "tunnel_id": "tid-20260925-001",
+          "capabilities": ["binary_frames"]
+        }
+      }
+    },
+    {
       "name": "auth_error_with_code",
       "input_json": "{\"type\":\"auth_error\",\"error\":\"invalid token\",\"code\":\"INVALID_TOKEN\"}",
       "expect": {

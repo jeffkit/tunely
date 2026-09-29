@@ -53,6 +53,11 @@ pub enum Message {
         client_version: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         force: bool,
+        /// 协议 v2 能力协商：客户端支持的能力。缺字段 = 空 vec（不声明任何能力）。
+        /// 铁律：客户端只许声明自己已实现的能力；发送侧恒为空 vec 且
+        /// skip_serializing_if 保证空 vec 不上线（wire 最小变化）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// 认证成功
     AuthOk {
@@ -60,6 +65,10 @@ pub enum Message {
         tunnel_id: String,
         #[serde(default)]
         server_version: Option<String>,
+        /// 协议 v2 能力协商：协商启用的能力（服务端注册表 ∩ 客户端声明）。
+        /// 缺字段 = 空 vec（旧服务端 auth_ok 不带该字段，安全）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// 认证失败
     AuthError {
@@ -175,6 +184,8 @@ impl Message {
             token: token.to_string(),
             client_version: CLIENT_VERSION.to_string(),
             force,
+            // T1 客户端不声明任何能力；空 vec 经 skip_serializing_if 不上线
+            capabilities: vec![],
         }
     }
 

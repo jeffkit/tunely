@@ -38,6 +38,12 @@ export interface AuthMessage {
   token: string;
   client_version?: string;
   force?: boolean;
+  /**
+   * 协议 v2 能力协商：客户端支持的能力。缺省/空数组 = 不声明任何能力。
+   * 铁律：客户端只许声明自己已实现的能力（声明了没实现 = 事故）。
+   * 本期（T1）客户端一律不声明——createAuthMessage 不设置该字段。
+   */
+  capabilities?: string[];
 }
 
 export interface AuthOkMessage {
@@ -45,6 +51,8 @@ export interface AuthOkMessage {
   domain: string;
   tunnel_id: string;
   server_version?: string;
+  /** 协议 v2：协商启用的能力 = 服务端注册表 ∩ 客户端声明；缺字段按空集合理解 */
+  capabilities?: string[];
 }
 
 export interface AuthErrorMessage {
