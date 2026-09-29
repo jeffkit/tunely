@@ -1238,14 +1238,12 @@ mod tests {
         // 等 udp_close 回执（ICMP 不可达为异步路径，轮询等待）
         let mut got_close = false;
         for _ in 0..100 {
-            if let Ok(Some(outbound)) =
+            if let Ok(Some(super::OutFrame::Text(json))) =
                 tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
             {
-                if let super::OutFrame::Text(json) = outbound {
-                    if json.contains(r#""type":"udp_close""#) && json.contains(session_id) {
-                        got_close = true;
-                        break;
-                    }
+                if json.contains(r#""type":"udp_close""#) && json.contains(session_id) {
+                    got_close = true;
+                    break;
                 }
             }
         }
