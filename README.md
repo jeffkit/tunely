@@ -190,7 +190,7 @@ tunely/
 
 ## 协议版本
 
-当前协议版本：**1.1**（1.1 新增 SSE 流式响应与 TCP 透传消息）
+当前协议版本：**2.0**（2.0 新增能力协商、binary_frames 二进制数据帧、chunked_http 非SSE流式；1.1 新增 SSE 流式响应与 TCP 透传）
 
 详见 [PROTOCOL.md](docs/PROTOCOL.md)
 
