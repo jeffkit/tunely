@@ -184,8 +184,9 @@ impl Message {
             token: token.to_string(),
             client_version: CLIENT_VERSION.to_string(),
             force,
-            // T1 客户端不声明任何能力；空 vec 经 skip_serializing_if 不上线
-            capabilities: vec![],
+            // T2 起客户端声明已实现的能力（铁律：只许声明已实现的）；
+            // 修改本 vec 前先确认对应能力已在本客户端实现
+            capabilities: vec!["binary_frames".to_string()],
         }
     }
 
@@ -270,6 +271,101 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "proxy-authorization",
     "proxy-connection",
 ];
+
+// ============== binary_frames 帧编解码（协议 v2 T2，docs/PROTOCOL_V2.md §1） ==============
+//
+// WS binary 帧（仅 tcp_data 一个类型）：
+//   [0x02]     1B  协议版本标记（v2）
+//   [0x01]     1B  帧类型：0x01 = tcp_data
+//   [16B]      conn_id，UUID v4 原始字节（JSON 控制面仍是 36 字符串形式）
+//   [payload]  原始字节（无 base64、无 JSON、无 sequence——WS 有序，接收侧不依赖）
+//
+// tcp_close 保持 JSON（低频、携带 error）。解码遇版本/类型/长度不对返回 Err，
+// 调用方按畸形帧丢弃（F10 语义）。UUID 转换手写 parse/format（不引 uuid crate）。
+
+/// 协议版本标记（v2）
+pub const FRAME_PROTOCOL_VERSION: u8 = 0x02;
+/// 帧类型：tcp_data
+pub const FRAME_TYPE_TCP_DATA: u8 = 0x01;
+/// 帧头长度：1B version + 1B type + 16B conn_id
+pub const FRAME_HEADER_LEN: usize = 18;
+
+/// UUID 36 字符串 → 16 原始字节。
+///
+/// 仅做格式校验（长度 + 连字符位置 + hex 字符），不校验版本/变体位——
+/// 与 python `uuid.UUID(...).bytes` 语义一致（任意 16 字节可往返）。
+pub fn uuid_to_bytes(uuid_str: &str) -> Result<[u8; 16], String> {
+    let invalid = || format!("invalid uuid: {uuid_str}");
+    let b = uuid_str.as_bytes();
+    if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+        return Err(invalid());
+    }
+    let mut out = [0u8; 16];
+    let mut oi = 0usize;
+    let mut pending: Option<u8> = None;
+    for (i, &c) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            continue;
+        }
+        let v = (c as char).to_digit(16).ok_or_else(invalid)? as u8;
+        match pending.take() {
+            None => pending = Some(v),
+            Some(hi) => {
+                out[oi] = (hi << 4) | v;
+                oi += 1;
+            }
+        }
+    }
+    debug_assert_eq!(oi, 16);
+    Ok(out)
+}
+
+/// 16 原始字节 → 小写 36 字符 UUID 字符串。
+pub fn bytes_to_uuid(bytes: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(36);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push(HEX[(byte >> 4) as usize] as char);
+        s.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// tcp_data 二进制帧编码：0x02 0x01 + UUID 原始字节 + 原始 payload。
+/// conn_id 非 UUID 字符串返回 Err。
+pub fn encode_tcp_data_frame(conn_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    frame.push(FRAME_PROTOCOL_VERSION);
+    frame.push(FRAME_TYPE_TCP_DATA);
+    frame.extend_from_slice(&uuid_to_bytes(conn_id)?);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// tcp_data 二进制帧解码 → (conn_id 36 字符串, payload 原始字节)。
+///
+/// 版本/类型/长度不对返回 Err（调用方按畸形帧丢弃，F10 语义）；
+/// conn_id 16 字节不校验版本位（与 python uuid 语义一致）。
+pub fn decode_tcp_data_frame(frame: &[u8]) -> Result<(String, Vec<u8>), String> {
+    if frame.len() < FRAME_HEADER_LEN {
+        return Err(format!("invalid frame: too short ({})", frame.len()));
+    }
+    if frame[0] != FRAME_PROTOCOL_VERSION {
+        return Err(format!(
+            "invalid frame: unsupported version 0x{:02x}",
+            frame[0]
+        ));
+    }
+    if frame[1] != FRAME_TYPE_TCP_DATA {
+        return Err(format!("invalid frame: unsupported type 0x{:02x}", frame[1]));
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&frame[2..FRAME_HEADER_LEN]);
+    Ok((bytes_to_uuid(&id), frame[FRAME_HEADER_LEN..].to_vec()))
+}
 
 /// 从 targetUrl 解析 TCP 模式目标 (host, port)；解析失败回退 localhost:8080
 pub fn parse_target(target_url: &str) -> (String, u16) {
@@ -490,5 +586,96 @@ mod tests {
         assert_eq!(d.flush(), "\u{FFFD}");
         assert_eq!(d.decode(b"next"), "next");
         assert_eq!(d.flush(), "");
+    }
+
+    #[test]
+    fn auth_declares_binary_frames_capability() {
+        // T2：客户端声明已实现的能力（auth wire 含 capabilities）
+        match Message::auth("tok", false) {
+            Message::Auth { capabilities, .. } => {
+                assert_eq!(capabilities, vec!["binary_frames".to_string()])
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_roundtrip() {
+        let conn_id = "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b";
+        let payload = b"hello tcp \x00\x01\xff binary";
+        let frame = encode_tcp_data_frame(conn_id, payload).unwrap();
+        let (out_id, out_payload) = decode_tcp_data_frame(&frame).unwrap();
+        assert_eq!(out_id, conn_id);
+        assert_eq!(out_payload, payload.to_vec());
+    }
+
+    #[test]
+    fn frame_layout() {
+        let conn_id = "00112233-4455-4677-8899-aabbccddeeff";
+        let frame = encode_tcp_data_frame(conn_id, b"abc").unwrap();
+        assert_eq!(frame.len(), FRAME_HEADER_LEN + 3);
+        assert_eq!(frame[0], 0x02);
+        assert_eq!(frame[1], 0x01);
+        assert_eq!(&frame[2..18], &b"\x00\x11\x22\x33\x44\x55\x46\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff"[..]);
+        assert_eq!(&frame[18..], b"abc");
+    }
+
+    #[test]
+    fn frame_empty_payload() {
+        let conn_id = "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b";
+        let frame = encode_tcp_data_frame(conn_id, b"").unwrap();
+        assert_eq!(frame.len(), FRAME_HEADER_LEN);
+        let (out_id, payload) = decode_tcp_data_frame(&frame).unwrap();
+        assert_eq!(out_id, conn_id);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn frame_decode_rejects_malformed() {
+        // 过短
+        assert!(decode_tcp_data_frame(&[]).is_err());
+        assert!(decode_tcp_data_frame(&[0x02, 0x01, 0x00]).is_err());
+        assert!(decode_tcp_data_frame(&[0x02; 17]).is_err());
+        // 错版本
+        let mut bad = encode_tcp_data_frame("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", b"x").unwrap();
+        bad[0] = 0x01;
+        assert!(decode_tcp_data_frame(&bad)
+            .unwrap_err()
+            .contains("version"));
+        // 错类型（仅 tcp_data=0x01 一个类型）
+        let mut bad = encode_tcp_data_frame("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", b"x").unwrap();
+        bad[1] = 0x09;
+        assert!(decode_tcp_data_frame(&bad).unwrap_err().contains("type"));
+    }
+
+    #[test]
+    fn frame_encode_rejects_invalid_conn_id() {
+        assert!(encode_tcp_data_frame("not-a-uuid", b"x").is_err());
+        assert!(encode_tcp_data_frame("3f2a1b4c5d6e4f809a1b2c3d4e5f6a7b", b"x").is_err());
+    }
+
+    #[test]
+    fn uuid_conversion_matches_python_semantics() {
+        // 已知向量（与 python uuid.UUID(...).bytes 一致）
+        let bytes = uuid_to_bytes("00112233-4455-4677-8899-AABBCCDDEEFF").unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                0xdd, 0xee, 0xff
+            ]
+        );
+        // bytes_to_uuid 输出小写规范格式
+        assert_eq!(
+            bytes_to_uuid(&bytes),
+            "00112233-4455-4677-8899-aabbccddeeff"
+        );
+        // 畸形输入拒绝
+        assert!(uuid_to_bytes("not-a-uuid").is_err());
+        assert!(uuid_to_bytes("3f2a1b4c5d6e4f809a1b2c3d4e5f6a7b").is_err());
+        assert!(uuid_to_bytes("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7g").is_err());
+        // 任意 16 字节可往返（不校验版本位）
+        let raw = [0xffu8; 16];
+        assert_eq!(uuid_to_bytes(&bytes_to_uuid(&raw)).unwrap(), raw);
     }
 }

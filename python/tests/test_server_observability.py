@@ -336,12 +336,11 @@ class TestAdminAuditLog:
         mock_ws.accept = AsyncMock()
         mock_ws.send_text = AsyncMock()
         mock_ws.close = AsyncMock()
+        # 0.8.0 binary_frames 起：auth 走 receive_text，消息循环走 receive()
         mock_ws.receive_text = AsyncMock(
-            side_effect=[
-                AuthMessage(token="t-tk", force=True).model_dump_json(),
-                WebSocketDisconnect(),
-            ]
+            side_effect=[AuthMessage(token="t-tk", force=True).model_dump_json()]
         )
+        mock_ws.receive = AsyncMock(side_effect=[WebSocketDisconnect()])
 
         audit_mock = AsyncMock()
         with (
@@ -384,12 +383,11 @@ class TestAdminAuditLog:
         mock_ws.accept = AsyncMock()
         mock_ws.send_text = AsyncMock()
         mock_ws.close = AsyncMock()
+        # 0.8.0 binary_frames 起：auth 走 receive_text，消息循环走 receive()
         mock_ws.receive_text = AsyncMock(
-            side_effect=[
-                AuthMessage(token="t-tk2", force=True).model_dump_json(),
-                WebSocketDisconnect(),
-            ]
+            side_effect=[AuthMessage(token="t-tk2", force=True).model_dump_json()]
         )
+        mock_ws.receive = AsyncMock(side_effect=[WebSocketDisconnect()])
 
         audit_mock = AsyncMock()
         with (

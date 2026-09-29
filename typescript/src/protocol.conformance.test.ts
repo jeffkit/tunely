@@ -118,18 +118,27 @@ describe('Protocol Conformance - 能力协商（协议 v2）', () => {
     expect(msg).toEqual(roundtrip(msg));
   });
 
-  it('createAuthMessage 不声明任何能力：线上键仍为 type/token/client_version/force 四键', () => {
-    // T1 铁律：客户端一律不发 capabilities（undefined 被 JSON.stringify 丢弃 = 缺省空集合）
+  it('createAuthMessage 默认声明 binary_frames：线上键为五键（含 capabilities）', () => {
+    // T2 起客户端声明已实现的能力（CLIENT_CAPABILITIES = ['binary_frames']）
     const wire = JSON.stringify(createAuthMessage('tok_local', false));
     const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
 
     expect(Object.keys(msg).sort()).toEqual([
+      'capabilities',
       'client_version',
       'force',
       'token',
       'type',
     ]);
-    expect(msg.capabilities).toBeUndefined();
+    expect(msg.capabilities).toEqual(['binary_frames']);
+  });
+
+  it('createAuthMessage 可覆盖 capabilities：传空数组 = 不声明任何能力（0.7.x 行为）', () => {
+    const wire = JSON.stringify(createAuthMessage('tok_local', false, []));
+    const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
+
+    expect(msg.capabilities).toEqual([]);
+    expect(msg).toEqual(roundtrip(msg));
   });
 });
 
@@ -311,11 +320,12 @@ describe('Protocol Conformance - 客户端序列化形状（pydantic 兼容）',
     );
   });
 
-  it('createAuthMessage：线上键为 type/token/client_version/force，force 为布尔', () => {
+  it('createAuthMessage：线上键为 type/token/client_version/force/capabilities 五键，force 为布尔', () => {
     const wire = JSON.stringify(createAuthMessage('tok_local', true));
     const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;
 
     expect(Object.keys(msg).sort()).toEqual([
+      'capabilities',
       'client_version',
       'force',
       'token',
@@ -324,6 +334,7 @@ describe('Protocol Conformance - 客户端序列化形状（pydantic 兼容）',
     expect(msg.type).toBe('auth');
     expect(msg.token).toBe('tok_local');
     expect(msg.force).toBe(true);
+    expect(msg.capabilities).toEqual(['binary_frames']);
   });
 
   it('createPongMessage：线上键为 type/timestamp，type 为 "pong"', () => {

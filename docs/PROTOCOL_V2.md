@@ -18,20 +18,24 @@
 
 ## 1. binary_frames（T2）——issue #3 草图的落地
 
+> **状态：已落地（2026-09-29，py 服务端 + py/ts/rust 三客户端）。**
+> 帧格式与下方定稿逐字一致；实现清单见 PROTOCOL.md「binary_frames 帧格式」小节。
+
 采用 issue #3 的帧布局（jeffkit 提案），细节定稿：
 
-- WS **binary** 帧（仅 `tcp_data` 一个类型）：
+- WS **binary** 帧（仅 `tcp_data` 一个类型）：✅
   ```
   [0x02]        1B  协议版本标记（v2）
   [0x01]        1B  帧类型：0x01 = tcp_data
   [16B]         conn_id，UUID v4 原始字节（JSON 控制面仍是 36 字符串形式）
   [payload]     原始字节（无 base64、无 JSON）
   ```
-- `tcp_close` 保持 JSON（携带 error 字段，低频）；`sequence` 不进二进制帧（WS 有序，接收侧本就不依赖）。
+- `tcp_close` 保持 JSON（携带 error 字段，低频）；`sequence` 不进二进制帧（WS 有序，接收侧本就不依赖）。✅
 - 双向都用：服务端 `_tcp_read_loop`（外部→客户端）与客户端 TCP 读循环（目标→服务端）在能力启用时发 binary 帧；
-  服务端 WS 循环改 `receive()` 分派 text（JSON 控制面）/binary（数据面）。
-- 门控：该连接 AuthOk 回了 `binary_frames` 才启用；未协商时收到 binary 帧 → 丢弃 + warning（F10 语义）。
-- 兼容：未协商路径的代码保持 0.7.x 原样不动（老路径一行不改是验收项）。
+  服务端 WS 循环改 `receive()` 分派 text（JSON 控制面）/binary（数据面）。✅
+- 门控：该连接 AuthOk 回了 `binary_frames` 才启用；未协商时收到 binary 帧 → 丢弃 + warning（F10 语义）。✅
+- 兼容：未协商路径的代码保持 0.7.x 原样不动（老路径一行不改是验收项）。✅
+- 服务端注册表已注册 `"binary_frames"`；三客户端 auth 均已声明该能力。✅
 
 ## 2. chunked_http（T3）——非 SSE 大响应流式
 

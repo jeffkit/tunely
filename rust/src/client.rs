@@ -17,7 +17,10 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::protocol::{backoff_delay_ms, jitter, parse_target, Message, HOP_BY_HOP_HEADERS};
+use crate::protocol::{
+    backoff_delay_ms, decode_tcp_data_frame, encode_tcp_data_frame, jitter, parse_target, Message,
+    HOP_BY_HOP_HEADERS,
+};
 
 fn info(msg: impl AsRef<str>) {
     println!("{}", msg.as_ref());
@@ -132,16 +135,31 @@ struct TcpConn {
 /// 生产者（HTTP/SSE/TCP 读循环）在此阻塞而不是无界占用内存。
 const TX_CHANNEL_CAPACITY: usize = 256;
 
+/// WS 出站帧：控制面 JSON 消息 or 数据面二进制帧（协议 v2 binary_frames）
+enum OutFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl From<Message> for OutFrame {
+    fn from(m: Message) -> Self {
+        OutFrame::Text(m.to_json())
+    }
+}
+
 /// 单次 WebSocket 会话内共享的发送通道与本地连接表
 #[derive(Clone)]
 struct Session {
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<OutFrame>,
     tcp: Arc<Mutex<HashMap<String, Arc<TcpConn>>>>,
     http: reqwest::Client,
     target_base: String,
     target_host: String,
     target_port: u16,
     request_timeout: Duration,
+    /// 本连接是否协商了 binary_frames 能力（协议 v2，AuthOk.capabilities 快照；
+    /// 未协商 = false，tcp_data 全走 JSON+base64，行为与 0.7.x 一致）
+    binary_frames: bool,
 }
 
 /// 隧道客户端
@@ -311,17 +329,22 @@ impl TunnelClient {
             .map_err(|e| ConnectError::Io(format!("WebSocket 连接失败: {e}")))?;
 
         let (mut sink, mut stream) = ws.split();
-        let (tx, mut rx) = mpsc::channel::<Message>(TX_CHANNEL_CAPACITY);
+        let (tx, mut rx) = mpsc::channel::<OutFrame>(TX_CHANNEL_CAPACITY);
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if sink.send(WsMessage::Text(msg.to_json())).await.is_err() {
+                let ws_msg = match msg {
+                    OutFrame::Text(t) => WsMessage::Text(t),
+                    // 协议 v2 binary_frames：数据面 WS binary 帧
+                    OutFrame::Binary(b) => WsMessage::Binary(b),
+                };
+                if sink.send(ws_msg).await.is_err() {
                     break;
                 }
             }
             let _ = sink.close().await;
         });
 
-        let session = Session {
+        let mut session = Session {
             tx: tx.clone(),
             tcp: Arc::new(Mutex::new(HashMap::new())),
             http: reqwest::Client::builder()
@@ -331,10 +354,11 @@ impl TunnelClient {
             target_host,
             target_port,
             request_timeout: self.config.request_timeout,
+            binary_frames: false,
         };
 
-        // 发送认证
-        tx.send(Message::auth(&self.config.token, force))
+        // 发送认证（协议 v2：声明本客户端已实现的能力）
+        tx.send(Message::auth(&self.config.token, force).into())
             .await
             .map_err(|_| ConnectError::Io("发送认证失败".into()))?;
 
@@ -360,7 +384,7 @@ impl TunnelClient {
                         dead.notify_waiters();
                         break;
                     }
-                    if tx.send(Message::Ping {}).await.is_err() {
+                    if tx.send(Message::Ping {}.into()).await.is_err() {
                         break;
                     }
                 }
@@ -393,6 +417,21 @@ impl TunnelClient {
 
             let text = match ws_msg {
                 WsMessage::Text(t) => t,
+                WsMessage::Binary(b) => {
+                    // 协议 v2 binary_frames：二进制消息 = tcp_data 帧（仅协商连接处理）；
+                    // 未协商收到 binary → 丢弃 + warn；畸形帧 → 丢弃 + warn（F10 语义）
+                    if !session.binary_frames {
+                        warn("未协商 binary_frames，收到 WS 二进制消息已丢弃");
+                        continue;
+                    }
+                    match decode_tcp_data_frame(&b) {
+                        Ok((conn_id, payload)) => {
+                            handle_tcp_data_bytes(&session, &conn_id, &payload).await
+                        }
+                        Err(e) => warn(format!("丢弃畸形 binary 帧: {e}")),
+                    }
+                    continue;
+                }
                 WsMessage::Close(_) => break,
                 _ => continue,
             };
@@ -406,7 +445,12 @@ impl TunnelClient {
             };
 
             match msg {
-                Message::AuthOk { domain, .. } => {
+                Message::AuthOk {
+                    domain, capabilities, ..
+                } => {
+                    // 协议 v2：协商结果 = AuthOk.capabilities（缺字段 = 空 vec，
+                    // 旧服务端不带该字段时全 JSON，行为与 0.7.x 一致）
+                    session.binary_frames = capabilities.iter().any(|c| c == "binary_frames");
                     state.connected.store(true, Ordering::SeqCst);
                     state.was_connected.store(true, Ordering::SeqCst);
                     state.reconnect_count.store(0, Ordering::SeqCst);
@@ -424,7 +468,7 @@ impl TunnelClient {
                     break;
                 }
                 Message::Ping {} => {
-                    let _ = session.tx.send(Message::pong()).await;
+                    let _ = session.tx.send(Message::pong().into()).await;
                 }
                 Message::Request {
                     id,
@@ -557,7 +601,8 @@ fn spawn_http_request(
                             Some(body),
                             None,
                             duration,
-                        ))
+                        )
+                        .into())
                         .await;
                 }
             }
@@ -579,7 +624,8 @@ fn spawn_http_request(
                         None,
                         Some(error),
                         duration,
-                    ))
+                    )
+                    .into())
                     .await;
             }
         }
@@ -596,7 +642,7 @@ async fn handle_sse(
 ) {
     let _ = session
         .tx
-        .send(Message::stream_start(id, status, headers))
+        .send(Message::stream_start(id, status, headers).into())
         .await;
 
     let mut decoder = crate::protocol::Utf8StreamDecoder::new();
@@ -608,7 +654,7 @@ async fn handle_sse(
             Ok(Some(chunk)) => {
                 let text = decoder.decode(&chunk);
                 if !text.is_empty() {
-                    let _ = session.tx.send(Message::stream_chunk(id, text, seq)).await;
+                    let _ = session.tx.send(Message::stream_chunk(id, text, seq).into()).await;
                     seq += 1;
                 }
             }
@@ -624,14 +670,14 @@ async fn handle_sse(
     // 冲洗缓存的未完成多字节序列（以 U+FFFD 收尾，WHATWG 替换语义）
     let tail = decoder.flush();
     if !tail.is_empty() {
-        let _ = session.tx.send(Message::stream_chunk(id, tail, seq)).await;
+        let _ = session.tx.send(Message::stream_chunk(id, tail, seq).into()).await;
         seq += 1;
     }
 
     let duration = start.elapsed().as_millis() as u64;
     let _ = session
         .tx
-        .send(Message::stream_end(id, error_msg, duration, seq))
+        .send(Message::stream_end(id, error_msg, duration, seq).into())
         .await;
 }
 
@@ -673,7 +719,7 @@ async fn handle_tcp_connect(session: &Session, conn_id: &str) {
             ));
             let _ = session
                 .tx
-                .send(Message::tcp_close(conn_id, Some(e.to_string())))
+                .send(Message::tcp_close(conn_id, Some(e.to_string())).into())
                 .await;
         }
     }
@@ -695,13 +741,18 @@ async fn tcp_read_loop(
                 break;
             }
             Ok(n) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                if session
-                    .tx
-                    .send(Message::tcp_data(conn_id, &encoded, seq))
-                    .await
-                    .is_err()
-                {
+                // 协议 v2 binary_frames：协商了就组二进制帧直发（去 base64+JSON
+                // 开销）；否则走 0.7.x 的 JSON+base64 路径（wire 不变）
+                let outbound = if session.binary_frames {
+                    match encode_tcp_data_frame(conn_id, &buf[..n]) {
+                        Ok(frame) => OutFrame::Binary(frame),
+                        // conn_id 非 UUID 等极端情况：回落 JSON 帧，不丢数据
+                        Err(_) => OutFrame::from(json_tcp_data(conn_id, &buf[..n], seq)),
+                    }
+                } else {
+                    OutFrame::from(json_tcp_data(conn_id, &buf[..n], seq))
+                };
+                if session.tx.send(outbound).await.is_err() {
                     break; // WebSocket 已断
                 }
                 seq += 1;
@@ -718,7 +769,7 @@ async fn tcp_read_loop(
 async fn finish_tcp(session: &Session, conn_id: &str, conn: &Arc<TcpConn>, error: Option<String>) {
     use tokio::io::AsyncWriteExt;
     if !conn.close_sent.swap(true, Ordering::SeqCst) {
-        let _ = session.tx.send(Message::tcp_close(conn_id, error)).await;
+        let _ = session.tx.send(Message::tcp_close(conn_id, error).into()).await;
     }
     {
         let mut w = conn.write.lock().await;
@@ -727,12 +778,15 @@ async fn finish_tcp(session: &Session, conn_id: &str, conn: &Arc<TcpConn>, error
     session.tcp.lock().await.remove(conn_id);
 }
 
+/// JSON 形态的 tcp_data 消息（0.7.x wire：base64 + sequence）
+fn json_tcp_data(conn_id: &str, data: &[u8], seq: u32) -> Message {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    Message::tcp_data(conn_id, &encoded, seq)
+}
+
+/// 处理来自服务端的 TCP 数据（JSON 形态，base64）：解码后与 binary 帧路径
+/// 共用 handle_tcp_data_bytes 落地。
 async fn handle_tcp_data(session: &Session, conn_id: &str, data: &str) {
-    let conn = session.tcp.lock().await.get(conn_id).cloned();
-    let Some(conn) = conn else {
-        warn(format!("收到未知 TCP 连接的数据: {conn_id}"));
-        return;
-    };
     let bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
         Ok(b) => b,
         Err(e) => {
@@ -740,9 +794,19 @@ async fn handle_tcp_data(session: &Session, conn_id: &str, data: &str) {
             return;
         }
     };
+    handle_tcp_data_bytes(session, conn_id, &bytes).await;
+}
+
+/// tcp_data 落地写入本地连接（JSON 与 binary 帧两路共用）
+async fn handle_tcp_data_bytes(session: &Session, conn_id: &str, bytes: &[u8]) {
+    let conn = session.tcp.lock().await.get(conn_id).cloned();
+    let Some(conn) = conn else {
+        warn(format!("收到未知 TCP 连接的数据: {conn_id}"));
+        return;
+    };
     use tokio::io::AsyncWriteExt;
     let mut w = conn.write.lock().await;
-    let _ = w.write_all(&bytes).await; // 写失败会随后以 read 侧 EOF/error 收敛
+    let _ = w.write_all(bytes).await; // 写失败会随后以 read 侧 EOF/error 收敛
 }
 
 async fn handle_server_tcp_close(session: &Session, conn_id: &str) {

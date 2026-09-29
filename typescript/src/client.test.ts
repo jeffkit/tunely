@@ -516,7 +516,9 @@ async function waitUntil(fn: () => boolean, timeoutMs = 2000): Promise<void> {
 }
 
 function sentMessages(mockWs: MockWebSocket): any[] {
-  return (mockWs.send.mock.calls as string[][]).map((args) => JSON.parse(args[0]));
+  return (mockWs.send.mock.calls as unknown[][])
+    .filter((args) => typeof args[0] === 'string')
+    .map((args) => JSON.parse(args[0] as string));
 }
 
 function sentOf(mockWs: MockWebSocket, type: string, connId?: string): any[] {
@@ -526,7 +528,10 @@ function sentOf(mockWs: MockWebSocket, type: string, connId?: string): any[] {
 }
 
 /** 创建 targetUrl 指向指定地址的已连接客户端（TCP 测试专用） */
-async function createTcpTestClient(targetUrl: string): Promise<{
+async function createTcpTestClient(
+  targetUrl: string,
+  authOkExtras: Record<string, unknown> = {}
+): Promise<{
   client: TunnelClient;
   mockWs: MockWebSocket;
   runPromise: Promise<void>;
@@ -555,7 +560,9 @@ async function createTcpTestClient(targetUrl: string): Promise<{
 
   mockWs.emit(
     'message',
-    Buffer.from(JSON.stringify({ type: 'auth_ok', domain: 'test-domain', tunnel_id: 'tid' }))
+    Buffer.from(
+      JSON.stringify({ type: 'auth_ok', domain: 'test-domain', tunnel_id: 'tid', ...authOkExtras })
+    )
   );
   await new Promise((r) => setImmediate(r));
 
@@ -984,4 +991,224 @@ describe('TunnelClient - keepalive', () => {
     client.stop();
     await runPromise.catch(() => {});
   }, 5000);
+});
+
+// ================================================================
+// 协议 v2 binary_frames（T2）：WS 二进制帧数据面
+// - auth 声明 ['binary_frames']；
+// - 协商启用时双向 tcp_data 走二进制帧（无 base64/JSON）；
+// - 未协商收到二进制 → 丢弃 + warning，连接不断（F10 语义）。
+// ================================================================
+
+import { decodeTcpDataFrame, encodeTcpDataFrame } from './framing.js';
+
+/** 提取 mockWs 收到的所有二进制 send（Buffer） */
+function sentBinaryFrames(mockWs: MockWebSocket): Buffer[] {
+  return (mockWs.send.mock.calls as unknown[][])
+    .map((args) => args[0])
+    .filter((d): d is Buffer => Buffer.isBuffer(d));
+}
+
+describe('TunnelClient - binary_frames（协议 v2）', () => {
+  // 本 describe 自有的清理链（与上方 TCP 隧道模式的 disposables 互不相干）
+  let locals: Array<() => Promise<void> | void>;
+
+  beforeEach(() => {
+    locals = [];
+  });
+
+  afterEach(async () => {
+    for (const dispose of [...locals].reverse()) {
+      await dispose();
+    }
+    vi.clearAllMocks();
+  });
+
+  /** 注册回环服务与客户端的清理（逆序执行） */
+  function track(server: net.Server, client: TunnelClient, runPromise: Promise<void>): void {
+    locals.push(async () => await closeServer(server));
+    locals.push(async () => {
+      client.stop();
+      await runPromise.catch(() => {});
+    });
+  }
+
+  it('auth 声明 binary_frames 能力', async () => {
+    const { client, mockWs, runPromise } = await createConnectedClient();
+    try {
+      // 'open' 触发 auth 发送（mock 默认不 emit open，显式触发）
+      mockWs.emit('open');
+      await new Promise((r) => setImmediate(r));
+      const authCall = (mockWs.send.mock.calls as string[][]).find(
+        (args) => typeof args[0] === 'string' && args[0].includes('"type":"auth"')
+      );
+      expect(authCall).toBeDefined();
+      const auth = JSON.parse(authCall![0]);
+      expect(auth.capabilities).toEqual(['binary_frames']);
+    } finally {
+      client.stop();
+      await runPromise.catch(() => {});
+    }
+  });
+
+  it('未协商（0.7.x 服务端 auth_ok 无 capabilities）：tcp_data 仍走 JSON+base64', async () => {
+    const { server, port, connections } = await startTcpServer((data, socket) =>
+      socket.write(data)
+    );
+    const { client, mockWs, runPromise } = await createTcpTestClient(
+      `http://127.0.0.1:${port}`
+    );
+    track(server, client, runPromise);
+
+    const connId = 'conn-json-fallback';
+    mockWs.emit(
+      'message',
+      Buffer.from(JSON.stringify({ type: 'tcp_connect', conn_id: connId }))
+    );
+    await waitUntil(() => connections.length === 1);
+
+    const payload = Buffer.from('json-fallback-data');
+    mockWs.emit(
+      'message',
+      Buffer.from(
+        JSON.stringify({ type: 'tcp_data', conn_id: connId, data: payload.toString('base64') })
+      )
+    );
+
+    await waitUntil(() => sentOf(mockWs, 'tcp_data', connId).length >= 1);
+    // 回声全部是 JSON 文本（无二进制帧）
+    expect(sentBinaryFrames(mockWs)).toHaveLength(0);
+    const chunks = sentOf(mockWs, 'tcp_data', connId);
+    expect(Buffer.from(chunks[0].data, 'base64').equals(payload)).toBe(true);
+  });
+
+  it('协商 binary_frames：目标→服务端方向发二进制帧（conn_id+payload 直达）', async () => {
+    const { server, port, connections } = await startTcpServer((data, socket) =>
+      socket.write(data)
+    );
+    const { client, mockWs, runPromise } = await createTcpTestClient(
+      `http://127.0.0.1:${port}`,
+      { capabilities: ['binary_frames'] }
+    );
+    track(server, client, runPromise);
+
+    const connId = '11111111-2222-4333-8444-555555555555';
+    mockWs.emit(
+      'message',
+      Buffer.from(JSON.stringify({ type: 'tcp_connect', conn_id: connId }))
+    );
+    await waitUntil(() => connections.length === 1);
+
+    // 回环服务把收到的数据原样返回 → 客户端应以二进制帧发回
+    const payload = Buffer.from('你好，二进制帧 \x00\x01\x02');
+    mockWs.emit(
+      'message',
+      Buffer.from(JSON.stringify({ type: 'tcp_data', conn_id: connId, data: payload.toString('base64') }))
+    );
+
+    await waitUntil(() => sentBinaryFrames(mockWs).length >= 1);
+    const frame = sentBinaryFrames(mockWs)[0];
+    const decoded = decodeTcpDataFrame(frame);
+    expect(decoded.connId).toBe(connId);
+    expect(Buffer.from(decoded.payload).equals(payload)).toBe(true);
+    // 二进制模式下不再发 JSON tcp_data
+    expect(sentOf(mockWs, 'tcp_data', connId)).toHaveLength(0);
+  });
+
+  it('协商 binary_frames：服务端→目标方向收到二进制帧写入本地连接', async () => {
+    let received = Buffer.alloc(0);
+    const { server, port, connections } = await startTcpServer((data) => {
+      received = Buffer.concat([received, data]);
+    });
+    const { client, mockWs, runPromise } = await createTcpTestClient(
+      `http://127.0.0.1:${port}`,
+      { capabilities: ['binary_frames'] }
+    );
+    track(server, client, runPromise);
+
+    const connId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    mockWs.emit(
+      'message',
+      Buffer.from(JSON.stringify({ type: 'tcp_connect', conn_id: connId }))
+    );
+    await waitUntil(() => connections.length === 1);
+
+    // 服务端下发二进制帧（isBinary=true）
+    const payload = Buffer.from('server->client via binary frame');
+    mockWs.emit('message', encodeTcpDataFrame(connId, payload), true);
+
+    await waitUntil(() => received.length >= payload.length);
+    expect(received.equals(payload)).toBe(true);
+  });
+
+  it('未协商收到二进制消息：丢弃且连接不断（ping/pong 仍工作）', async () => {
+    const { client, mockWs, runPromise } = await createConnectedClient();
+    try {
+      // 未协商连接收到二进制（isBinary=true）→ 丢弃
+      mockWs.emit(
+        'message',
+        encodeTcpDataFrame('99999999-9999-4999-8999-999999999999', Buffer.from('junk')),
+        true
+      );
+      await new Promise((r) => setImmediate(r));
+
+      // 连接仍健康：ping → pong
+      mockWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping' })));
+      await waitUntil(() => sentMessages(mockWs).some((m) => m.type === 'pong'));
+    } finally {
+      client.stop();
+      await runPromise.catch(() => {});
+    }
+  });
+
+  it('协商后收到畸形二进制帧：丢弃且连接不断', async () => {
+    const { client, mockWs, runPromise } = await createTcpTestClient('http://127.0.0.1:1', {
+      capabilities: ['binary_frames'],
+    });
+    try {
+      // 错版本标记的畸形帧
+      const bad = encodeTcpDataFrame('88888888-8888-4888-9888-888888888888', Buffer.from('x'));
+      bad[0] = 0x7f;
+      mockWs.emit('message', bad, true);
+      // 过短帧
+      mockWs.emit('message', Buffer.from([0x02, 0x01, 0x00]), true);
+      await new Promise((r) => setImmediate(r));
+
+      // 连接仍健康：ping → pong
+      mockWs.emit('message', Buffer.from(JSON.stringify({ type: 'ping' })));
+      await waitUntil(() => sentMessages(mockWs).some((m) => m.type === 'pong'));
+    } finally {
+      client.stop();
+      await runPromise.catch(() => {});
+    }
+  });
+
+  it('断开重连后协商结果清空：旧连接的能力不带入新连接', async () => {
+    const { client, mockWs, runPromise } = await createConnectedClient();
+    try {
+      // 先用带 capabilities 的 auth_ok 建立协商（模拟新服务端）
+      mockWs.emit(
+        'message',
+        Buffer.from(
+          JSON.stringify({
+            type: 'auth_ok',
+            domain: 'test-domain',
+            tunnel_id: 'tid',
+            capabilities: ['binary_frames'],
+          })
+        )
+      );
+      await new Promise((r) => setImmediate(r));
+      expect(((client as any).negotiated as Set<string>).has('binary_frames')).toBe(true);
+
+      // 服务端关闭连接（close handler 应清空 negotiated）
+      mockWs.emit('close');
+      await new Promise((r) => setImmediate(r));
+
+      expect(((client as any).negotiated as Set<string>).size).toBe(0);
+    } finally {
+      client.stop();
+      await runPromise.catch(() => {});
+    }
+  });
 });

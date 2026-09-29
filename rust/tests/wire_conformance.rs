@@ -119,10 +119,17 @@ fn auth_with_capabilities_parses() {
     }
 }
 
-/// 发送侧 wire 最小变化：auth() 构造的空 capabilities 不出现在线上 JSON
+/// 发送侧 wire 最小变化：空 capabilities 不出现在线上 JSON
+/// （T2 起 Message::auth 恒声明 ["binary_frames"]，空 vec 场景仅限手构变体）
 #[test]
 fn auth_serialization_omits_empty_capabilities() {
-    let wire = Message::auth("tok", false).to_json();
+    let wire = Message::Auth {
+        token: "tok".into(),
+        client_version: "0.0.0".into(),
+        force: false,
+        capabilities: vec![],
+    }
+    .to_json();
     assert!(
         !wire.contains("capabilities"),
         "空 capabilities 不应上线: {wire}"
@@ -140,7 +147,7 @@ fn auth_serialization_omits_empty_capabilities() {
         ok.to_json()
     );
 
-    // 非空 capabilities 正常序列化（供 T2/T3 客户端声明用）
+    // 非空 capabilities 正常序列化（客户端声明用）
     let ok2 = Message::AuthOk {
         domain: "d".into(),
         tunnel_id: "t1".into(),
@@ -151,5 +158,15 @@ fn auth_serialization_omits_empty_capabilities() {
     assert!(
         wire2.contains(r#""capabilities":["binary_frames"]"#),
         "{wire2}"
+    );
+}
+
+/// T2：Message::auth 恒声明已实现的 binary_frames 能力（auth wire 含 capabilities）
+#[test]
+fn auth_declares_binary_frames() {
+    let wire = Message::auth("tok", false).to_json();
+    assert!(
+        wire.contains(r#""capabilities":["binary_frames"]"#),
+        "auth 应声明 binary_frames: {wire}"
     );
 }

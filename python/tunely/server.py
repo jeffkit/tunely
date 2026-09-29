@@ -69,6 +69,8 @@ from .protocol import (
     tcp_close_payload,
     tcp_connect_payload,
     tcp_data_payload,
+    decode_tcp_data_frame,
+    encode_tcp_data_frame,
 )
 from .repository import TunnelRepository, TunnelRequestLogRepository, AdminAuditLogRepository
 
@@ -102,9 +104,8 @@ _STREAM_FAILED = object()
 
 # 服务端能力注册表（协议 v2 能力协商，见 docs/PROTOCOL_V2.md §0）。
 # 认证时按「服务端注册表 ∩ 客户端声明 − disable_capabilities」回交集。
-# 初始为空：T2 实现 binary_frames 后加 "binary_frames"，T3 实现 chunked_http 后加
-# "chunked_http"——注册进这里之前，客户端声明了也不会被协商启用。
-SERVER_CAPABILITIES: list[str] = []
+# T2 已实现 binary_frames（WS binary 数据面帧）；T3 实现 chunked_http 后再加。
+SERVER_CAPABILITIES: list[str] = ["binary_frames"]
 
 
 def _client_ip(http_request: Request | None) -> str | None:
@@ -1462,7 +1463,19 @@ class TunnelServer:
 
             # 处理消息循环
             while True:
-                raw_message = await websocket.receive_text()
+                # 协议 v2 binary_frames（T2）：receive_text() 改 receive() 分派——
+                # text 消息（key="text"）走原 JSON 全流程；binary 消息（key="bytes"）
+                # 仅协商连接解帧路由。对 text 消息的取值与断连语义与 receive_text()
+                # 逐字一致（_raise_on_disconnect），未协商路径行为不变。
+                ws_msg = await websocket.receive()
+                if ws_msg["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(ws_msg["code"], ws_msg.get("reason"))
+                if ws_msg.get("bytes") is not None:
+                    await self._handle_ws_binary_message(
+                        token, tunnel_domain, ws_msg["bytes"]
+                    )
+                    continue
+                raw_message = ws_msg["text"]
                 # F10：畸形消息（非法 JSON / 未知类型 / 字段形状不对）只丢弃
                 # 该条并告警，不得让整条隧道断连注销（断连会让全部在途请求悬挂）。
                 # 0.7.3 起热路径消息走 parse_message_fast 轻校验（ValueError 同样在此捕获）
@@ -1551,6 +1564,34 @@ class TunnelServer:
                 # 仅当注册表仍指向当前连接时才注销——force 抢占后
                 # 注册表已是新连接，旧连接的退出不得误删（0.6.1 回归修复）
                 await self.manager.unregister(token, websocket=websocket)
+
+    async def _handle_ws_binary_message(
+        self, token: str | None, tunnel_domain: str | None, payload: bytes
+    ) -> None:
+        """处理 WS binary 消息（协议 v2 binary_frames，能力门控）
+
+        - 未协商该能力的连接收到 binary → warning + 丢弃（F10 语义，不断连）
+        - 畸形帧（版本/类型/长度不对）→ warning + 丢弃
+        - 解出 conn_id + payload 后与 TcpDataMessage 的 JSON 路径汇合：
+          同样的跨隧道归属校验 + _route_tcp_payload 落地
+        """
+        conn = self.manager.get_connection_by_token(token) if token else None
+        if conn is None or "binary_frames" not in conn.capabilities:
+            logger.warning("未协商 binary_frames，收到 WS 二进制消息已丢弃")
+            return
+        try:
+            conn_id, data = decode_tcp_data_frame(payload)
+        except ValueError as e:
+            logger.warning(f"丢弃畸形 binary 帧: {e}")
+            return
+        if self._reject_cross_tunnel_message(
+            "tcp_data",
+            conn_id,
+            self.manager.get_tcp_owner_domain(conn_id),
+            tunnel_domain,
+        ):
+            return
+        await self._route_tcp_payload(conn_id, data)
 
     def _verify_jwt_token(self, authorization: str | None) -> dict | None:
         """验证 JWT Bearer token，返回 payload 或 None"""
@@ -2901,16 +2942,29 @@ class TunnelServer:
                 if domain:
                     self._count_tunnel_bytes(domain, "bytes_out", len(data))
 
-                # 编码并发送（数据面快速路径：手工 dict，wire 键集不变）
-                await websocket.send_text(
-                    dump_payload(
-                        tcp_data_payload(
-                            conn_id,
-                            base64.b64encode(data).decode("ascii"),
-                            sequence,
+                # 协议 v2 binary_frames（T2）：该隧道连接协商了该能力时发 WS binary
+                # 帧（去 base64+JSON 开销）。能力从 ActiveConnection（经 manager 按
+                # domain 查询）取——断线/被接管后查不到时回落 JSON 路径（0.7.x wire
+                # 不变）并记 debug 日志。
+                conn = self.manager.get_connection_by_domain(domain) if domain else None
+                if conn is not None and "binary_frames" in conn.capabilities:
+                    await websocket.send_bytes(encode_tcp_data_frame(conn_id, data))
+                else:
+                    if conn is None:
+                        logger.debug(
+                            f"binary_frames 未启用（查不到 ActiveConnection），"
+                            f"回落 JSON 帧: conn_id={conn_id}"
+                        )
+                    # 编码并发送（数据面快速路径：手工 dict，wire 键集不变）
+                    await websocket.send_text(
+                        dump_payload(
+                            tcp_data_payload(
+                                conn_id,
+                                base64.b64encode(data).decode("ascii"),
+                                sequence,
+                            )
                         )
                     )
-                )
                 sequence += 1
                 logger.debug(f"TCP->WS: conn_id={conn_id}, size={len(data)}, seq={sequence}")
         except asyncio.CancelledError:
@@ -2922,32 +2976,39 @@ class TunnelServer:
 
     async def _handle_tcp_data_from_client(self, message: TcpDataMessage) -> None:
         """
-        处理从客户端接收的 TCP 数据
+        处理从客户端接收的 TCP 数据（JSON 形态，base64）
 
-        两种场景:
-        1. HTTP 触发的 TCP 转发 -> 累积到 PendingTcpRequest
-        2. 服务端 TCP 监听 -> 写入到真实 TCP 连接
+        解 base64 后与 binary_frames 帧路径共用 _route_tcp_payload 落地。
         """
         import base64
 
         try:
             data = base64.b64decode(message.data)
-
-            # 优先检查是否有待响应的 HTTP 触发的 TCP 转发
-            if await self.manager.handle_tcp_response_data(message.conn_id, data):
-                logger.debug(f"TCP 响应数据累积: conn_id={message.conn_id}, size={len(data)}")
-                return
-
-            # 其次检查是否有真实 TCP 连接（服务端监听场景）
-            success = await self.manager.handle_tcp_data(message.conn_id, data)
-            if success:
-                tcp_conn = await self.manager.get_tcp_connection(message.conn_id)
-                if tcp_conn and tcp_conn.domain:
-                    self._count_tunnel_bytes(tcp_conn.domain, "bytes_in", len(data))
-            else:
-                logger.warning(f"无法路由 TCP 数据: conn_id={message.conn_id}")
+            await self._route_tcp_payload(message.conn_id, data)
         except Exception as e:
             logger.error(f"处理 TCP 数据错误: {message.conn_id}, {e}")
+
+    async def _route_tcp_payload(self, conn_id: str, data: bytes) -> None:
+        """
+        tcp_data 落地路由（JSON TcpDataMessage 与 binary 帧两路共用）
+
+        两种场景:
+        1. HTTP 触发的 TCP 转发 -> 累积到 PendingTcpRequest
+        2. 服务端 TCP 监听 -> 写入到真实 TCP 连接
+        """
+        # 优先检查是否有待响应的 HTTP 触发的 TCP 转发
+        if await self.manager.handle_tcp_response_data(conn_id, data):
+            logger.debug(f"TCP 响应数据累积: conn_id={conn_id}, size={len(data)}")
+            return
+
+        # 其次检查是否有真实 TCP 连接（服务端监听场景）
+        success = await self.manager.handle_tcp_data(conn_id, data)
+        if success:
+            tcp_conn = await self.manager.get_tcp_connection(conn_id)
+            if tcp_conn and tcp_conn.domain:
+                self._count_tunnel_bytes(tcp_conn.domain, "bytes_in", len(data))
+        else:
+            logger.warning(f"无法路由 TCP 数据: conn_id={conn_id}")
 
     async def _handle_tcp_close_from_client(self, message: TcpCloseMessage) -> None:
         """

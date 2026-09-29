@@ -88,8 +88,25 @@ def _make_ws(receive_texts: list[str]) -> AsyncMock:
     mock_ws.accept = AsyncMock()
     mock_ws.send_text = AsyncMock()
     mock_ws.close = AsyncMock()
-    mock_ws.receive_text = AsyncMock(side_effect=receive_texts)
+    # 0.8.0 binary_frames 起：auth 阶段走 receive_text（首条 auth），
+    # 消息循环改 receive() 分派 text/binary——循环期消息以 ASGI dict 形态喂入
+    mock_ws.receive_text = AsyncMock(side_effect=[receive_texts[0]])
+    mock_ws.receive = AsyncMock(side_effect=_asgi_ws_messages(receive_texts[1:]))
     return mock_ws
+
+
+def _asgi_ws_messages(items: list):
+    """旧 receive_text side_effect 列表 → receive() 的 ASGI 消息形态：
+
+    str → {"type": "websocket.receive", "text": ...}；
+    Exception 实例（如 WebSocketDisconnect）原样保留（side_effect 抛出）。"""
+    out = []
+    for item in items:
+        if isinstance(item, BaseException):
+            out.append(item)
+        else:
+            out.append({"type": "websocket.receive", "text": item})
+    return out
 
 
 def _make_db_repo(get_by_token_return=None) -> tuple[MagicMock, AsyncMock]:

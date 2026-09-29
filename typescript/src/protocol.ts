@@ -41,7 +41,7 @@ export interface AuthMessage {
   /**
    * 协议 v2 能力协商：客户端支持的能力。缺省/空数组 = 不声明任何能力。
    * 铁律：客户端只许声明自己已实现的能力（声明了没实现 = 事故）。
-   * 本期（T1）客户端一律不声明——createAuthMessage 不设置该字段。
+   * T2 起客户端声明 ['binary_frames']（见 CLIENT_CAPABILITIES）。
    */
   capabilities?: string[];
 }
@@ -167,13 +167,25 @@ export type Message =
 
 // ============== 辅助函数 ==============
 
-export function createAuthMessage(token: string, force: boolean = false): AuthMessage {
+/**
+ * 本客户端已实现并声明的能力（协议 v2 能力协商）。
+ * 铁律：只许声明已实现的能力（声明了没实现 = 服务端会用而客户端解析不了 = 事故）。
+ * T2 起实现 binary_frames，故声明之；新能力实现后在此追加。
+ */
+export const CLIENT_CAPABILITIES: string[] = ['binary_frames'];
+
+export function createAuthMessage(
+  token: string,
+  force: boolean = false,
+  capabilities: string[] = CLIENT_CAPABILITIES
+): AuthMessage {
   return {
     type: MessageType.AUTH,
     token,
     // 真实版本上报（服务端 /api/tunnels 用于升级核对）；历史版本硬编码 '0.1.0' 是假值
     client_version: CLIENT_VERSION,
     force,
+    capabilities,
   };
 }
 

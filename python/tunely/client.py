@@ -48,6 +48,8 @@ from .protocol import (
     TcpConnectMessage,
     TcpDataMessage,
     TcpCloseMessage,
+    decode_tcp_data_frame,
+    encode_tcp_data_frame,
     parse_message,
     parse_message_fast,
     stream_chunk_payload,
@@ -84,7 +86,8 @@ class TcpConnection:
     """
 
     def __init__(self, conn_id: str, target_host: str, target_port: int, websocket,
-                 on_closed: Optional[Callable[["TcpConnection"], None]] = None):
+                 on_closed: Optional[Callable[["TcpConnection"], None]] = None,
+                 binary_frames: bool = False):
         """
         初始化 TCP 连接
         
@@ -94,12 +97,15 @@ class TcpConnection:
             target_port: 目标端口
             websocket: WebSocket 连接（用于发送数据回服务端）
             on_closed: 读取结束（EOF/错误）后的清理回调（F6：从客户端连接表移除，防 fd 泄漏）
+            binary_frames: 本连接是否协商了 binary_frames 能力（协议 v2；
+                启用时 tcp_data 走 WS 二进制帧，否则 JSON+base64）
         """
         self.conn_id = conn_id
         self.target_host = target_host
         self.target_port = target_port
         self._websocket = websocket
         self._on_closed = on_closed
+        self._binary_frames = binary_frames
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._read_task: Optional[asyncio.Task] = None
@@ -165,8 +171,15 @@ class TcpConnection:
                 logger.error(f"TCP 连接清理回调失败: {self.conn_id}, {e}")
 
     async def _send_data(self, data: bytes) -> None:
-        """发送数据到服务端（数据面快速路径：手工 dict，wire 键集不变）"""
+        """发送数据到服务端
+
+        协商 binary_frames 时发 WS 二进制帧（协议 v2，去 base64+JSON 开销）；
+        否则走 0.7.3 的 JSON 路径（数据面快速路径：手工 dict，wire 键集不变）。
+        """
         try:
+            if self._binary_frames:
+                await self._websocket.send(encode_tcp_data_frame(self.conn_id, data))
+                return
             message = tcp_data_payload(
                 self.conn_id,
                 base64.b64encode(data).decode("ascii"),
@@ -271,6 +284,9 @@ class TunnelClient:
         self._connected = False
         self._domain: str | None = None
         self._reconnect_count = 0
+        # 协议 v2 能力协商结果（AuthOk.capabilities 的本连接快照；
+        # 重连重新认证后刷新，断线后按新连接语义重建）
+        self._negotiated: frozenset[str] = frozenset()
 
         # 实例级共享 httpx 客户端（0.7.3：连接池跨请求/重连复用；
         # 0.7.2 及之前每请求新建 AsyncClient，TLS 握手无法复用）
@@ -386,6 +402,15 @@ class TunnelClient:
             except Exception:
                 return "unknown"
 
+    @staticmethod
+    def _client_capabilities() -> list[str]:
+        """本客户端已实现并声明的能力（协议 v2 能力协商）。
+
+        铁律：只许声明已实现的能力（声明了没实现 = 服务端会用而客户端解析不了）。
+        T2 起实现 binary_frames，故声明之；新能力实现后在此追加。
+        """
+        return ["binary_frames"]
+
     async def _connect_and_run(self) -> None:
         """连接并运行"""
         logger.info(f"正在连接到 {self.config.server_url}...")
@@ -402,6 +427,7 @@ class TunnelClient:
                 token=self.config.token,
                 client_version=self._client_version(),
                 force=self.config.force,
+                capabilities=self._client_capabilities(),
             )
             await websocket.send(auth_message.model_dump_json())
 
@@ -418,6 +444,11 @@ class TunnelClient:
 
             if isinstance(response, AuthOkMessage):
                 self._domain = response.domain
+                # 协议 v2：协商结果 = AuthOk.capabilities（缺字段 = 空集合，
+                # 旧服务端不带该字段时全 JSON，行为与 0.7.3 一致）
+                self._negotiated = frozenset(
+                    getattr(response, "capabilities", None) or ()
+                )
                 self._connected = True
                 self._reconnect_count = 0
 
@@ -433,6 +464,21 @@ class TunnelClient:
         """消息处理循环"""
         async for raw_message in websocket:
             try:
+                # 协议 v2 binary_frames：websockets 库迭代中 bytes = 二进制消息
+                # （str = 文本消息）。协商了该能力才解帧路由；未协商收到 bytes →
+                # 丢弃 + warning（F10 语义，不断连）。
+                if isinstance(raw_message, bytes):
+                    if "binary_frames" not in self._negotiated:
+                        logger.warning("未协商 binary_frames，收到 WS 二进制消息已丢弃")
+                        continue
+                    try:
+                        conn_id, data = decode_tcp_data_frame(raw_message)
+                    except ValueError as e:
+                        logger.warning(f"丢弃畸形 binary 帧: {e}")
+                        continue
+                    await self._route_tcp_payload(conn_id, data)
+                    continue
+
                 # 热路径解析（轻校验直构；畸形消息走下方异常分支丢弃）
                 message = parse_message_fast(raw_message)
 
@@ -654,6 +700,7 @@ class TunnelClient:
             target_port=self._target_port,
             websocket=websocket,
             on_closed=self._remove_tcp_connection,
+            binary_frames="binary_frames" in self._negotiated,
         )
         
         # 尝试连接
@@ -677,20 +724,40 @@ class TunnelClient:
 
     async def _handle_tcp_data(self, message: TcpDataMessage) -> None:
         """
-        处理 TCP 数据传输
-        
-        将数据写入到对应的 TCP 连接
+        处理 TCP 数据传输（JSON 形态，base64）
+
+        解 base64 后与 binary_frames 帧路径共用 _route_tcp_payload 落地。
         """
         conn_id = message.conn_id
         conn = self._tcp_connections.get(conn_id)
-        
+
         if not conn:
             logger.warning(f"收到未知连接的数据: {conn_id}")
             return
-        
+
         try:
             # 解码 base64 数据
             data = base64.b64decode(message.data)
+            await self._route_tcp_payload(conn_id, data, conn=conn)
+        except Exception as e:
+            logger.error(f"处理 TCP 数据错误: {conn_id}, {e}")
+            await conn.close(str(e))
+
+    async def _route_tcp_payload(
+        self, conn_id: str, data: bytes, conn: "TcpConnection | None" = None
+    ) -> None:
+        """
+        tcp_data 落地写入（JSON 与 binary 帧两路共用）
+
+        将数据写入对应的 TCP 连接；conn 传入时免二次查表（JSON 路径
+        需要连接对象做错误收尾，binary 路径查不到连接按未知连接丢弃）。
+        """
+        if conn is None:
+            conn = self._tcp_connections.get(conn_id)
+            if not conn:
+                logger.warning(f"收到未知连接的数据: {conn_id}")
+                return
+        try:
             await conn.write_data(data)
         except Exception as e:
             logger.error(f"处理 TCP 数据错误: {conn_id}, {e}")

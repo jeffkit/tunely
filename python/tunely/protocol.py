@@ -16,6 +16,7 @@ WS-Tunnel 协议定义
 """
 
 import json
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -577,3 +578,49 @@ def parse_message_fast(raw: str | bytes) -> BaseModel:
 
     # 冷门/未知类型：全量 pydantic 校验（ValidationError ⊂ ValueError，F10 兼容）
     return parse_message(data)
+
+
+# ============== binary_frames 帧编解码（协议 v2 T2，docs/PROTOCOL_V2.md §1） ==============
+#
+# WS binary 帧（仅 tcp_data 一个类型）：
+#   [0x02]     1B  协议版本标记（v2）
+#   [0x01]     1B  帧类型：0x01 = tcp_data
+#   [16B]      conn_id，UUID v4 原始字节（JSON 控制面仍是 36 字符串形式）
+#   [payload]  原始字节（无 base64、无 JSON、无 sequence——WS 有序，接收侧不依赖）
+#
+# tcp_close 保持 JSON（低频、携带 error）。解码遇版本/类型/长度不对抛 ValueError，
+# 调用方按畸形帧丢弃（F10 语义）。
+
+FRAME_PROTOCOL_VERSION = 0x02
+FRAME_TYPE_TCP_DATA = 0x01
+_FRAME_HEADER_LEN = 18  # 1B version + 1B type + 16B conn_id
+
+
+def encode_tcp_data_frame(conn_id: str, payload: bytes) -> bytes:
+    """tcp_data 二进制帧编码：0x02 0x01 + UUID 原始字节 + 原始 payload
+
+    conn_id 为 JSON 控制面的 36 字符 UUID 字符串；非 UUID 字符串抛 ValueError。
+    """
+    return (
+        bytes((FRAME_PROTOCOL_VERSION, FRAME_TYPE_TCP_DATA))
+        + uuid.UUID(conn_id).bytes
+        + bytes(payload)
+    )
+
+
+def decode_tcp_data_frame(frame: bytes) -> tuple[str, bytes]:
+    """tcp_data 二进制帧解码 → (conn_id 36 字符串, payload 原始字节)
+
+    版本/类型/长度不对抛 ValueError（调用方按畸形帧丢弃，F10 语义）；
+    conn_id 16 字节不校验版本位（与 uuid.UUID(bytes=...) 语义一致）。
+    """
+    if not isinstance(frame, (bytes, bytearray, memoryview)):
+        raise ValueError("invalid frame: not bytes")
+    if len(frame) < _FRAME_HEADER_LEN:
+        raise ValueError(f"invalid frame: too short ({len(frame)})")
+    if frame[0] != FRAME_PROTOCOL_VERSION:
+        raise ValueError(f"invalid frame: unsupported version 0x{frame[0]:02x}")
+    if frame[1] != FRAME_TYPE_TCP_DATA:
+        raise ValueError(f"invalid frame: unsupported type 0x{frame[1]:02x}")
+    conn_id = str(uuid.UUID(bytes=bytes(frame[2:_FRAME_HEADER_LEN])))
+    return conn_id, bytes(frame[_FRAME_HEADER_LEN:])

@@ -323,12 +323,11 @@ class TestFireAndForgetNonBlocking:
         mock_ws.close = AsyncMock()
 
         auth_msg = AuthMessage(token="valid-token")
-        # 第一次返回 auth，第二次模拟 disconnect
+        # auth 走 receive_text；0.8.0 binary_frames 起消息循环走 receive()（此处直接断连）
         from fastapi import WebSocketDisconnect
 
-        mock_ws.receive_text = AsyncMock(
-            side_effect=[auth_msg.model_dump_json(), WebSocketDisconnect()]
-        )
+        mock_ws.receive_text = AsyncMock(side_effect=[auth_msg.model_dump_json()])
+        mock_ws.receive = AsyncMock(side_effect=[WebSocketDisconnect()])
 
         # mock DB 返回有效 tunnel
         mock_tunnel = MagicMock()

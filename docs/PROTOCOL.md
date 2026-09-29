@@ -320,11 +320,27 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 
 | 能力名 | 说明 | 状态 |
 |--------|------|------|
-| `binary_frames` | 数据面（`tcp_data`）改走 WS binary 帧，去掉 base64+JSON 开销 | 规划中（未注册） |
+| `binary_frames` | 数据面（`tcp_data`）改走 WS binary 帧，去掉 base64+JSON 开销 | 已注册（v2 T2，见下节） |
 | `chunked_http` | 非 SSE 大响应按 `stream_start/chunk/end` 分块流式 | 规划中（未注册） |
 
 > 状态为「规划中」的能力尚未进服务端注册表（`SERVER_CAPABILITIES`），声明了也不会被协商启用；
-> 实现落地后由服务端注册并同步本表。当前注册表为空列表。
+> 实现落地后由服务端注册并同步本表。当前注册表：`["binary_frames"]`。
+
+### binary_frames 帧格式（已落地）
+
+协商启用的连接上，`tcp_data` 双向改走 WS **binary** 帧（`tcp_close` 保持 JSON——低频且携带 error）：
+
+```
+[0x02]     1B  协议版本标记（v2）
+[0x01]     1B  帧类型：0x01 = tcp_data（当前唯一类型）
+[16B]      conn_id，UUID v4 原始字节（JSON 控制面仍是 36 字符串形式）
+[payload]  原始字节（无 base64、无 JSON）
+```
+
+- `sequence` 不进二进制帧：WS 消息本身有序，接收侧本就不依赖；
+- 双向都用：服务端 TCP 读循环（外部→客户端）与客户端 TCP 读循环（目标→服务端）在能力启用时发 binary 帧；
+- **未协商连接收到 binary 帧 → 丢弃 + warning**（F10 语义，不断连）；畸形帧（版本/类型/长度不对）同样丢弃；
+- 未协商路径的 wire 行为与 1.x 完全一致（JSON + base64）。
 
 ## 连接流程（HTTP 模式）
 
@@ -389,6 +405,7 @@ Client                                  Server
 
 ## 版本历史
 
-- **2.0**：能力协商机制先行（`auth`/`auth_ok` 增加可选 `capabilities`，缺字段 = 空集合，只回交集）；二进制帧等新帧格式随后续任务逐能力落地。
+- **2.0**：能力协商机制（`auth`/`auth_ok` 增加可选 `capabilities`，缺字段 = 空集合，只回交集）；
+  首个能力 `binary_frames` 落地（`tcp_data` 双向改走 WS binary 帧，`tcp_close` 保持 JSON，未协商行为不变）。
 - **1.1**：新增 SSE 流式响应消息（`stream_start` / `stream_chunk` / `stream_end`）与 TCP 透传消息（`tcp_connect` / `tcp_data` / `tcp_close`）；`auth` 增加 `force` 抢占字段。
 - **1.0**：认证、HTTP 请求-响应、心跳。

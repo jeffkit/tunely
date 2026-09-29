@@ -26,6 +26,7 @@ import {
   TcpDataMessage,
   TcpCloseMessage,
 } from './protocol.js';
+import { decodeTcpDataFrame, encodeTcpDataFrame } from './framing.js';
 
 export interface TunnelClientConfig {
   /** 服务端 WebSocket URL */
@@ -108,6 +109,9 @@ export class TunnelClient {
   private running = false;
   private connected = false;
   private domain: string | null = null;
+  // 协议 v2 能力协商结果（AuthOk.capabilities 的本连接快照；
+  // 重连重新认证后刷新，断开时清空——旧连接的能力不带入新连接）
+  private negotiated: Set<string> = new Set();
   private reconnectCount = 0;
   private consecutiveRejectCount = 0;
   private wasConnectedBefore = false;
@@ -263,8 +267,16 @@ export class TunnelClient {
         ws.send(JSON.stringify(authMessage));
       });
 
-      ws.on('message', async (data: Buffer) => {
+      // ws 库回调第三参 isBinary 区分文本（JSON 控制面/数据面）/二进制
+      // （binary_frames 数据面帧）。mock 测试只 emit 单参（isBinary=undefined
+      // → 按 text 处理），与既有测试兼容。
+      ws.on('message', async (data: Buffer, isBinary?: boolean) => {
         try {
+          // 协议 v2 binary_frames：二进制消息 = tcp_data 帧（仅协商连接处理）
+          if (isBinary) {
+            this.handleBinaryMessage(data);
+            return;
+          }
           const message = parseMessage(data.toString());
 
           switch (message.type) {
@@ -315,6 +327,8 @@ export class TunnelClient {
         clearInterval(keepaliveTimer);
         // WebSocket 断开后服务端会重新分配 conn_id，旧本地连接全部丢弃，防止泄漏
         this.cleanupTcpConnections();
+        // 协商结果属于单条连接：断开后清空，重连重新认证协商
+        this.negotiated = new Set();
         // 无论是正常关闭还是异常关闭，只要之前是已认证状态，都需要触发 onDisconnect
         // 否则调用方（如 tunnelService）的状态会停留在 connected=true，导致 UI 显示误连接。
         // F12：close handler 与 run 循环两条路径都会到达 notifyDisconnect，
@@ -334,6 +348,9 @@ export class TunnelClient {
 
   private handleAuthOk(message: AuthOkMessage): void {
     this.domain = message.domain;
+    // 协议 v2：协商结果 = AuthOk.capabilities（缺字段 = 空集合，旧服务端
+    // 不带该字段时全 JSON，行为与 0.7.x 一致）
+    this.negotiated = new Set(message.capabilities ?? []);
     this.connected = true;
     this.wasConnectedBefore = true;
     this.reconnectCount = 0;
@@ -633,6 +650,16 @@ export class TunnelClient {
     this.tcpConnections.set(connId, state);
 
     state.socket.on('data', (data: Buffer) => {
+      // 协议 v2 binary_frames：协商了就组二进制帧直发（去 base64+JSON 开销）；
+      // 否则走 0.7.x 的 JSON+base64 路径（wire 不变）。
+      if (this.negotiated.has('binary_frames')) {
+        const frame = encodeTcpDataFrame(connId, data);
+        // 经串行链发送：WS 背压等待时不乱序，也保证 tcp_close 不会插队到 tcp_data 前
+        state.sendChain = state.sendChain
+          .then(() => this.sendToWs(ws, frame))
+          .catch(() => {});
+        return;
+      }
       const msg: TcpDataMessage = {
         type: MessageType.TCP_DATA,
         conn_id: connId,
@@ -663,19 +690,27 @@ export class TunnelClient {
   }
 
   /**
-   * 处理来自服务端的 TCP 数据：解码后写入本地连接
+   * 处理来自服务端的 TCP 数据（JSON 形态，base64）：解码后与 binary 帧路径
+   * 共用 routeTcpPayload 落地。
+   */
+  private handleTcpData(message: TcpDataMessage): void {
+    const data = Buffer.from(message.data, 'base64');
+    this.routeTcpPayload(message.conn_id, data);
+  }
+
+  /**
+   * tcp_data 落地写入本地连接（JSON 与 binary 帧两路共用）
    *
    * 写入走串行链：socket.write() 返回 false（内核缓冲满）时等一次 'drain' 再写下一批，
    * 防止对慢速目标无界缓冲，同时保持写入顺序。
    */
-  private handleTcpData(message: TcpDataMessage): void {
-    const state = this.tcpConnections.get(message.conn_id);
+  private routeTcpPayload(connId: string, data: Buffer): void {
+    const state = this.tcpConnections.get(connId);
     if (!state) {
-      console.warn(`收到未知 TCP 连接的数据: ${message.conn_id}`);
+      console.warn(`收到未知 TCP 连接的数据: ${connId}`);
       return;
     }
 
-    const data = Buffer.from(message.data, 'base64');
     state.writeChain = state.writeChain
       .then(async () => {
         if (!state.socket.write(data)) {
@@ -683,6 +718,27 @@ export class TunnelClient {
         }
       })
       .catch(() => {});
+  }
+
+  /**
+   * WS 二进制消息分派（协议 v2 binary_frames，能力门控）：
+   * 未协商收到 binary → 丢弃 + warning；畸形帧 → 丢弃 + warning；
+   * 解出 conn_id + payload 后与 JSON tcp_data 路径汇合同一落地函数。
+   */
+  private handleBinaryMessage(data: Buffer): void {
+    if (!this.negotiated.has('binary_frames')) {
+      console.warn('未协商 binary_frames，收到 WS 二进制消息已丢弃');
+      return;
+    }
+    let connId: string;
+    let payload: Uint8Array;
+    try {
+      ({ connId, payload } = decodeTcpDataFrame(data));
+    } catch (error) {
+      console.warn(`丢弃畸形 binary 帧: ${error}`);
+      return;
+    }
+    this.routeTcpPayload(connId, Buffer.from(payload));
   }
 
   /**
@@ -741,8 +797,9 @@ export class TunnelClient {
   /**
    * WS 发送背压（F: 发送端无界缓冲）：出站缓冲超过 WS_MAX_BUFFERED_AMOUNT 时
    * 循环等待回落后再发送；连接不再 OPEN 时放弃发送（由 close 路径统一收尾）。
+   * data 为 string（JSON 文本）或 Buffer（binary_frames 二进制帧）。
    */
-  private async sendToWs(ws: WebSocket, data: string): Promise<void> {
+  private async sendToWs(ws: WebSocket, data: string | Buffer): Promise<void> {
     if (!(await this.awaitWsWritable(ws))) {
       return;
     }
