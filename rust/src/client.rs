@@ -240,6 +240,15 @@ impl TunnelClient {
         self.running.store(true, Ordering::SeqCst);
         let state = Arc::new(RunState::default());
         let (target_host, target_port) = parse_target(&self.config.target_url);
+        // parse_target 对无 scheme 输入（如 "127.0.0.1:8902" 会被 URL 解析当 scheme）
+        // 静默回退 localhost:8080——历史上吃过亏，这里把解析结果亮出来
+        if session_target_looks_suspicious(&self.config.target_url, &target_host, target_port) {
+            warn(format!(
+                "target 解析可疑: config='{}' -> {}:{}（target 需带 scheme，如 http://host:port）",
+                self.config.target_url, target_host, target_port
+            ));
+        }
+        info(format!("目标解析: {}:{} (from '{}')", target_host, target_port, self.config.target_url));
         let target_base = self.config.target_url.trim_end_matches('/').to_string();
 
         while self.running.load(Ordering::SeqCst) {
@@ -886,6 +895,11 @@ async fn cleanup_tcp(session: &Session) {
 /// UDP 会话接收缓冲区大小：对齐主流 MTU 上限之上的裕量（jumbogram 罕见，
 /// 更大数据报会被截断——UDP 语义下可接受）
 const UDP_RECV_BUF_SIZE: usize = 65536;
+
+/// target 解析可疑判定：解析结果落回默认值而配置串并不是明示的 localhost:8080
+fn session_target_looks_suspicious(target_url: &str, host: &str, port: u16) -> bool {
+    host == "localhost" && port == 8080 && !target_url.contains("localhost")
+}
 
 /// 处理 udp_open（服务端 → 客户端）：建到目标的 UDP socket（每会话一个）
 /// + 起收包任务（回包组 0x03 帧回服务端）。
