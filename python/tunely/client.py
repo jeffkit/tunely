@@ -355,6 +355,24 @@ class TunnelClient:
         if self._websocket:
             await self._websocket.close()
 
+    @staticmethod
+    def _client_version() -> str:
+        """真实客户端版本（服务端记录用于升级核对；历史版本不传被默认成假值 0.1.0）
+
+        优先取执行代码自身的 tunely.__version__（install 元数据可能过期谎报）。
+        """
+        try:
+            import tunely
+
+            return tunely.__version__
+        except Exception:
+            try:
+                from importlib.metadata import version as _pkg_version
+
+                return _pkg_version("tunely")
+            except Exception:
+                return "unknown"
+
     async def _connect_and_run(self) -> None:
         """连接并运行"""
         logger.info(f"正在连接到 {self.config.server_url}...")
@@ -369,6 +387,7 @@ class TunnelClient:
             # 发送认证
             auth_message = AuthMessage(
                 token=self.config.token,
+                client_version=self._client_version(),
                 force=self.config.force,
             )
             await websocket.send(auth_message.model_dump_json())

@@ -140,11 +140,11 @@ systemctl restart tunely-server
 
 ## 8. 验收清单
 
-**0.7.2（第 1 级）**
-- [ ] AuthOk 携带真实 server_version；`/api/tunnels` 暴露各隧道 client_version
-- [ ] TS/py 客户端上报真实版本；rust `client_version` 加 `#[serde(default)]`
-- [ ] TS conformance 精确键集断言同步更新；三端测试全绿
-- [ ] 真机核对：升完后 `/api/tunnels` 三条隧道版本号=最新（这是本方案第一次可查询的"同时更新"验证）
+**0.7.2（第 1 级）——已实现（2026-09-28）**
+- [x] AuthOk 携带真实 server_version；`/api/tunnels` 暴露各隧道 client_version（未连接 None）
+- [x] TS/py 客户端上报真实版本（TS 经 src/version.ts 常量+防漂移测试；py 读 tunely.__version__，install 元数据可能过期谎报故不作首选）；rust `client_version` 加 `#[serde(default)]`
+- [x] TS conformance 防漂移测试（CLIENT_VERSION == package.json.version）；三端测试全绿（py 288 / TS 55 / rust 44）
+- [ ] 真机核对：部署 0.7.2 后 `/api/tunnels` 三条隧道版本号=最新（部署时执行）
 
 **推迟项动工时**
 - [ ] capabilities："缺失=空集合"写入 PROTOCOL.md；服务端只回交集

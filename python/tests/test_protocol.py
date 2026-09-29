@@ -27,7 +27,8 @@ class TestMessageTypes:
         msg = AuthMessage(token="test_token")
         assert msg.type == MessageType.AUTH
         assert msg.token == "test_token"
-        assert msg.client_version == "0.1.0"
+        # 0.7.2 起：不传版本报 unknown（历史默认值 0.1.0 是假值，服务端无法据此核对）
+        assert msg.client_version == "unknown"
 
     def test_auth_ok_message(self):
         """测试认证成功消息"""

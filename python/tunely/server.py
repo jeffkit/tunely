@@ -147,6 +147,10 @@ class ActiveConnection:
     # 隧道转发模式（注册时从 DB 行读取一次缓存；forward 路由用，避免每请求查库。
     # token 轮换/隧道删除后连接仍存活时，沿用缓存值，行为兼容）
     mode: str = "http"
+    # 客户端自报版本（AuthMessage.client_version；缺省 unknown）。
+    # 用于升级前核对现网客户端版本分布（ROLLING_UPGRADE.md 0.7.2）。
+    # 注意：历史 TS/py 客户端曾硬编码/默认 "0.1.0"，该值不可信到 0.2.7/0.7.2 前
+    client_version: str = "unknown"
     connected_at: datetime = field(default_factory=datetime.now)
     last_heartbeat: datetime = field(default_factory=datetime.now)
 
@@ -270,6 +274,8 @@ class TunnelInfo(BaseModel):
     created_at: str | None = None
     last_connected_at: str | None = None
     total_requests: int = 0
+    # 当前连接客户端的自报版本（未连接时 None；历史客户端可能报假值 0.1.0）
+    client_version: str | None = None
 
 
 class UpdateTunnelRequest(BaseModel):
@@ -360,6 +366,7 @@ class TunnelManager:
         token: str,
         force: bool = False,
         mode: str = "http",
+        client_version: str = "unknown",
     ) -> tuple[bool, str | None]:
         """
         注册隧道连接
@@ -371,6 +378,7 @@ class TunnelManager:
             token: 隧道令牌
             force: 是否强制抢占已有连接
             mode: 隧道转发模式（http/tcp，注册时从 DB 读一次缓存，forward 路由用）
+            client_version: 客户端自报版本（AuthMessage.client_version）
 
         Returns:
             (success, error_message) - 成功返回 (True, None)，失败返回 (False, error_message)
@@ -409,6 +417,7 @@ class TunnelManager:
                 domain=domain,
                 token=token,
                 mode=mode if mode in ("http", "tcp") else "http",
+                client_version=client_version or "unknown",
             )
             self._connections[token] = conn
             self._domain_token_map[domain] = token
@@ -508,6 +517,11 @@ class TunnelManager:
     def is_connected(self, domain: str) -> bool:
         """检查域名是否已连接"""
         return domain in self._domain_token_map
+
+    def get_client_version(self, domain: str) -> str | None:
+        """获取隧道的客户端自报版本（未连接返回 None）"""
+        conn = self.get_connection_by_domain(domain)
+        return conn.client_version if conn else None
 
     def list_connected_domains(self) -> list[str]:
         """列出所有已连接的域名"""
@@ -1127,12 +1141,8 @@ class TunnelServer:
         async def get_server_info():
             """获取服务信息和域名配置规则"""
             ws_url = self.config.ws_url or f"wss://{self.config.domain}{self.config.ws_path}"
-            
-            try:
-                from importlib.metadata import version as _pkg_version
-                server_version = _pkg_version("tunely")
-            except Exception:
-                server_version = "unknown"
+
+            server_version = self._server_version()
             result: dict[str, Any] = {
                 "name": "Tunely Server",
                 "version": server_version,
@@ -1155,6 +1165,25 @@ class TunnelServer:
                 result["instruction"] = self.config.instruction
             
             return result
+
+    @staticmethod
+    def _server_version() -> str:
+        """真实服务端版本（AuthOk.server_version 与 /api/info 同源，0.7.2 起不再谎报 0.1.0）
+
+        优先取执行代码自身的 tunely.__version__（install 元数据可能过期谎报），
+        取不到再退 importlib.metadata。
+        """
+        try:
+            import tunely
+
+            return tunely.__version__
+        except Exception:
+            try:
+                from importlib.metadata import version as _pkg_version
+
+                return _pkg_version("tunely")
+            except Exception:
+                return "unknown"
 
     def _check_admin_api_key(self, api_key: str | None) -> None:
         """检查管理 API 密钥（常数时间比较，防时序侧信道）"""
@@ -1330,6 +1359,7 @@ class TunnelServer:
                     token=token,
                     force=force,
                     mode=tunnel_mode,
+                    client_version=getattr(message, "client_version", None) or "unknown",
                 )
 
                 if not success:
@@ -1356,6 +1386,7 @@ class TunnelServer:
                     AuthOkMessage(
                         domain=tunnel.domain,
                         tunnel_id=str(tunnel.id),
+                        server_version=self._server_version(),
                     ).model_dump_json()
                 )
 
@@ -1600,6 +1631,7 @@ class TunnelServer:
                         t.last_connected_at.isoformat() if t.last_connected_at else None
                     ),
                     total_requests=self._live_request_count(t.domain, t.total_requests),
+                    client_version=self.manager.get_client_version(t.domain),
                 )
                 for t in tunnels
             ]
@@ -1635,6 +1667,7 @@ class TunnelServer:
                 total_requests=self._live_request_count(
                     tunnel.domain, tunnel.total_requests
                 ),
+                client_version=self.manager.get_client_version(tunnel.domain),
             )
 
     async def _update_tunnel(
@@ -1706,6 +1739,7 @@ class TunnelServer:
                 total_requests=self._live_request_count(
                     tunnel.domain, tunnel.total_requests
                 ),
+                client_version=self.manager.get_client_version(tunnel.domain),
             )
 
     async def _close_tunnel_connection(self, domain: str, reason: str) -> bool:

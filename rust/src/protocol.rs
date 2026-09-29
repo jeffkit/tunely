@@ -28,6 +28,10 @@ pub enum MessageType {
 /// 客户端版本标识（服务端仅记录）
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn default_client_version() -> String {
+    CLIENT_VERSION.to_string()
+}
+
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
@@ -43,6 +47,9 @@ pub enum Message {
     /// 客户端认证请求
     Auth {
         token: String,
+        /// 反序列化缺省时回退 CLIENT_VERSION（与 TS/py 的可选语义对称；
+        /// 发送侧恒填 CLIENT_VERSION 真实版本）
+        #[serde(default = "default_client_version")]
         client_version: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         force: bool,

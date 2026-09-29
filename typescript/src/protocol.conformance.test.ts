@@ -18,6 +18,8 @@ import {
   parseMessage,
   Message,
 } from './protocol.js';
+import { CLIENT_VERSION } from './version.js';
+import packageJson from '../package.json';
 
 /** Python 服务端风格的时间戳（ISO-8601，含微秒与 +00:00 偏移） */
 const TS = '2026-09-25T02:00:00.123456+00:00';
@@ -246,6 +248,15 @@ describe('Protocol Conformance - 心跳消息', () => {
 });
 
 describe('Protocol Conformance - 客户端序列化形状（pydantic 兼容）', () => {
+  it('CLIENT_VERSION 与 package.json 版本一致（防漂移：服务端 /api/tunnels 靠它核对升级）', () => {
+    expect(CLIENT_VERSION).toBe(packageJson.version);
+
+    const wire = JSON.stringify(createAuthMessage('tok_local'));
+    expect((parseMessage(wire) as { client_version: string }).client_version).toBe(
+      CLIENT_VERSION
+    );
+  });
+
   it('createAuthMessage：线上键为 type/token/client_version/force，force 为布尔', () => {
     const wire = JSON.stringify(createAuthMessage('tok_local', true));
     const msg = parseMessage(wire) as Extract<Message, { type: MessageType.AUTH }>;

@@ -4,6 +4,8 @@
  * 协议版本: 1.0
  */
 
+import { CLIENT_VERSION } from './version';
+
 export enum MessageType {
   // 认证
   AUTH = 'auth',
@@ -161,7 +163,8 @@ export function createAuthMessage(token: string, force: boolean = false): AuthMe
   return {
     type: MessageType.AUTH,
     token,
-    client_version: '0.1.0',
+    // 真实版本上报（服务端 /api/tunnels 用于升级核对）；历史版本硬编码 '0.1.0' 是假值
+    client_version: CLIENT_VERSION,
     force,
   };
 }

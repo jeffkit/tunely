@@ -57,7 +57,11 @@ class AuthMessage(BaseModel):
 
     type: MessageType = MessageType.AUTH
     token: str = Field(..., description="隧道令牌")
-    client_version: str = Field(default="0.1.0", description="客户端版本")
+    client_version: str = Field(
+        default="unknown",
+        description="客户端版本（服务端记录用于升级核对；客户端应显式传真实版本，"
+        "历史默认值 0.1.0 是假值，0.7.2 起改为 unknown）",
+    )
     force: bool = Field(default=False, description="是否强制抢占已有连接")
 
 
@@ -67,7 +71,10 @@ class AuthOkMessage(BaseModel):
     type: MessageType = MessageType.AUTH_OK
     domain: str = Field(..., description="分配的域名")
     tunnel_id: str = Field(..., description="隧道 ID")
-    server_version: str = Field(default="0.1.0", description="服务端版本")
+    server_version: str = Field(
+        default="0.1.0",
+        description="服务端版本（服务端发送时必填真实版本；默认值仅为兼容旧客户端解析）",
+    )
 
 
 class AuthErrorMessage(BaseModel):
