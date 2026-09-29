@@ -1,7 +1,7 @@
 /**
  * WS-Tunnel 协议定义
  *
- * 协议版本: 1.0
+ * 协议版本: 2.0（能力协商 + binary_frames + chunked_http）
  */
 
 import { CLIENT_VERSION } from './version';
