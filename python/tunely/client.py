@@ -49,6 +49,13 @@ from .protocol import (
     TcpDataMessage,
     TcpCloseMessage,
     parse_message,
+    parse_message_fast,
+    stream_chunk_payload,
+    stream_end_payload,
+    stream_start_payload,
+    tcp_close_payload,
+    tcp_data_payload,
+    dump_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,14 +165,14 @@ class TcpConnection:
                 logger.error(f"TCP 连接清理回调失败: {self.conn_id}, {e}")
 
     async def _send_data(self, data: bytes) -> None:
-        """发送数据到服务端"""
+        """发送数据到服务端（数据面快速路径：手工 dict，wire 键集不变）"""
         try:
-            message = TcpDataMessage(
-                conn_id=self.conn_id,
-                data=base64.b64encode(data).decode('ascii'),
-                sequence=self._sequence,
+            message = tcp_data_payload(
+                self.conn_id,
+                base64.b64encode(data).decode("ascii"),
+                self._sequence,
             )
-            await self._websocket.send(message.model_dump_json())
+            await self._websocket.send(dump_payload(message))
         except Exception as e:
             logger.error(f"发送 TCP 数据失败: {self.conn_id}, {e}")
 
@@ -173,13 +180,10 @@ class TcpConnection:
         """发送关闭消息到服务端"""
         if self._closed:
             return
-        
+
         try:
-            message = TcpCloseMessage(
-                conn_id=self.conn_id,
-                error=error,
-            )
-            await self._websocket.send(message.model_dump_json())
+            message = tcp_close_payload(self.conn_id, error)
+            await self._websocket.send(dump_payload(message))
         except Exception as e:
             logger.error(f"发送 TCP 关闭消息失败: {self.conn_id}, {e}")
 
@@ -201,15 +205,12 @@ class TcpConnection:
             return
         
         logger.info(f"TCP 连接关闭: {self.conn_id}")
-        
+
         # 先发送关闭消息（在设置 _closed 之前）
         if not self._closed:
             try:
-                message = TcpCloseMessage(
-                    conn_id=self.conn_id,
-                    error=error,
-                )
-                await self._websocket.send(message.model_dump_json())
+                message = tcp_close_payload(self.conn_id, error)
+                await self._websocket.send(dump_payload(message))
             except Exception as e:
                 logger.error(f"发送 TCP 关闭消息失败: {self.conn_id}, {e}")
         
@@ -270,6 +271,10 @@ class TunnelClient:
         self._connected = False
         self._domain: str | None = None
         self._reconnect_count = 0
+
+        # 实例级共享 httpx 客户端（0.7.3：连接池跨请求/重连复用；
+        # 0.7.2 及之前每请求新建 AsyncClient，TLS 握手无法复用）
+        self._http: Optional[httpx.AsyncClient] = None
 
         # TCP 连接管理（TCP 模式使用）
         self._tcp_connections: Dict[str, TcpConnection] = {}
@@ -354,6 +359,14 @@ class TunnelClient:
         self._running = False
         if self._websocket:
             await self._websocket.close()
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+
+    def _get_http(self) -> httpx.AsyncClient:
+        """共享 httpx 客户端（懒创建；超时在每请求上单独传）"""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient()
+        return self._http
 
     @staticmethod
     def _client_version() -> str:
@@ -420,8 +433,8 @@ class TunnelClient:
         """消息处理循环"""
         async for raw_message in websocket:
             try:
-                data = json.loads(raw_message)
-                message = parse_message(data)
+                # 热路径解析（轻校验直构；畸形消息走下方异常分支丢弃）
+                message = parse_message_fast(raw_message)
 
                 if isinstance(message, PingMessage):
                     # 响应心跳
@@ -486,47 +499,69 @@ class TunnelClient:
                 except json.JSONDecodeError:
                     body = request.body
 
-            # 使用 stream 模式发送请求，以便检测 SSE
-            # 配置超时：connect 30秒，read 使用请求的超时时间，write 30秒
+            # 使用共享客户端的 stream 模式发送请求，以便检测 SSE
+            # （连接池跨请求复用；超时在每请求上覆盖：connect 30s，read 用请求超时）
             timeout_config = httpx.Timeout(
                 connect=30.0,
                 read=float(request.timeout),
                 write=30.0,
                 pool=30.0,
             )
-            async with httpx.AsyncClient(timeout=timeout_config) as client:
-                async with client.stream(
-                    method=request.method,
-                    url=url,
-                    headers=request.headers,
-                    json=body if isinstance(body, (dict, list)) else None,
-                    content=body if isinstance(body, str) else None,
-                ) as response:
-                    response_headers = dict(response.headers)
-                    
-                    # 检查是否是 SSE 响应
-                    if self._is_sse_response(response_headers):
-                        # SSE 流式响应处理
-                        await self._handle_sse_response(
-                            request_id=request.id,
-                            status=response.status_code,
-                            headers=response_headers,
-                            response=response,
-                            start_time=start_time,
-                        )
-                        return None  # SSE 响应已通过流式消息发送
-                    else:
-                        # 普通响应：读取完整内容
-                        response_body = await response.aread()
-                        duration_ms = int((time.time() - start_time) * 1000)
+            async with self._get_http().stream(
+                method=request.method,
+                url=url,
+                headers=request.headers,
+                json=body if isinstance(body, (dict, list)) else None,
+                content=body if isinstance(body, str) else None,
+                timeout=timeout_config,
+            ) as response:
+                response_headers = dict(response.headers)
 
-                        return TunnelResponse(
-                            id=request.id,
-                            status=response.status_code,
-                            headers=response_headers,
-                            body=response_body.decode("utf-8", errors="replace"),
-                            duration_ms=duration_ms,
-                        )
+                # 检查是否是 SSE 响应
+                if self._is_sse_response(response_headers):
+                    # SSE 流式响应处理
+                    await self._handle_sse_response(
+                        request_id=request.id,
+                        status=response.status_code,
+                        headers=response_headers,
+                        response=response,
+                        start_time=start_time,
+                    )
+                    return None  # SSE 响应已通过流式消息发送
+                else:
+                    # 普通响应：带内存上限读取（0.7.3，超限 502 并中止；
+                    # 对齐生产服务端 cap，避免大响应先把客户端内存打爆）
+                    cap = self.config.max_response_bytes
+                    if cap > 0:
+                        chunks: list[bytes] = []
+                        total = 0
+                        too_large = False
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > cap:
+                                too_large = True
+                                break
+                            chunks.append(chunk)
+                        if too_large:
+                            return TunnelResponse(
+                                id=request.id,
+                                status=502,
+                                error=f"Response too large (> {cap} bytes, client cap)",
+                                duration_ms=int((time.time() - start_time) * 1000),
+                            )
+                        response_body = b"".join(chunks)
+                    else:
+                        response_body = await response.aread()
+
+                    duration_ms = int((time.time() - start_time) * 1000)
+
+                    return TunnelResponse(
+                        id=request.id,
+                        status=response.status_code,
+                        headers=response_headers,
+                        body=response_body.decode("utf-8", errors="replace"),
+                        duration_ms=duration_ms,
+                    )
 
         except httpx.TimeoutException:
             duration_ms = int((time.time() - start_time) * 1000)
@@ -571,27 +606,21 @@ class TunnelClient:
             return
 
         # 发送 StreamStart
-        start_msg = StreamStartMessage(
-            id=request_id,
-            status=status,
-            headers=headers,
+        await self._websocket.send(
+            dump_payload(stream_start_payload(request_id, status, headers))
         )
-        await self._websocket.send(start_msg.model_dump_json())
         logger.debug(f"SSE 流开始: request_id={request_id}")
 
         chunk_count = 0
         error_msg = None
 
         try:
-            # 流式读取并发送数据块
+            # 流式读取并发送数据块（数据面快速路径：手工 dict，wire 键集不变）
             async for chunk in response.aiter_text():
                 if chunk:
-                    chunk_msg = StreamChunkMessage(
-                        id=request_id,
-                        data=chunk,
-                        sequence=chunk_count,
+                    await self._websocket.send(
+                        dump_payload(stream_chunk_payload(request_id, chunk, chunk_count))
                     )
-                    await self._websocket.send(chunk_msg.model_dump_json())
                     chunk_count += 1
 
         except Exception as e:
@@ -600,13 +629,11 @@ class TunnelClient:
 
         # 发送 StreamEnd
         duration_ms = int((time.time() - start_time) * 1000)
-        end_msg = StreamEndMessage(
-            id=request_id,
-            error=error_msg,
-            duration_ms=duration_ms,
-            total_chunks=chunk_count,
+        await self._websocket.send(
+            dump_payload(
+                stream_end_payload(request_id, error_msg, duration_ms, chunk_count)
+            )
         )
-        await self._websocket.send(end_msg.model_dump_json())
         logger.debug(f"SSE 流结束: request_id={request_id}, chunks={chunk_count}, duration={duration_ms}ms")
 
     # ============== TCP 模式处理方法 ==============

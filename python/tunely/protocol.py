@@ -15,6 +15,7 @@ WS-Tunnel 协议定义
 - ping/pong: 心跳保活
 """
 
+import json
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -299,3 +300,270 @@ def parse_message(data: dict[str, Any]) -> BaseModel:
         return PongMessage(**data)
     else:
         raise ValueError(f"Unknown message type: {msg_type}")
+
+
+# ============== 数据面快速路径（0.7.3 去 pydantic 化） ==============
+#
+# 每条 TCP/SSE 数据块、每请求的 request/response 是纯热路径，pydantic 的
+# 校验 + model_dump_json 在 64KB 块 × 千块/秒的量级下是纯 CPU 税。这里提供
+# 手工 dict 构造（键集与 pydantic model_dump 逐字段一致，wire 不变）与
+# parse_message_fast 轻校验解析（类型不对抛 ValueError，调用方按畸形消息
+# 丢弃，语义同 F10）。控制面消息（auth/audit 等）照旧走 parse_message 全校验。
+
+_MSG_TYPES = MessageType
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _require_str(data: dict, key: str) -> str:
+    v = data.get(key)
+    if not isinstance(v, str):
+        raise ValueError(f"invalid message: {key} must be str")
+    return v
+
+
+def _opt_dict(data: dict, key: str) -> dict:
+    v = data.get(key)
+    if v is not None and not isinstance(v, dict):
+        raise ValueError(f"invalid message: {key} must be dict")
+    return v if v is not None else {}
+
+
+def dump_payload(payload: dict) -> str:
+    """payload dict → 紧凑 JSON（与 pydantic model_dump_json 的无空格输出一致，
+    wire 体积最小；键序无关紧要但形状必须逐字段一致）"""
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def request_payload(
+    request_id: str,
+    method: str,
+    path: str,
+    headers: dict[str, str] | None,
+    body: str | None,
+    timeout: float,
+) -> dict:
+    """TunnelRequest 的手工 dict 形状（键集与 model_dump 一致）"""
+    return {
+        "type": _MSG_TYPES.REQUEST.value,
+        "id": request_id,
+        "method": method,
+        "path": path,
+        "headers": headers or {},
+        "body": body,
+        "timeout": timeout,
+        "timestamp": _now_iso(),
+    }
+
+
+def response_payload(
+    response_id: str,
+    status: int,
+    headers: dict[str, str] | None,
+    body: str | None,
+    error: str | None = None,
+    duration_ms: int = 0,
+) -> dict:
+    """TunnelResponse 的手工 dict 形状"""
+    return {
+        "type": _MSG_TYPES.RESPONSE.value,
+        "id": response_id,
+        "status": status,
+        "headers": headers or {},
+        "body": body,
+        "error": error,
+        "duration_ms": duration_ms,
+        "timestamp": _now_iso(),
+    }
+
+
+def stream_start_payload(
+    request_id: str, status: int, headers: dict[str, str] | None
+) -> dict:
+    return {
+        "type": _MSG_TYPES.STREAM_START.value,
+        "id": request_id,
+        "status": status,
+        "headers": headers or {},
+        "timestamp": _now_iso(),
+    }
+
+
+def stream_chunk_payload(request_id: str, data: str, sequence: int) -> dict:
+    return {
+        "type": _MSG_TYPES.STREAM_CHUNK.value,
+        "id": request_id,
+        "data": data,
+        "sequence": sequence,
+        "timestamp": _now_iso(),
+    }
+
+
+def stream_end_payload(
+    request_id: str,
+    error: str | None,
+    duration_ms: int,
+    total_chunks: int,
+) -> dict:
+    return {
+        "type": _MSG_TYPES.STREAM_END.value,
+        "id": request_id,
+        "error": error,
+        "duration_ms": duration_ms,
+        "total_chunks": total_chunks,
+        "timestamp": _now_iso(),
+    }
+
+
+def tcp_connect_payload(conn_id: str) -> dict:
+    return {
+        "type": _MSG_TYPES.TCP_CONNECT.value,
+        "conn_id": conn_id,
+        "timestamp": _now_iso(),
+    }
+
+
+def tcp_data_payload(conn_id: str, data: str, sequence: int) -> dict:
+    return {
+        "type": _MSG_TYPES.TCP_DATA.value,
+        "conn_id": conn_id,
+        "data": data,
+        "sequence": sequence,
+        "timestamp": _now_iso(),
+    }
+
+
+def tcp_close_payload(conn_id: str, error: str | None = None) -> dict:
+    return {
+        "type": _MSG_TYPES.TCP_CLOSE.value,
+        "conn_id": conn_id,
+        "error": error,
+        "timestamp": _now_iso(),
+    }
+
+
+def parse_message_fast(raw: str | bytes) -> BaseModel:
+    """热路径解析：json.loads 一次 + 常见消息类型轻校验直构（跳过 pydantic 校验）
+
+    键缺失/类型不对抛 ValueError（含 JSONDecodeError），调用方按畸形消息
+    丢弃即可（F10 语义不变）。冷门类型回退 parse_message 全校验。
+    """
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("invalid message: not an object")
+
+    msg_type = data.get("type")
+
+    if msg_type == _MSG_TYPES.RESPONSE.value:
+        status = data.get("status")
+        if not _is_int(status):
+            raise ValueError("invalid response: status must be int")
+        return TunnelResponse.model_construct(
+            type=_MSG_TYPES.RESPONSE,
+            id=_require_str(data, "id"),
+            status=status,
+            headers=_opt_dict(data, "headers"),
+            body=data.get("body"),
+            error=data.get("error"),
+            duration_ms=data.get("duration_ms") or 0,
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.STREAM_CHUNK.value:
+        sequence = data.get("sequence", 0)
+        if not _is_int(sequence):
+            raise ValueError("invalid stream_chunk: sequence must be int")
+        return StreamChunkMessage.model_construct(
+            type=_MSG_TYPES.STREAM_CHUNK,
+            id=_require_str(data, "id"),
+            data=_require_str(data, "data"),
+            sequence=sequence,
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.STREAM_START.value:
+        status = data.get("status")
+        if not _is_int(status):
+            raise ValueError("invalid stream_start: status must be int")
+        return StreamStartMessage.model_construct(
+            type=_MSG_TYPES.STREAM_START,
+            id=_require_str(data, "id"),
+            status=status,
+            headers=_opt_dict(data, "headers"),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.STREAM_END.value:
+        total_chunks = data.get("total_chunks", 0)
+        duration_ms = data.get("duration_ms", 0)
+        if not _is_int(total_chunks) or not _is_int(duration_ms):
+            raise ValueError("invalid stream_end: counters must be int")
+        return StreamEndMessage.model_construct(
+            type=_MSG_TYPES.STREAM_END,
+            id=_require_str(data, "id"),
+            error=data.get("error"),
+            duration_ms=duration_ms,
+            total_chunks=total_chunks,
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.TCP_DATA.value:
+        sequence = data.get("sequence", 0)
+        if not _is_int(sequence):
+            raise ValueError("invalid tcp_data: sequence must be int")
+        return TcpDataMessage.model_construct(
+            type=_MSG_TYPES.TCP_DATA,
+            conn_id=_require_str(data, "conn_id"),
+            data=_require_str(data, "data"),
+            sequence=sequence,
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.TCP_CLOSE.value:
+        return TcpCloseMessage.model_construct(
+            type=_MSG_TYPES.TCP_CLOSE,
+            conn_id=_require_str(data, "conn_id"),
+            error=data.get("error"),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.TCP_CONNECT.value:
+        return TcpConnectMessage.model_construct(
+            type=_MSG_TYPES.TCP_CONNECT,
+            conn_id=_require_str(data, "conn_id"),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.REQUEST.value:
+        timeout = data.get("timeout", 1800.0)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise ValueError("invalid request: timeout must be number")
+        return TunnelRequest.model_construct(
+            type=_MSG_TYPES.REQUEST,
+            id=_require_str(data, "id"),
+            method=_require_str(data, "method"),
+            path=_require_str(data, "path"),
+            headers=_opt_dict(data, "headers"),
+            body=data.get("body"),
+            timeout=timeout,
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.PING.value:
+        return PingMessage.model_construct(
+            type=_MSG_TYPES.PING, timestamp=data.get("timestamp") or _now_iso()
+        )
+
+    if msg_type == _MSG_TYPES.PONG.value:
+        return PongMessage.model_construct(
+            type=_MSG_TYPES.PONG, timestamp=data.get("timestamp") or _now_iso()
+        )
+
+    # 冷门/未知类型：全量 pydantic 校验（ValidationError ⊂ ValueError，F10 兼容）
+    return parse_message(data)

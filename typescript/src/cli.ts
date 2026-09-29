@@ -52,6 +52,10 @@ program
       targetUrl: target,
       reconnectInterval: parseFloat(options.reconnect) * 1000,
       force: options.force,
+      // 普通响应体内存上限（字节）：env TUNELY_MAX_RESPONSE_BYTES，0 = 不限制，默认 100MB
+      maxResponseBytes: process.env.TUNELY_MAX_RESPONSE_BYTES
+        ? parseInt(process.env.TUNELY_MAX_RESPONSE_BYTES, 10)
+        : undefined,
     });
 
     client.on('onConnect', (domain) => {

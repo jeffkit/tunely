@@ -46,6 +46,24 @@ export interface TunnelClientConfig {
   keepaliveInterval?: number;
   /** keepalive：超过该时长未收到 pong 判定连接死亡并重连（毫秒，默认 45000） */
   keepaliveTimeout?: number;
+  /** 普通响应体内存上限（字节，默认 104857600 = 100MB；与生产服务端 cap 对齐）。0 = 不限制，超限返回 502 并中止读取 */
+  maxResponseBytes?: number;
+}
+
+// 共享 undici Agent（0.7.3：连接池跨请求复用，此前每请求新建+关闭，TLS 握手无法复用）。
+// headers/bodyTimeout 设为极大值兜底（防 undici 默认 300s 抢跑），每请求的真实超时
+// 由 AbortController 执行——语义与旧 per-request Agent 一致
+let sharedDispatcher: Agent | null = null;
+
+function getSharedDispatcher(): Agent {
+  if (!sharedDispatcher) {
+    sharedDispatcher = new Agent({
+      headersTimeout: 2 ** 31 - 1,
+      bodyTimeout: 2 ** 31 - 1,
+      connectTimeout: 30_000,
+    });
+  }
+  return sharedDispatcher;
 }
 
 export interface TunnelClientEvents {
@@ -109,6 +127,7 @@ export class TunnelClient {
       reconnectInterval: config.reconnectInterval ?? 5000,
       maxReconnectAttempts: config.maxReconnectAttempts ?? 0,
       requestTimeout: config.requestTimeout ?? 300000,
+      maxResponseBytes: config.maxResponseBytes ?? 104857600,
       force: config.force ?? false,
       keepaliveInterval: config.keepaliveInterval ?? 25000,
       keepaliveTimeout: config.keepaliveTimeout ?? 45000,
@@ -347,6 +366,41 @@ export class TunnelClient {
     return contentType.toLowerCase().includes('text/event-stream');
   }
 
+  /**
+   * 带内存上限读取响应体（0.7.3）：超过 cap 立即中止读取并返回 tooLarge，
+   * 避免"先全量缓冲再判断"的 OOM 窗口。解码语义与 text() 一致（UTF-8 容错替换）。
+   */
+  private async readBodyCapped(
+    body: ReadableStream<Uint8Array>,
+    cap: number
+  ): Promise<{ text: string; tooLarge: boolean }> {
+    const reader = body.getReader();
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > cap) {
+          reader.cancel().catch(() => {});
+          return { text: '', tooLarge: true };
+        }
+        parts.push(value);
+      }
+    } catch (e) {
+      reader.cancel().catch(() => {});
+      throw e;
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      merged.set(part, offset);
+      offset += part.byteLength;
+    }
+    return { text: new TextDecoder('utf-8', { fatal: false }).decode(merged), tooLarge: false };
+  }
+
   private async handleRequest(
     request: TunnelRequest,
     ws: WebSocket
@@ -387,14 +441,6 @@ export class TunnelClient {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-      // 自定义 undici Agent，确保 headersTimeout/bodyTimeout 与请求超时一致
-      // 不设置的话 undici 默认 headersTimeout=300s，Agent 处理慢时会先于 AbortController 触发
-      const dispatcher = new Agent({
-        headersTimeout: timeoutMs,
-        bodyTimeout: timeoutMs,
-        connectTimeout: 30_000,
-      });
-
       const fetchOptions: RequestInit = {
         method: request.method,
         headers: cleanHeaders,
@@ -406,7 +452,7 @@ export class TunnelClient {
           ...fetchOptions,
           signal: controller.signal,
           // @ts-expect-error Node.js fetch supports undici dispatcher option
-          dispatcher,
+          dispatcher: getSharedDispatcher(),
         });
 
         const responseHeaders = Object.fromEntries(fetchResponse.headers.entries());
@@ -425,8 +471,27 @@ export class TunnelClient {
           return; // SSE 响应已通过流式消息发送
         }
 
-        // 普通响应：读取完整内容
-        const responseBody = await fetchResponse.text();
+        // 普通响应：带内存上限读取（0.7.3，超限 502 并中止；对齐生产服务端 cap）
+        const cap = this.config.maxResponseBytes ?? 104857600;
+        let responseBody: string;
+        if (cap > 0 && fetchResponse.body) {
+          const capped = await this.readBodyCapped(fetchResponse.body, cap);
+          if (capped.tooLarge) {
+            const response = createResponse(
+              request.id,
+              502,
+              null,
+              {},
+              `Response too large (> ${cap} bytes, client cap)`,
+              Date.now() - startTime
+            );
+            await this.sendToWs(ws, JSON.stringify(response));
+            return;
+          }
+          responseBody = capped.text;
+        } else {
+          responseBody = await fetchResponse.text();
+        }
         const durationMs = Date.now() - startTime;
 
         const response = createResponse(
@@ -440,7 +505,6 @@ export class TunnelClient {
         await this.sendToWs(ws, JSON.stringify(response));
       } finally {
         clearTimeout(timeoutId);
-        await dispatcher.close();
       }
     } catch (error: any) {
       const durationMs = Date.now() - startTime;

@@ -63,6 +63,12 @@ from .protocol import (
     TcpDataMessage,
     TcpCloseMessage,
     parse_message,
+    parse_message_fast,
+    dump_payload,
+    request_payload,
+    tcp_close_payload,
+    tcp_connect_payload,
+    tcp_data_payload,
 )
 from .repository import TunnelRepository, TunnelRequestLogRepository, AdminAuditLogRepository
 
@@ -89,6 +95,10 @@ _LOG_NORMALIZE_MAX_BODY = 1_000_000
 # 每条外部 TCP 连接的写队列长度（条；每条 ≤64KB，64 条 ≈ 4MB 缓冲）。
 # 写循环独立消费，慢接收方只堵自己这条连接，不阻塞隧道 WS 消息循环
 _TCP_WRITE_QUEUE_MAXSIZE = 64
+
+# 流式请求的失败哨兵：经队列唤醒消费侧（0.7.3 起消费侧单 await queue.get()，
+# 不再每 chunk 双 task 等待「新消息 vs 失败事件」）
+_STREAM_FAILED = object()
 
 
 def _client_ip(http_request: Request | None) -> str | None:
@@ -473,7 +483,7 @@ class TunnelManager:
                     f"隧道断连，在途请求已失败: domain={domain}, request_id={request_id}"
                 )
 
-        # 2. 流式请求：通过 failed 事件让消费侧立即以错误结束
+        # 2. 流式请求：哨兵入队让消费侧立即以错误结束
         for request_id in [
             rid
             for rid, pending in self._pending_stream_requests.items()
@@ -483,7 +493,7 @@ class TunnelManager:
             if pending:
                 pending.error = "tunnel disconnected"
                 pending.ended = True
-                pending.failed.set()
+                self._signal_stream_failed(pending)
                 logger.warning(
                     f"隧道断连，流式请求已终止: domain={domain}, request_id={request_id}"
                 )
@@ -591,8 +601,26 @@ class TunnelManager:
             )
             pending.error = "stream queue overflow"
             pending.ended = True
-            pending.failed.set()
+            self._signal_stream_failed(pending)
             return False
+
+    def _signal_stream_failed(self, pending: PendingStreamRequest) -> None:
+        """经队列哨兵唤醒消费侧：流已失败（溢出/断连/显式失败）
+
+        队列满时丢弃一条滞留 chunk 腾位（同步代码段无 await，get_nowait
+        必然成功）；消费侧读到哨兵即以 pending.error 结束，不等超时兜底。
+        """
+        pending.failed.set()
+        attempts = (pending.queue.maxsize or 1) + 1
+        for _ in range(attempts):
+            try:
+                pending.queue.put_nowait(_STREAM_FAILED)
+                return
+            except asyncio.QueueFull:
+                try:
+                    pending.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
 
     async def create_stream_request(self, request_id: str, domain: str = "") -> PendingStreamRequest:
         """创建待响应的流式请求"""
@@ -606,12 +634,12 @@ class TunnelManager:
         return pending
 
     async def fail_stream_request(self, request_id: str, error: str) -> bool:
-        """以错误终止流式请求（唤醒消费侧，不必等超时兜底）"""
+        """以错误终止流式请求（哨兵唤醒消费侧，不必等超时兜底）"""
         pending = self._pending_stream_requests.get(request_id)
         if pending:
             pending.error = error
             pending.ended = True
-            pending.failed.set()
+            self._signal_stream_failed(pending)
             self._pending_stream_requests.pop(request_id, None)
             return True
         return False
@@ -1398,11 +1426,11 @@ class TunnelServer:
             # 处理消息循环
             while True:
                 raw_message = await websocket.receive_text()
-                # F10：畸形消息（非法 JSON / 未知类型）只丢弃该条并告警，
-                # 不得让整条隧道断连注销（断连会让全部在途请求悬挂）
+                # F10：畸形消息（非法 JSON / 未知类型 / 字段形状不对）只丢弃
+                # 该条并告警，不得让整条隧道断连注销（断连会让全部在途请求悬挂）。
+                # 0.7.3 起热路径消息走 parse_message_fast 轻校验（ValueError 同样在此捕获）
                 try:
-                    data = json.loads(raw_message)
-                    message = parse_message(data)
+                    message = parse_message_fast(raw_message)
                 except (ValueError, TypeError) as e:
                     logger.warning(
                         f"丢弃畸形 WS 消息: domain={tunnel_domain}, error={e}, "
@@ -1954,16 +1982,9 @@ class TunnelServer:
             return ForwardResponse(status=503, error=f"Tunnel not connected: {domain}")
 
         request_id = str(uuid.uuid4())
-        request = TunnelRequest(
-            id=request_id,
-            method=method,
-            path=path,
-            headers=headers or {},
-            # F17：body is not None 才序列化——falsy body（{} / 0 / "" / False）必须保留
-            body=json.dumps(body) if body is not None else None,
-            timeout=timeout,
-        )
-
+        # 数据面快速路径：手工 dict + json.dumps，跳过 pydantic 校验/序列化
+        # （wire 键集与 TunnelRequest.model_dump 逐字段一致）
+        request_body_json = json.dumps(body) if body is not None else None
         try:
             # pending 限额：达到上限直接 503（防慢响应堆积耗尽内存）
             if self.manager.pending_requests_count() >= self.config.max_pending_requests:
@@ -1979,7 +2000,13 @@ class TunnelServer:
             future = await self.manager.create_pending_request(request_id, domain=domain)
 
             # 发送请求
-            await conn.websocket.send_text(request.model_dump_json())
+            await conn.websocket.send_text(
+                dump_payload(
+                    request_payload(
+                        request_id, method, path, headers, request_body_json, timeout
+                    )
+                )
+            )
 
             # 等待响应
             start_time = asyncio.get_event_loop().time()
@@ -1999,8 +2026,8 @@ class TunnelServer:
                     method=method,
                     path=path,
                     headers=headers,
-                    request_body_str=request.body[:10000]
-                    if request.body is not None
+                    request_body_str=request_body_json[:10000]
+                    if request_body_json is not None
                     else None,
                     status_code=response.status,
                     response_headers=response.headers,
@@ -2040,8 +2067,8 @@ class TunnelServer:
                 method=method,
                 path=path,
                 headers=headers,
-                request_body_str=request.body[:10000]
-                if request.body is not None
+                request_body_str=request_body_json[:10000]
+                if request_body_json is not None
                 else None,
                 status_code=response.status,
                 response_headers=response.headers,
@@ -2068,8 +2095,8 @@ class TunnelServer:
                 method=method,
                 path=path,
                 headers=headers,
-                request_body_str=request.body[:10000]
-                if request.body is not None
+                request_body_str=request_body_json[:10000]
+                if request_body_json is not None
                 else None,
                 status_code=504,
                 error=error_msg,
@@ -2090,8 +2117,8 @@ class TunnelServer:
                 method=method,
                 path=path,
                 headers=headers,
-                request_body_str=request.body[:10000]
-                if request.body is not None
+                request_body_str=request_body_json[:10000]
+                if request_body_json is not None
                 else None,
                 status_code=500,
                 error=error_msg,
@@ -2135,8 +2162,7 @@ class TunnelServer:
             future = await self.manager.create_pending_tcp_request(conn_id, domain=domain)
 
             # 2. 发送 TCP 连接建立消息
-            connect_msg = TcpConnectMessage(conn_id=conn_id)
-            await conn.websocket.send_text(connect_msg.model_dump_json())
+            await conn.websocket.send_text(dump_payload(tcp_connect_payload(conn_id)))
 
             # 3. 发送数据（body is not None 即发送——falsy body 如 0 / "" 不丢）
             if body is not None:
@@ -2149,12 +2175,13 @@ class TunnelServer:
                     data = json.dumps(body).encode("utf-8")
 
                 # 编码为 base64 并发送
-                data_msg = TcpDataMessage(
-                    conn_id=conn_id,
-                    data=base64.b64encode(data).decode("ascii"),
-                    sequence=0,
+                await conn.websocket.send_text(
+                    dump_payload(
+                        tcp_data_payload(
+                            conn_id, base64.b64encode(data).decode("ascii"), 0
+                        )
+                    )
                 )
-                await conn.websocket.send_text(data_msg.model_dump_json())
 
             # 4. 等待客户端响应（TcpDataMessage 累积 + TcpCloseMessage 完成）
             result = await asyncio.wait_for(future, timeout=timeout)
@@ -2187,8 +2214,9 @@ class TunnelServer:
             await self.manager.cleanup_tcp_request(conn_id)
             # 通知客户端关闭
             try:
-                close_msg = TcpCloseMessage(conn_id=conn_id)
-                await conn.websocket.send_text(close_msg.model_dump_json())
+                await conn.websocket.send_text(
+                    dump_payload(tcp_close_payload(conn_id))
+                )
             except Exception:
                 pass
             elapsed = asyncio.get_event_loop().time() - start_time
@@ -2322,52 +2350,31 @@ class TunnelServer:
             return
 
         request_id = str(uuid.uuid4())
-        request = TunnelRequest(
-            id=request_id,
-            method=method,
-            path=path,
-            headers=headers or {},
-            # F17：falsy body（{} / 0 / "" / False）必须保留
-            body=json.dumps(body) if body is not None else None,
-            timeout=timeout,
-        )
+        request_body_json = json.dumps(body) if body is not None else None
 
         try:
             # 创建流式请求
             pending = await self.manager.create_stream_request(request_id, domain=domain)
 
-            # 发送请求
-            await conn.websocket.send_text(request.model_dump_json())
+            # 发送请求（数据面快速路径：手工 dict，wire 键集不变）
+            await conn.websocket.send_text(
+                dump_payload(
+                    request_payload(
+                        request_id, method, path, headers, request_body_json, timeout
+                    )
+                )
+            )
 
             # 从队列中读取流式数据
+            # 0.7.3：失败信号（队列溢出/断连/显式失败）统一经队列哨兵传递，
+            # 消费侧单 await queue.get() 即可，不再每 chunk 创建一对 task
             start_time = datetime.now()
             while True:
-                # 同时等待「队列新消息」与「流失败信号」（队列溢出 / 隧道断连），
-                # 失败时立即以错误结束，而非等到超时兜底
-                get_task = asyncio.ensure_future(pending.queue.get())
-                failed_task = asyncio.ensure_future(pending.failed.wait())
-                done, _ = await asyncio.wait(
-                    {get_task, failed_task},
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in (get_task, failed_task):
-                    if task not in done:
-                        task.cancel()
-                await asyncio.gather(
-                    *(t for t in (get_task, failed_task) if t not in done),
-                    return_exceptions=True,
-                )
-
-                if failed_task in done:
-                    # 流已被生产侧标记失败（队列溢出 / 隧道断连）
-                    yield StreamEndMessage(
-                        id=request_id,
-                        error=pending.error or "stream failed",
+                try:
+                    message = await asyncio.wait_for(
+                        pending.queue.get(), timeout=timeout
                     )
-                    break
-
-                if get_task not in done:
+                except asyncio.TimeoutError:
                     # 超时，发送错误结束消息
                     yield StreamEndMessage(
                         id=request_id,
@@ -2375,7 +2382,13 @@ class TunnelServer:
                     )
                     break
 
-                message = get_task.result()
+                if message is _STREAM_FAILED:
+                    # 流已被生产侧标记失败（队列溢出 / 隧道断连 / 显式失败）
+                    yield StreamEndMessage(
+                        id=request_id,
+                        error=pending.error or "stream failed",
+                    )
+                    break
 
                 if message is None:
                     # 流结束
@@ -2794,8 +2807,9 @@ class TunnelServer:
 
         try:
             # 通知客户端建立到目标的 TCP 连接
-            connect_msg = TcpConnectMessage(conn_id=conn_id)
-            await tunnel_conn.websocket.send_text(connect_msg.model_dump_json())
+            await tunnel_conn.websocket.send_text(
+                dump_payload(tcp_connect_payload(conn_id))
+            )
 
             # 启动从外部 TCP 读取数据的任务
             tcp_conn = await self.manager.get_tcp_connection(conn_id)
@@ -2811,8 +2825,9 @@ class TunnelServer:
         finally:
             # 通知客户端关闭连接
             try:
-                close_msg = TcpCloseMessage(conn_id=conn_id)
-                await tunnel_conn.websocket.send_text(close_msg.model_dump_json())
+                await tunnel_conn.websocket.send_text(
+                    dump_payload(tcp_close_payload(conn_id))
+                )
             except Exception:
                 pass
             await self.manager.remove_tcp_connection(conn_id)
@@ -2849,13 +2864,16 @@ class TunnelServer:
                 if domain:
                     self._count_tunnel_bytes(domain, "bytes_out", len(data))
 
-                # 编码并发送
-                data_msg = TcpDataMessage(
-                    conn_id=conn_id,
-                    data=base64.b64encode(data).decode("ascii"),
-                    sequence=sequence,
+                # 编码并发送（数据面快速路径：手工 dict，wire 键集不变）
+                await websocket.send_text(
+                    dump_payload(
+                        tcp_data_payload(
+                            conn_id,
+                            base64.b64encode(data).decode("ascii"),
+                            sequence,
+                        )
+                    )
                 )
-                await websocket.send_text(data_msg.model_dump_json())
                 sequence += 1
                 logger.debug(f"TCP->WS: conn_id={conn_id}, size={len(data)}, seq={sequence}")
         except asyncio.CancelledError:

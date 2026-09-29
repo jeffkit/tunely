@@ -176,6 +176,8 @@ tunely/
 | `WS_TUNNEL_REQUEST_LOG_RETENTION_DAYS` | `30` | 请求日志保留天数，后台周期清理；`0` = 永久保留 |
 | `WS_TUNNEL_HTTP_MAX_RESPONSE_BYTES` | `104857600` | HTTP 模式单请求响应体上限（字节），超限 502；`0` = 不限制 |
 | `WS_TUNNEL_TCP_FORWARD_MAX_BUFFER_BYTES` | `10485760` | TCP 转发单请求响应累积上限（字节），超限 502；`0` = 不限制 |
+| `WS_TUNNEL_CLIENT_MAX_RESPONSE_BYTES` | `104857600` | （py 客户端）普通响应体内存上限（字节），超限中止读取并返回 502；`0` = 不限制 |
+| `TUNELY_MAX_RESPONSE_BYTES` | `104857600` | （TS 客户端 CLI）普通响应体内存上限（字节），超限中止读取并返回 502；`0` = 不限制 |
 
 **客户端配置**：
 

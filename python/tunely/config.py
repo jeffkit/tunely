@@ -149,6 +149,10 @@ class TunnelClientConfig(BaseSettings):
 
     # 请求配置
     request_timeout: float = Field(default=1800.0, description="请求超时（秒）")
+    max_response_bytes: int = Field(
+        default=104857600,
+        description="普通响应体内存上限（字节），超限中止读取并以 502 返回（与生产服务端 cap 对齐）；0 = 不限制（env: WS_TUNNEL_CLIENT_MAX_RESPONSE_BYTES）",
+    )
 
     model_config = {
         "env_prefix": "WS_TUNNEL_CLIENT_",
