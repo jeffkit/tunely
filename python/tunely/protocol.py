@@ -1,7 +1,7 @@
 """
 WS-Tunnel 协议定义
 
-协议版本: 2.0 (能力协商 + binary_frames + chunked_http；1.1 = SSE+TCP 透传)
+协议版本: 2.0 (能力协商 + binary_frames + chunked_http + udp；1.1 = SSE+TCP 透传)
 
 消息类型:
 - auth: 客户端认证请求
@@ -12,6 +12,8 @@ WS-Tunnel 协议定义
 - stream_start: 流式响应开始
 - stream_chunk: 流式响应数据块
 - stream_end: 流式响应结束
+- tcp_connect/tcp_data/tcp_close: TCP 透传
+- udp_open/udp_close: UDP 会话控制（数据面走 0x03 二进制帧）
 - ping/pong: 心跳保活
 """
 
@@ -45,6 +47,10 @@ class MessageType(str, Enum):
     TCP_CONNECT = "tcp_connect"  # 服务端通知新 TCP 连接
     TCP_DATA = "tcp_data"        # TCP 数据传输（双向）
     TCP_CLOSE = "tcp_close"      # TCP 连接关闭
+
+    # UDP 模式（协议 v2 udp，数据面走 0x03 二进制帧）
+    UDP_OPEN = "udp_open"     # 服务端通知新 UDP 会话
+    UDP_CLOSE = "udp_close"   # UDP 会话关闭（双向）
 
     # 心跳
     PING = "ping"
@@ -244,13 +250,46 @@ class TcpDataMessage(BaseModel):
 class TcpCloseMessage(BaseModel):
     """
     TCP 连接关闭（双向）
-    
+
     通知对方关闭 TCP 连接
     """
 
     type: MessageType = MessageType.TCP_CLOSE
     conn_id: str = Field(..., description="连接 ID")
     error: str | None = Field(default=None, description="错误信息（如果异常关闭）")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().isoformat(), description="关闭时间"
+    )
+
+
+# ============== UDP 模式消息（协议 v2 udp） ==============
+
+
+class UdpOpenMessage(BaseModel):
+    """
+    UDP 会话建立（服务端 → 客户端）
+
+    外部首包到达时，服务端建会话并通知客户端建立到目标的 UDP socket；
+    随后的数据走 0x03 二进制帧（见 docs/PROTOCOL_V2.md §5）
+    """
+
+    type: MessageType = MessageType.UDP_OPEN
+    session_id: str = Field(..., description="会话唯一 ID（36 字符 UUID），后续帧/关闭靠它关联")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now().isoformat(), description="会话建立时间"
+    )
+
+
+class UdpCloseMessage(BaseModel):
+    """
+    UDP 会话关闭（双向）
+
+    任一方结束会话：客户端 socket 错误/主动关闭时上报；服务端空闲超时回收时下发
+    """
+
+    type: MessageType = MessageType.UDP_CLOSE
+    session_id: str = Field(..., description="要关闭的会话 ID")
+    reason: str | None = Field(default=None, description="关闭原因（如 idle timeout / socket error）")
     timestamp: str = Field(
         default_factory=lambda: datetime.now().isoformat(), description="关闭时间"
     )
@@ -317,6 +356,10 @@ def parse_message(data: dict[str, Any]) -> BaseModel:
         return TcpDataMessage(**data)
     elif msg_type == MessageType.TCP_CLOSE:
         return TcpCloseMessage(**data)
+    elif msg_type == MessageType.UDP_OPEN:
+        return UdpOpenMessage(**data)
+    elif msg_type == MessageType.UDP_CLOSE:
+        return UdpCloseMessage(**data)
     elif msg_type == MessageType.PING:
         return PingMessage(**data)
     elif msg_type == MessageType.PONG:
@@ -479,6 +522,23 @@ def tcp_close_payload(conn_id: str, error: str | None = None) -> dict:
     }
 
 
+def udp_open_payload(session_id: str) -> dict:
+    return {
+        "type": _MSG_TYPES.UDP_OPEN.value,
+        "session_id": session_id,
+        "timestamp": _now_iso(),
+    }
+
+
+def udp_close_payload(session_id: str, reason: str | None = None) -> dict:
+    return {
+        "type": _MSG_TYPES.UDP_CLOSE.value,
+        "session_id": session_id,
+        "reason": reason,
+        "timestamp": _now_iso(),
+    }
+
+
 def parse_message_fast(raw: str | bytes) -> BaseModel:
     """热路径解析：json.loads 一次 + 常见消息类型轻校验直构（跳过 pydantic 校验）
 
@@ -575,6 +635,21 @@ def parse_message_fast(raw: str | bytes) -> BaseModel:
             timestamp=data.get("timestamp") or _now_iso(),
         )
 
+    if msg_type == _MSG_TYPES.UDP_OPEN.value:
+        return UdpOpenMessage.model_construct(
+            type=_MSG_TYPES.UDP_OPEN,
+            session_id=_require_str(data, "session_id"),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+    if msg_type == _MSG_TYPES.UDP_CLOSE.value:
+        return UdpCloseMessage.model_construct(
+            type=_MSG_TYPES.UDP_CLOSE,
+            session_id=_require_str(data, "session_id"),
+            reason=data.get("reason"),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
     if msg_type == _MSG_TYPES.REQUEST.value:
         timeout = data.get("timeout", 1800.0)
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
@@ -652,3 +727,47 @@ def decode_tcp_data_frame(frame: bytes) -> tuple[str, bytes]:
         raise ValueError(f"invalid frame: unsupported type 0x{frame[1]:02x}")
     conn_id = str(uuid.UUID(bytes=bytes(frame[2:_FRAME_HEADER_LEN])))
     return conn_id, bytes(frame[_FRAME_HEADER_LEN:])
+
+
+# ============== udp_data 帧编解码（协议 v2 T4，docs/PROTOCOL_V2.md §5） ==============
+#
+# 帧布局与 tcp_data 相同，帧类型 0x03，16B 为 session_id 原始 UUID：
+#   [0x02]     1B  协议版本标记（v2）
+#   [0x03]     1B  帧类型：0x03 = udp_data
+#   [16B]      session_id，UUID v4 原始字节
+#   [payload]  原始数据报字节（一帧一报文，不拼接；双向）
+#
+# udp_open/udp_close 保持 JSON 控制面（低频）。解码遇版本/类型/长度不对抛
+# ValueError，调用方按畸形帧丢弃（F10 语义）。
+
+FRAME_TYPE_UDP_DATA = 0x03
+
+
+def encode_udp_data_frame(session_id: str, payload: bytes) -> bytes:
+    """udp_data 二进制帧编码：0x02 0x03 + UUID 原始字节 + 原始 payload
+
+    session_id 为 JSON 控制面的 36 字符 UUID 字符串；非 UUID 字符串抛 ValueError。
+    """
+    return (
+        bytes((FRAME_PROTOCOL_VERSION, FRAME_TYPE_UDP_DATA))
+        + uuid.UUID(session_id).bytes
+        + bytes(payload)
+    )
+
+
+def decode_udp_data_frame(frame: bytes) -> tuple[str, bytes]:
+    """udp_data 二进制帧解码 → (session_id 36 字符串, payload 原始字节)
+
+    版本/类型/长度不对抛 ValueError（调用方按畸形帧丢弃，F10 语义）；
+    session_id 16 字节不校验版本位（与 uuid.UUID(bytes=...) 语义一致）。
+    """
+    if not isinstance(frame, (bytes, bytearray, memoryview)):
+        raise ValueError("invalid frame: not bytes")
+    if len(frame) < _FRAME_HEADER_LEN:
+        raise ValueError(f"invalid frame: too short ({len(frame)})")
+    if frame[0] != FRAME_PROTOCOL_VERSION:
+        raise ValueError(f"invalid frame: unsupported version 0x{frame[0]:02x}")
+    if frame[1] != FRAME_TYPE_UDP_DATA:
+        raise ValueError(f"invalid frame: unsupported type 0x{frame[1]:02x}")
+    session_id = str(uuid.UUID(bytes=bytes(frame[2:_FRAME_HEADER_LEN])))
+    return session_id, bytes(frame[_FRAME_HEADER_LEN:])

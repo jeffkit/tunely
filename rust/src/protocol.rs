@@ -1,4 +1,4 @@
-//! WS-Tunnel 协议定义（wire 1.1：SSE + TCP 模式）
+//! WS-Tunnel 协议定义（wire 2.0：能力协商 + binary_frames + udp；1.1 = SSE + TCP 模式）
 //!
 //! 字段名与 python/tunely/protocol.py、typescript/src/protocol.ts 逐一对齐。
 //! `timestamp` 等纯元数据字段本实现省略（协议中均为可选，服务端不强依赖）。
@@ -21,6 +21,8 @@ pub enum MessageType {
     TcpConnect,
     TcpData,
     TcpClose,
+    UdpOpen,
+    UdpClose,
     Ping,
     Pong,
 }
@@ -157,6 +159,19 @@ pub enum Message {
         error: Option<String>,
     },
 
+    /// UDP 会话建立（服务端 → 客户端，协议 v2 udp）：外部首包到达，建会话并
+    /// 通知客户端建到目标的 UDP socket；数据面走 0x03 二进制帧
+    UdpOpen {
+        session_id: String,
+    },
+    /// UDP 会话关闭（双向，协议 v2 udp）：任一侧结束会话（服务端空闲回收 /
+    /// 客户端 socket 错误或主动关闭）
+    UdpClose {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
     /// 心跳
     Ping {},
     Pong {},
@@ -180,6 +195,8 @@ impl Message {
             Message::TcpConnect { .. } => "tcp_connect",
             Message::TcpData { .. } => "tcp_data",
             Message::TcpClose { .. } => "tcp_close",
+            Message::UdpOpen { .. } => "udp_open",
+            Message::UdpClose { .. } => "udp_close",
             Message::Ping { .. } => "ping",
             Message::Pong { .. } => "pong",
         }
@@ -195,8 +212,8 @@ impl Message {
             client_version: CLIENT_VERSION.to_string(),
             force,
             // T2 起客户端声明已实现的能力（铁律：只许声明已实现的）；
-            // 修改本 vec 前先确认对应能力已在本客户端实现
-            capabilities: vec!["binary_frames".to_string()],
+            // T4 起追加 udp；修改本 vec 前先确认对应能力已在本客户端实现
+            capabilities: vec!["binary_frames".to_string(), "udp".to_string()],
         }
     }
 
@@ -269,6 +286,14 @@ impl Message {
             error,
         }
     }
+
+    /// UDP 会话关闭（双向，协议 v2 udp）
+    pub fn udp_close(session_id: &str, reason: Option<String>) -> Message {
+        Message::UdpClose {
+            session_id: session_id.to_string(),
+            reason,
+        }
+    }
 }
 
 /// HTTP 转发时需要剥离的 hop-by-hop 头（与 TS 客户端一致）
@@ -284,22 +309,25 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
-// ============== binary_frames 帧编解码（协议 v2 T2，docs/PROTOCOL_V2.md §1） ==============
+// ============== binary_frames 帧编解码（协议 v2 T2/T4，docs/PROTOCOL_V2.md §1/§5） ==============
 //
-// WS binary 帧（仅 tcp_data 一个类型）：
+// WS binary 帧（帧类型 0x01 = tcp_data / 0x03 = udp_data）：
 //   [0x02]     1B  协议版本标记（v2）
-//   [0x01]     1B  帧类型：0x01 = tcp_data
-//   [16B]      conn_id，UUID v4 原始字节（JSON 控制面仍是 36 字符串形式）
+//   [0x01]     1B  帧类型
+//   [16B]      conn_id / session_id，UUID v4 原始字节（JSON 控制面仍是 36 字符串形式）
 //   [payload]  原始字节（无 base64、无 JSON、无 sequence——WS 有序，接收侧不依赖）
 //
-// tcp_close 保持 JSON（低频、携带 error）。解码遇版本/类型/长度不对返回 Err，
-// 调用方按畸形帧丢弃（F10 语义）。UUID 转换手写 parse/format（不引 uuid crate）。
+// tcp_close/udp_open/udp_close 保持 JSON（低频、控制面）。解码遇版本/类型/长度
+// 不对返回 Err，调用方按畸形帧丢弃（F10 语义）。UUID 转换手写 parse/format
+// （不引 uuid crate）。
 
 /// 协议版本标记（v2）
 pub const FRAME_PROTOCOL_VERSION: u8 = 0x02;
 /// 帧类型：tcp_data
 pub const FRAME_TYPE_TCP_DATA: u8 = 0x01;
-/// 帧头长度：1B version + 1B type + 16B conn_id
+/// 帧类型：udp_data（协议 v2 udp，双向；payload 为原始数据报字节，一帧一报文）
+pub const FRAME_TYPE_UDP_DATA: u8 = 0x03;
+/// 帧头长度：1B version + 1B type + 16B conn_id/session_id
 pub const FRAME_HEADER_LEN: usize = 18;
 
 /// UUID 36 字符串 → 16 原始字节。
@@ -362,6 +390,30 @@ pub fn encode_tcp_data_frame(conn_id: &str, payload: &[u8]) -> Result<Vec<u8>, S
 /// 版本/类型/长度不对返回 Err（调用方按畸形帧丢弃，F10 语义）；
 /// conn_id 16 字节不校验版本位（与 python uuid 语义一致）。
 pub fn decode_tcp_data_frame(frame: &[u8]) -> Result<(String, Vec<u8>), String> {
+    decode_uuid_frame(frame, FRAME_TYPE_TCP_DATA)
+}
+
+/// udp_data 二进制帧编码：0x02 0x03 + session_id 原始字节 + 原始 payload。
+/// session_id 非 UUID 字符串返回 Err（协议 v2 udp，双向）。
+pub fn encode_udp_data_frame(session_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    frame.push(FRAME_PROTOCOL_VERSION);
+    frame.push(FRAME_TYPE_UDP_DATA);
+    frame.extend_from_slice(&uuid_to_bytes(session_id)?);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// udp_data 二进制帧解码 → (session_id 36 字符串, payload 原始字节)。
+///
+/// 版本/类型/长度不对返回 Err（调用方按畸形帧丢弃，F10 语义）；
+/// session_id 16 字节不校验版本位（与 python uuid 语义一致）。
+pub fn decode_udp_data_frame(frame: &[u8]) -> Result<(String, Vec<u8>), String> {
+    decode_uuid_frame(frame, FRAME_TYPE_UDP_DATA)
+}
+
+/// 共享解帧：0x02 + 期望帧类型 + 16B UUID + payload
+fn decode_uuid_frame(frame: &[u8], frame_type: u8) -> Result<(String, Vec<u8>), String> {
     if frame.len() < FRAME_HEADER_LEN {
         return Err(format!("invalid frame: too short ({})", frame.len()));
     }
@@ -371,7 +423,7 @@ pub fn decode_tcp_data_frame(frame: &[u8]) -> Result<(String, Vec<u8>), String> 
             frame[0]
         ));
     }
-    if frame[1] != FRAME_TYPE_TCP_DATA {
+    if frame[1] != frame_type {
         return Err(format!("invalid frame: unsupported type 0x{:02x}", frame[1]));
     }
     let mut id = [0u8; 16];
@@ -602,11 +654,12 @@ mod tests {
 
     #[test]
     fn auth_declares_binary_frames_capability() {
-        // T2：客户端声明已实现的能力（auth wire 含 capabilities）
+        // T2：客户端声明已实现的能力（auth wire 含 capabilities）；T4 起追加 udp
         match Message::auth("tok", false) {
-            Message::Auth { capabilities, .. } => {
-                assert_eq!(capabilities, vec!["binary_frames".to_string()])
-            }
+            Message::Auth { capabilities, .. } => assert_eq!(
+                capabilities,
+                vec!["binary_frames".to_string(), "udp".to_string()]
+            ),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -664,6 +717,140 @@ mod tests {
     fn frame_encode_rejects_invalid_conn_id() {
         assert!(encode_tcp_data_frame("not-a-uuid", b"x").is_err());
         assert!(encode_tcp_data_frame("3f2a1b4c5d6e4f809a1b2c3d4e5f6a7b", b"x").is_err());
+    }
+
+    // ============== 协议 v2 T4：udp_data 帧（0x03）+ udp 消息 serde ==============
+
+    #[test]
+    fn udp_frame_roundtrip() {
+        let session_id = "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b";
+        let payload = b"hello udp \x00\x01\xff datagram";
+        let frame = encode_udp_data_frame(session_id, payload).unwrap();
+        let (out_id, out_payload) = decode_udp_data_frame(&frame).unwrap();
+        assert_eq!(out_id, session_id);
+        assert_eq!(out_payload, payload.to_vec());
+    }
+
+    #[test]
+    fn udp_frame_layout() {
+        // [0]=0x02 版本、[1]=0x03 帧类型、[2:18]=session_id 原始字节
+        let session_id = "00112233-4455-4677-8899-aabbccddeeff";
+        let frame = encode_udp_data_frame(session_id, b"abc").unwrap();
+        assert_eq!(frame.len(), FRAME_HEADER_LEN + 3);
+        assert_eq!(frame[0], FRAME_PROTOCOL_VERSION);
+        assert_eq!(frame[1], FRAME_TYPE_UDP_DATA);
+        assert_eq!(
+            &frame[2..18],
+            &b"\x00\x11\x22\x33\x44\x55\x46\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff"[..]
+        );
+        assert_eq!(&frame[18..], b"abc");
+    }
+
+    #[test]
+    fn udp_frame_empty_payload() {
+        let session_id = "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b";
+        let frame = encode_udp_data_frame(session_id, b"").unwrap();
+        assert_eq!(frame.len(), FRAME_HEADER_LEN);
+        let (out_id, payload) = decode_udp_data_frame(&frame).unwrap();
+        assert_eq!(out_id, session_id);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn udp_frame_cross_type_rejected() {
+        // tcp 帧不能当 udp 帧解、udp 帧不能当 tcp 帧解（帧类型互斥）
+        let tcp = encode_tcp_data_frame("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", b"x").unwrap();
+        assert!(decode_udp_data_frame(&tcp).unwrap_err().contains("type"));
+        let udp = encode_udp_data_frame("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", b"x").unwrap();
+        assert!(decode_tcp_data_frame(&udp).unwrap_err().contains("type"));
+    }
+
+    #[test]
+    fn udp_frame_decode_rejects_malformed() {
+        // 过短 / 错版本 / 错类型
+        assert!(decode_udp_data_frame(&[]).is_err());
+        assert!(decode_udp_data_frame(&[0x02, 0x03, 0x00]).is_err());
+        assert!(decode_udp_data_frame(&[0x02; 17]).is_err());
+        let mut bad = encode_udp_data_frame("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", b"x").unwrap();
+        bad[0] = 0x01;
+        assert!(decode_udp_data_frame(&bad).unwrap_err().contains("version"));
+        let mut bad = encode_udp_data_frame("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", b"x").unwrap();
+        bad[1] = 0x09;
+        assert!(decode_udp_data_frame(&bad).unwrap_err().contains("type"));
+    }
+
+    #[test]
+    fn udp_frame_encode_rejects_invalid_session_id() {
+        assert!(encode_udp_data_frame("not-a-uuid", b"x").is_err());
+        assert!(encode_udp_data_frame("3f2a1b4c5d6e4f809a1b2c3d4e5f6a7b", b"x").is_err());
+    }
+
+    #[test]
+    fn udp_frame_known_vector_matches_python() {
+        // 跨语言对齐锚：uuid.UUID("00112233-4455-4677-8899-aabbccddeeff").bytes
+        // + payload b"hi" 的期望字节（与 python 侧测试同一向量）
+        let frame = encode_udp_data_frame("00112233-4455-4677-8899-aabbccddeeff", b"hi").unwrap();
+        assert_eq!(
+            frame,
+            vec![
+                0x02, 0x03, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa,
+                0xbb, 0xcc, 0xdd, 0xee, 0xff, b'h', b'i'
+            ]
+        );
+    }
+
+    #[test]
+    fn udp_messages_parse_and_roundtrip() {
+        // 服务端 udp_open（带 timestamp 冗余字段，serde 容忍）
+        let open = Message::parse(
+            r#"{"type":"udp_open","session_id":"3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b","timestamp":"2026-09-29T00:00:00"}"#,
+        )
+        .unwrap();
+        match &open {
+            Message::UdpOpen { session_id } => {
+                assert_eq!(session_id, "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(open.type_name(), "udp_open");
+
+        // udp_close 带/不带 reason 双形态
+        let close = Message::parse(
+            r#"{"type":"udp_close","session_id":"3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b","reason":"idle timeout"}"#,
+        )
+        .unwrap();
+        match &close {
+            Message::UdpClose { session_id, reason } => {
+                assert_eq!(session_id, "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b");
+                assert_eq!(reason.as_deref(), Some("idle timeout"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(close.type_name(), "udp_close");
+
+        let close_no_reason = Message::parse(
+            r#"{"type":"udp_close","session_id":"3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b","timestamp":"now"}"#,
+        )
+        .unwrap();
+        match &close_no_reason {
+            Message::UdpClose { reason, .. } => assert!(reason.is_none()),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // roundtrip：序列化稳定
+        for m in [open, close, close_no_reason] {
+            let json = m.to_json();
+            let back = Message::parse(&json).unwrap();
+            assert_eq!(back.to_json(), json, "roundtrip mismatch for {m:?}");
+        }
+
+        // udp_close 构造器：reason=None 时字段不上线（wire 最小变化）
+        let wire = Message::udp_close("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", None).to_json();
+        assert!(!wire.contains("reason"), "{wire}");
+        let wire =
+            Message::udp_close("3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b", Some("boom".into()))
+                .to_json();
+        assert!(wire.contains(r#""reason":"boom""#), "{wire}");
     }
 
     #[test]

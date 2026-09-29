@@ -3,7 +3,7 @@
 
 - AuthMessage / AuthOkMessage 增加可选 capabilities: list[str]，缺字段 = 空集合
 - 协商语义：服务端注册表 ∩ 客户端声明 − kill 开关禁用集，只回交集
-- 服务端注册表 SERVER_CAPABILITIES 随实现注册能力名（现为 binary_frames + chunked_http）
+- 服务端注册表 SERVER_CAPABILITIES 随实现注册能力名（现为 binary_frames + chunked_http + udp）
 - ActiveConnection.capabilities 存协商结果（本任务只存不用）
 - 端到端：auth 带 capabilities → auth_ok 回交集；kill 开关经 env 生效
 """
@@ -27,8 +27,8 @@ def _make_server(**config_kwargs) -> TunnelServer:
 
 class TestNegotiateCapabilities:
     def test_registry_has_implemented_capabilities(self):
-        """T3 起注册表含 binary_frames（T2）与 chunked_http（T3）"""
-        assert SERVER_CAPABILITIES == ["binary_frames", "chunked_http"]
+        """T4 起注册表含 binary_frames（T2）、chunked_http（T3）与 udp（T4）"""
+        assert SERVER_CAPABILITIES == ["binary_frames", "chunked_http", "udp"]
 
     def test_intersection_semantics(self, monkeypatch):
         """交集语义：客户端声明 ∩ 服务端注册表；声明了未注册能力不启用"""

@@ -101,6 +101,25 @@ class TunnelServerConfig(BaseSettings):
         description="外部 TCP 连接空闲超时（秒）：连上不发数据的慢连接超时后被服务端关闭回收；0 = 不启用（env: WS_TUNNEL_TCP_IDLE_TIMEOUT）",
     )
 
+    # UDP 监听配置（协议 v2 udp 能力，可选；启用后经隧道转发 UDP 数据报）
+    udp_listen: str | None = Field(
+        default=None,
+        description="UDP 多监听器配置（可选）：'port:domain[,port:domain...]'，"
+        "每端口固定绑定一条隧道；与 TCP 监听同格式、独立 env，UDP/TCP 可同端口号并存；"
+        "监听地址复用 tcp_listen_host（默认仅回环）（env: WS_TUNNEL_UDP_LISTEN）",
+    )
+    udp_session_timeout: int = Field(
+        default=60,
+        description="UDP 会话空闲超时（秒）：超时无包的会话由周期 sweeper 回收"
+        "（发 udp_close + 删映射）；0 = 不限（env: WS_TUNNEL_UDP_SESSION_TIMEOUT）",
+    )
+    udp_max_sessions: int = Field(
+        default=256,
+        description="每隧道 UDP 会话数上限（0 = 不限），超限丢包——UDP 无连接，"
+        "防会话表被扫爆（反射放大风险见 PROTOCOL.md「UDP 会话语义」）"
+        "（env: WS_TUNNEL_UDP_MAX_SESSIONS）",
+    )
+
     # 协议 v2 能力协商（kill 开关）
     disable_capabilities: str | None = Field(
         default=None,

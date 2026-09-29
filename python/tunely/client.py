@@ -48,8 +48,12 @@ from .protocol import (
     TcpConnectMessage,
     TcpDataMessage,
     TcpCloseMessage,
+    UdpCloseMessage,
+    UdpOpenMessage,
     decode_tcp_data_frame,
+    decode_udp_data_frame,
     encode_tcp_data_frame,
+    encode_udp_data_frame,
     parse_message,
     parse_message_fast,
     stream_chunk_payload,
@@ -57,7 +61,9 @@ from .protocol import (
     stream_start_payload,
     tcp_close_payload,
     tcp_data_payload,
+    udp_close_payload,
     dump_payload,
+    FRAME_TYPE_UDP_DATA,
 )
 
 logger = logging.getLogger(__name__)
@@ -247,6 +253,142 @@ class TcpConnection:
                 logger.error(f"关闭 TCP writer 错误: {e}")
 
 
+class _UdpTargetProtocol(asyncio.DatagramProtocol):
+    """到目标服务的 UDP socket 协议（客户端侧，协议 v2 udp）
+
+    datagram_received 是同步回调不能 await——入有界队列，由 UdpSession 的
+    pump 任务顺序消费回发 0x03 帧（队满丢包，UDP 有损语义）。
+    """
+
+    def __init__(self, session: "UdpSession"):
+        self.session = session
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        self.session.enqueue_inbound(data)
+
+    def error_received(self, exc: Exception | None) -> None:
+        # 连接型 UDP socket 的 ICMP 错误（如目标端口不可达）在此上报：
+        # 交给会话异步收尾（发 udp_close + 关闭），不抛进事件循环
+        self.session.report_error(exc)
+
+
+class UdpSession:
+    """
+    单个 UDP 会话管理（协议 v2 udp）
+
+    每会话一个到目标服务的 UDP socket：
+    - 服务端 → 客户端方向（0x03 帧解出 payload）由消息循环调 send_to_target
+      直接 sendto 目标；
+    - 目标 → 服务端方向回包入有界队列，pump 任务顺序回发 0x03 帧
+      （队满丢包——UDP 有损语义，不反压不积压）。
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        websocket,
+        queue_maxsize: int = 64,
+        on_error=None,
+    ):
+        self.session_id = session_id
+        self._websocket = websocket
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
+        self._on_error = on_error
+        self._transport: asyncio.DatagramTransport | None = None
+        self._pump_task: asyncio.Task | None = None
+        self._closed = False
+
+    async def connect(self, target_host: str, target_port: int) -> bool:
+        """建立到目标的 UDP socket 并启动回包 pump 任务"""
+        try:
+            loop = asyncio.get_event_loop()
+            self._transport, _ = await loop.create_datagram_endpoint(
+                lambda: _UdpTargetProtocol(self),
+                remote_addr=(target_host, target_port),
+            )
+        except Exception as e:
+            logger.error(
+                f"UDP socket 建立失败: {self.session_id} -> {target_host}:{target_port}, {e}"
+            )
+            return False
+        self._pump_task = asyncio.create_task(self._pump_loop())
+        logger.info(
+            f"UDP 会话已建立: {self.session_id} -> {target_host}:{target_port}"
+        )
+        return True
+
+    def enqueue_inbound(self, data: bytes) -> None:
+        """目标回包入队（队满丢弃本包——UDP 有损语义，不积压内存）"""
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(data)
+        except asyncio.QueueFull:
+            logger.debug(
+                f"UDP 回包队列已满，丢包: session_id={self.session_id}, size={len(data)}"
+            )
+
+    def report_error(self, exc: Exception | None) -> None:
+        """socket 错误上报（ICMP 不可达等）：异步收尾，不在回调里 await"""
+        if self._closed:
+            return
+        logger.warning(f"UDP socket 错误: session_id={self.session_id}, {exc}")
+        if self._on_error is not None:
+            try:
+                result = self._on_error(self, exc)
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
+            except Exception as e:
+                logger.error(f"UDP 会话错误收尾失败: session_id={self.session_id}, {e}")
+
+    async def _pump_loop(self) -> None:
+        """回包 pump：队列 → 0x03 二进制帧回发服务端"""
+        while True:
+            data = await self._queue.get()
+            if data is None:
+                break
+            try:
+                await self._websocket.send(encode_udp_data_frame(self.session_id, data))
+            except Exception as e:
+                logger.error(f"发送 UDP 数据失败: session_id={self.session_id}, {e}")
+                break
+
+    async def send_to_target(self, data: bytes) -> None:
+        """服务端方向数据写入目标 socket"""
+        if self._closed or self._transport is None:
+            return
+        try:
+            self._transport.sendto(data)
+        except Exception as e:
+            logger.error(
+                f"UDP 写入目标失败: session_id={self.session_id}, {e}"
+            )
+            self.report_error(e)
+
+    async def close(self) -> None:
+        """关闭会话（幂等）：关 socket、停 pump"""
+        if self._closed:
+            return
+        self._closed = True
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception as e:
+                logger.error(f"关闭 UDP socket 错误: session_id={self.session_id}, {e}")
+            self._transport = None
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            try:
+                await self._pump_task
+            except asyncio.CancelledError:
+                pass
+            self._pump_task = None
+
+
 class TunnelClient:
     """
     隧道客户端
@@ -294,6 +436,9 @@ class TunnelClient:
 
         # TCP 连接管理（TCP 模式使用）
         self._tcp_connections: Dict[str, TcpConnection] = {}
+
+        # UDP 会话管理（协议 v2 udp）：session_id → UdpSession
+        self._udp_sessions: Dict[str, UdpSession] = {}
         
         # 目标服务解析（TCP 模式使用）
         self._target_host: str = "localhost"
@@ -407,10 +552,10 @@ class TunnelClient:
         """本客户端已实现并声明的能力（协议 v2 能力协商）。
 
         铁律：只许声明已实现的能力（声明了没实现 = 服务端会用而客户端解析不了）。
-        T2 起实现 binary_frames；T3 起实现 chunked_http（非 SSE 大响应流式回传）。
-        新能力实现后在此追加。
+        T2 起实现 binary_frames；T3 起实现 chunked_http（非 SSE 大响应流式回传）；
+        T4 起实现 udp（UDP 会话透传）。新能力实现后在此追加。
         """
-        return ["binary_frames", "chunked_http"]
+        return ["binary_frames", "chunked_http", "udp"]
 
     async def _connect_and_run(self) -> None:
         """连接并运行"""
@@ -458,8 +603,12 @@ class TunnelClient:
                 if self._on_connect:
                     self._on_connect()
 
-                # 消息循环
-                await self._message_loop(websocket)
+                # 消息循环（WS 断连时同步回收本连接的全部 UDP 会话——
+                # 协议 v2 udp：socket 不随重连跨连接复用）
+                try:
+                    await self._message_loop(websocket)
+                finally:
+                    await self._close_all_udp_sessions()
 
     async def _message_loop(self, websocket) -> None:
         """消息处理循环"""
@@ -471,6 +620,11 @@ class TunnelClient:
                 if isinstance(raw_message, bytes):
                     if "binary_frames" not in self._negotiated:
                         logger.warning("未协商 binary_frames，收到 WS 二进制消息已丢弃")
+                        continue
+                    # 协议 v2 udp（T4）：帧类型 0x03 = udp_data 走 UDP 会话路径
+                    # （另需该连接协商了 udp）；0x01 及其余按 tcp_data 解帧
+                    if len(raw_message) >= 2 and raw_message[1] == FRAME_TYPE_UDP_DATA:
+                        await self._handle_udp_frame(raw_message)
                         continue
                     try:
                         conn_id, data = decode_tcp_data_frame(raw_message)
@@ -510,6 +664,14 @@ class TunnelClient:
                 elif isinstance(message, TcpCloseMessage):
                     # 处理 TCP 连接关闭
                     await self._handle_tcp_close(message)
+
+                elif isinstance(message, UdpOpenMessage):
+                    # 处理 UDP 会话建立（协议 v2 udp）
+                    await self._handle_udp_open(message)
+
+                elif isinstance(message, UdpCloseMessage):
+                    # 处理 UDP 会话关闭
+                    await self._handle_udp_close(message)
 
                 else:
                     logger.warning(f"未知消息类型: {type(message)}")
@@ -907,6 +1069,89 @@ class TunnelClient:
             await conn.close(message.error)
         else:
             logger.warning(f"尝试关闭未知连接: {conn_id}")
+
+    # ============== UDP 会话处理方法（协议 v2 udp） ==============
+
+    async def _handle_udp_open(self, message: UdpOpenMessage) -> None:
+        """
+        处理 UDP 会话建立请求
+
+        建立到目标服务的 UDP socket（每会话一个）并登记；socket 失败时
+        回执 udp_close 通知服务端拆会话。
+        """
+        session_id = message.session_id
+        # 能力门控：未协商 udp 的连接不该收到 udp_open（防御：丢弃）
+        if "udp" not in self._negotiated:
+            logger.warning("未协商 udp，忽略 udp_open")
+            return
+        if session_id in self._udp_sessions:
+            logger.warning(f"UDP 会话已存在，忽略重复的 udp_open: {session_id}")
+            return
+
+        session = UdpSession(
+            session_id,
+            self._websocket,
+            on_error=self._teardown_udp_session_on_error,
+        )
+        if not await session.connect(self._target_host, self._target_port):
+            # socket 建立失败：UdpSession 未启动 pump，直接回执关闭
+            await self._send_udp_close(session_id, "target socket failed")
+            return
+        self._udp_sessions[session_id] = session
+
+    async def _handle_udp_frame(self, frame: bytes) -> None:
+        """udp_data 二进制帧落地：解帧后写入对应会话的目标 socket"""
+        # 能力门控：未协商 udp 的连接不该收到 0x03 帧（防御：丢弃）
+        if "udp" not in self._negotiated:
+            logger.warning("未协商 udp，收到 udp_data 二进制帧已丢弃")
+            return
+        try:
+            session_id, data = decode_udp_data_frame(frame)
+        except ValueError as e:
+            logger.warning(f"丢弃畸形 udp 帧: {e}")
+            return
+        session = self._udp_sessions.get(session_id)
+        if session is None:
+            logger.debug(f"收到未知 UDP 会话的数据: {session_id}")
+            return
+        await session.send_to_target(data)
+
+    async def _handle_udp_close(self, message: UdpCloseMessage) -> None:
+        """服务端关闭 UDP 会话（空闲超时回收等）：关本地 socket"""
+        session_id = message.session_id
+        session = self._udp_sessions.pop(session_id, None)
+        if session:
+            logger.info(
+                f"关闭 UDP 会话: {session_id} (reason={message.reason or 'n/a'})"
+            )
+            await session.close()
+        else:
+            logger.debug(f"尝试关闭未知 UDP 会话: {session_id}")
+
+    async def _teardown_udp_session_on_error(self, session: UdpSession, exc) -> None:
+        """socket 错误收尾：从会话表移除 + 关 socket + 回执 udp_close（尽力而为）"""
+        if self._udp_sessions.get(session.session_id) is session:
+            del self._udp_sessions[session.session_id]
+        await session.close()
+        await self._send_udp_close(session.session_id, f"socket error: {exc}")
+
+    async def _send_udp_close(self, session_id: str, reason: str | None = None) -> None:
+        """主动上报会话关闭（尽力而为：WS 已断时静默失败）"""
+        if not self._websocket:
+            return
+        try:
+            await self._websocket.send(dump_payload(udp_close_payload(session_id, reason)))
+        except Exception as e:
+            logger.debug(f"发送 udp_close 失败（忽略）: session_id={session_id}, {e}")
+
+    async def _close_all_udp_sessions(self) -> None:
+        """回收本连接全部 UDP 会话（WS 断连 / stop() 时调用）"""
+        sessions = list(self._udp_sessions.values())
+        self._udp_sessions.clear()
+        for session in sessions:
+            await session.close()
+        if sessions:
+            logger.info(f"已回收 {len(sessions)} 个 UDP 会话（连接断开）")
 
 
 async def run_tunnel_client(

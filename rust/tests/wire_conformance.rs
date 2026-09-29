@@ -161,12 +161,67 @@ fn auth_serialization_omits_empty_capabilities() {
     );
 }
 
-/// T2：Message::auth 恒声明已实现的 binary_frames 能力（auth wire 含 capabilities）
+/// T2/T4：Message::auth 恒声明已实现的 binary_frames + udp 能力（auth wire 含 capabilities）
 #[test]
 fn auth_declares_binary_frames() {
     let wire = Message::auth("tok", false).to_json();
     assert!(
-        wire.contains(r#""capabilities":["binary_frames"]"#),
-        "auth 应声明 binary_frames: {wire}"
+        wire.contains(r#""capabilities":["binary_frames","udp"]"#),
+        "auth 应声明 binary_frames + udp: {wire}"
+    );
+}
+
+// ============== 协议 v2 T4：udp_open / udp_close conformance ==============
+
+/// udp_open：服务端 wire（带 timestamp 冗余字段）解析 + 序列化形状
+#[test]
+fn udp_open_parses_and_serializes() {
+    let msg = Message::parse(
+        r#"{"type":"udp_open","session_id":"3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b","timestamp":"2026-09-29T02:00:06.000000+00:00"}"#,
+    )
+    .expect("udp_open 必须可解析（timestamp 冗余字段容忍）");
+    match &msg {
+        Message::UdpOpen { session_id } => {
+            assert_eq!(session_id, "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b")
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let wire = serde_json::to_value(&msg).unwrap();
+    assert_eq!(wire["type"], "udp_open");
+    assert_eq!(
+        wire["session_id"],
+        "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b"
+    );
+}
+
+/// udp_close：带 reason / 不带 reason 双形态 + 缺 reason 反序列化缺省安全
+#[test]
+fn udp_close_parses_with_and_without_reason() {
+    let with_reason = Message::parse(
+        r#"{"type":"udp_close","session_id":"3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b","reason":"idle timeout"}"#,
+    )
+    .expect("带 reason 的 udp_close 必须可解析");
+    match &with_reason {
+        Message::UdpClose { session_id, reason } => {
+            assert_eq!(session_id, "3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b");
+            assert_eq!(reason.as_deref(), Some("idle timeout"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let without_reason = Message::parse(
+        r#"{"type":"udp_close","session_id":"3f2a1b4c-5d6e-4f80-9a1b-2c3d4e5f6a7b","timestamp":"now"}"#,
+    )
+    .expect("缺 reason 的 udp_close 必须可解析（缺省安全）");
+    match &without_reason {
+        Message::UdpClose { reason, .. } => assert!(reason.is_none()),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // reason=None 不上线（wire 最小变化）
+    assert!(
+        !without_reason.to_json().contains("reason"),
+        "{}",
+        without_reason.to_json()
     );
 }

@@ -62,6 +62,8 @@ from .protocol import (
     TcpConnectMessage,
     TcpDataMessage,
     TcpCloseMessage,
+    UdpCloseMessage,
+    UdpOpenMessage,
     parse_message,
     parse_message_fast,
     dump_payload,
@@ -69,8 +71,13 @@ from .protocol import (
     tcp_close_payload,
     tcp_connect_payload,
     tcp_data_payload,
+    udp_close_payload,
+    udp_open_payload,
     decode_tcp_data_frame,
+    decode_udp_data_frame,
     encode_tcp_data_frame,
+    encode_udp_data_frame,
+    FRAME_TYPE_UDP_DATA,
 )
 from .repository import TunnelRepository, TunnelRequestLogRepository, AdminAuditLogRepository
 
@@ -102,10 +109,15 @@ _TCP_WRITE_QUEUE_MAXSIZE = 64
 # 不再每 chunk 双 task 等待「新消息 vs 失败事件」）
 _STREAM_FAILED = object()
 
+# 每个 UDP 监听器的收包队列长度（个；datagram_received 是同步回调不能 await，
+# 入队后由专职 pump 任务顺序消费）。队满按丢包处理（UDP 有损语义），不反压内核
+_UDP_QUEUE_MAXSIZE = 1024
+
 # 服务端能力注册表（协议 v2 能力协商，见 docs/PROTOCOL_V2.md §0）。
 # 认证时按「服务端注册表 ∩ 客户端声明 − disable_capabilities」回交集。
-# T2 binary_frames：WS binary 数据面帧；T3 chunked_http：非 SSE 大响应流式回传。
-SERVER_CAPABILITIES: list[str] = ["binary_frames", "chunked_http"]
+# T2 binary_frames：WS binary 数据面帧；T3 chunked_http：非 SSE 大响应流式回传；
+# T4 udp：UDP 会话透传（0x03 二进制帧数据面 + udp_open/udp_close JSON 控制面）。
+SERVER_CAPABILITIES: list[str] = ["binary_frames", "chunked_http", "udp"]
 
 
 def _client_ip(http_request: Request | None) -> str | None:
@@ -169,7 +181,8 @@ class ActiveConnection:
     # 注意：历史 TS/py 客户端曾硬编码/默认 "0.1.0"，该值不可信到 0.2.7/0.7.2 前
     client_version: str = "unknown"
     # 协商启用的能力（AuthOk.capabilities 的连接侧快照，协议 v2）。
-    # 后续 T2/T3 按「该连接是否协商了 X」门控新行为——本任务只存不用。
+    # 数据面路径按「该连接是否协商了 X」门控：binary_frames（T2）、
+    # chunked_http（T3）、udp（T4）。
     capabilities: frozenset[str] = field(default_factory=frozenset)
     connected_at: datetime = field(default_factory=datetime.now)
     last_heartbeat: datetime = field(default_factory=datetime.now)
@@ -245,6 +258,22 @@ class PendingTcpRequest:
     total_bytes: int = 0  # 已累积字节数（tcp_forward_max_buffer_bytes 限额用）
     domain: str = ""  # 归属隧道（跨隧道串扰校验用）
     created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class UdpSessionState:
+    """UDP 会话状态（服务端监听场景，协议 v2 udp）
+
+    会话键 = (监听端口, 外部 addr)：同一外部地址在同一监听端口上的所有
+    数据报归属同一会话（UDP 无连接，服务端按源地址区分「连接」）。
+    """
+
+    session_id: str
+    domain: str  # 归属隧道（跨隧道串扰校验 + 回程连接查找用）
+    port: int  # 服务端 UDP 监听端口
+    addr: tuple  # 外部源地址 (host, port)，回程 sendto 目标
+    created_at: datetime = field(default_factory=datetime.now)
+    last_seen: datetime = field(default_factory=datetime.now)  # 空闲超时回收用
 
 
 # ============== 请求/响应模型 ==============
@@ -368,6 +397,9 @@ class TunnelManager:
 
         # conn_id → PendingTcpRequest（TCP 模式 - HTTP 触发的 TCP 转发）
         self._pending_tcp_requests: dict[str, PendingTcpRequest] = {}
+
+        # (监听端口, 外部 addr) → UdpSessionState（UDP 模式，协议 v2 udp）
+        self._udp_sessions: dict[tuple, UdpSessionState] = {}
 
         # 内存安全上限（0 = 不限制）
         self.tcp_forward_max_buffer_bytes = tcp_forward_max_buffer_bytes
@@ -525,6 +557,14 @@ class TunnelManager:
                 logger.warning(
                     f"隧道断连，TCP 转发请求已失败: domain={domain}, conn_id={conn_id}"
                 )
+
+        # 4. UDP 会话：直接清表（协议 v2 udp）。WS 已断，udp_close 发不到客户端，
+        # 客户端靠自身 WS 断连清理路径回收本地 socket。
+        removed = self.cleanup_udp_sessions_for_domain(domain)
+        if removed:
+            logger.warning(
+                f"隧道断连，UDP 会话已清理: domain={domain}, sessions={removed}"
+            )
 
     def get_connection_by_domain(self, domain: str) -> ActiveConnection | None:
         """根据域名获取连接"""
@@ -976,8 +1016,97 @@ class TunnelManager:
         if pending and not pending.future.done():
             pending.future.cancel()
 
+    # ============== UDP 会话表（协议 v2 udp） ==============
+
+    def add_udp_session(self, key: tuple, session: UdpSessionState) -> None:
+        """登记 UDP 会话（会话键 = (监听端口, 外部 addr)；同键覆盖视为重建）"""
+        self._udp_sessions[key] = session
+
+    def get_udp_session_by_addr(self, key: tuple) -> UdpSessionState | None:
+        """按会话键（监听端口 + 外部 addr）查会话"""
+        return self._udp_sessions.get(key)
+
+    def get_udp_session(self, session_id: str) -> UdpSessionState | None:
+        """按 session_id 查会话（O(n) 扫描；会话规模受 udp_max_sessions 约束）"""
+        for session in self._udp_sessions.values():
+            if session.session_id == session_id:
+                return session
+        return None
+
+    def remove_udp_session(self, key: tuple) -> UdpSessionState | None:
+        """按会话键移除会话，返回被移除的会话（不存在返回 None）"""
+        return self._udp_sessions.pop(key, None)
+
+    def remove_udp_session_by_id(self, session_id: str) -> UdpSessionState | None:
+        """按 session_id 移除会话（客户端主动 udp_close 用）"""
+        key = next(
+            (k for k, s in self._udp_sessions.items() if s.session_id == session_id),
+            None,
+        )
+        return self._udp_sessions.pop(key, None) if key is not None else None
+
+    def count_udp_sessions(self, domain: str) -> int:
+        """统计指定隧道的活跃 UDP 会话数（udp_max_sessions 限额 / metrics 用）"""
+        return sum(1 for s in self._udp_sessions.values() if s.domain == domain)
+
+    def list_udp_session_domains(self) -> list[str]:
+        """列出当前有活跃 UDP 会话的隧道域名（去重排序）"""
+        return sorted({s.domain for s in self._udp_sessions.values() if s.domain})
+
+    def iter_udp_sessions(self) -> list[tuple[tuple, UdpSessionState]]:
+        """会话表快照（sweeper 遍历用，避免遍历时变更）"""
+        return list(self._udp_sessions.items())
+
+    def cleanup_udp_sessions_for_domain(self, domain: str) -> int:
+        """清理指定隧道的全部 UDP 会话（隧道断连时调用；同步无 IO，可在锁内调用）"""
+        if not domain:
+            return 0
+        stale = [k for k, s in self._udp_sessions.items() if s.domain == domain]
+        for key in stale:
+            self._udp_sessions.pop(key, None)
+        return len(stale)
+
+    def clear_udp_sessions(self) -> int:
+        """清空全部 UDP 会话（服务端停机时调用），返回清理数"""
+        n = len(self._udp_sessions)
+        self._udp_sessions.clear()
+        return n
+
 
 # ============== 隧道服务器 ==============
+
+
+class _UdpDatagramProtocol(asyncio.DatagramProtocol):
+    """UDP 监听器协议（协议 v2 udp）
+
+    datagram_received 是事件循环内的同步回调，不能 await——这里只做
+    有界入队（队满丢包，UDP 有损语义），由 TunnelServer 为每监听器启动的
+    pump 任务顺序消费：入包顺序严格保持，udp_open 严格先于首个数据帧。
+    """
+
+    def __init__(
+        self, server: "TunnelServer", port: int, domain: str, queue: asyncio.Queue
+    ):
+        self.server = server
+        self.port = port
+        self.domain = domain
+        self.queue = queue
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        try:
+            self.queue.put_nowait((data, addr))
+        except asyncio.QueueFull:
+            logger.warning(
+                f"UDP 收包队列已满，丢包: port={self.port}, addr={addr}, size={len(data)}"
+            )
+
+    def error_received(self, exc: Exception | None) -> None:
+        # 收包路径的 ICMP 错误等（UDP 监听 socket 本身通常不因此关闭）
+        logger.debug(f"UDP 监听器错误（忽略）: port={self.port}, {exc}")
 
 
 class TunnelServer:
@@ -1001,6 +1130,14 @@ class TunnelServer:
         self._tcp_servers: list[asyncio.Server] = []
         # 监听端口 -> 绑定的隧道域名（多监听器路由）
         self._listener_domains: dict[int, str] = {}
+        # UDP 监听器（协议 v2 udp）：端口 → transport / 绑定的隧道域名
+        self._udp_transports: dict[int, asyncio.DatagramTransport] = {}
+        self._udp_listener_domains: dict[int, str] = {}
+        # 每个 UDP 监听器的收包队列（datagram_received 同步回调入队，
+        # pump 任务顺序消费——严格保持入包顺序，udp_open 严格先于首个数据帧）
+        self._udp_queues: dict[int, asyncio.Queue] = {}
+        self._udp_pump_tasks: list[asyncio.Task] = []
+        self._udp_sweeper_task: asyncio.Task | None = None
         # 每隧道流量统计（内存态计数，周期性落库）：domain -> {"bytes_in": n, "bytes_out": n}
         # bytes_in = 外部 → 内网服务；bytes_out = 内网服务 → 外部
         self._tunnel_bytes: dict[str, dict[str, int]] = {}
@@ -1033,6 +1170,9 @@ class TunnelServer:
 
         # 如果配置了 TCP 监听端口，启动 TCP 监听
         await self._start_tcp_listeners()
+
+        # 如果配置了 UDP 监听端口，启动 UDP 监听（协议 v2 udp）
+        await self._start_udp_listeners()
 
         # 启动流量统计周期落库任务
         self._start_bytes_flush_task()
@@ -1095,6 +1235,30 @@ class TunnelServer:
             logger.info(f"TCP 监听器已关闭（{len(self._tcp_servers)} 个）")
         self._tcp_servers = []
         self._listener_domains.clear()
+        # 停 UDP sweeper、关 UDP 监听器与 pump、清会话表（协议 v2 udp）
+        if self._udp_sweeper_task:
+            self._udp_sweeper_task.cancel()
+            try:
+                await self._udp_sweeper_task
+            except asyncio.CancelledError:
+                pass
+            self._udp_sweeper_task = None
+        for transport in self._udp_transports.values():
+            try:
+                transport.close()
+            except Exception:
+                pass
+        self._udp_transports.clear()
+        self._udp_listener_domains.clear()
+        for pump_task in self._udp_pump_tasks:
+            pump_task.cancel()
+        if self._udp_pump_tasks:
+            await asyncio.gather(*self._udp_pump_tasks, return_exceptions=True)
+        self._udp_pump_tasks = []
+        self._udp_queues.clear()
+        closed_sessions = self.manager.clear_udp_sessions()
+        if closed_sessions:
+            logger.info(f"UDP 会话已清理（{closed_sessions} 个）")
         if self.db:
             await self.db.close()
         logger.info("TunnelServer 已关闭")
@@ -1593,6 +1757,10 @@ class TunnelServer:
                         tunnel_domain,
                     ):
                         await self._handle_tcp_close_from_client(message)
+                # UDP 消息处理（协议 v2 udp）：数据面走 0x03 binary 帧（见
+                # _handle_ws_binary_message 分派），控制面仅 udp_close（客户端主动关闭）
+                elif isinstance(message, UdpCloseMessage):
+                    await self._handle_udp_close_from_client(message, tunnel_domain)
                 else:
                     logger.warning(f"未知消息类型: {type(message)}")
 
@@ -1618,6 +1786,8 @@ class TunnelServer:
         """处理 WS binary 消息（协议 v2 binary_frames，能力门控）
 
         - 未协商该能力的连接收到 binary → warning + 丢弃（F10 语义，不断连）
+        - 帧类型分派（协议 v2 T4）：0x03 = udp_data 走 UDP 会话路径（另需
+          该连接协商了 udp）；0x01 及其余按 tcp_data 解帧
         - 畸形帧（版本/类型/长度不对）→ warning + 丢弃
         - 解出 conn_id + payload 后与 TcpDataMessage 的 JSON 路径汇合：
           同样的跨隧道归属校验 + _route_tcp_payload 落地
@@ -1625,6 +1795,9 @@ class TunnelServer:
         conn = self.manager.get_connection_by_token(token) if token else None
         if conn is None or "binary_frames" not in conn.capabilities:
             logger.warning("未协商 binary_frames，收到 WS 二进制消息已丢弃")
+            return
+        if len(payload) >= 2 and payload[1] == FRAME_TYPE_UDP_DATA:
+            await self._handle_udp_data_frame(conn, tunnel_domain, payload)
             return
         try:
             conn_id, data = decode_tcp_data_frame(payload)
@@ -2796,6 +2969,15 @@ class TunnelServer:
             ],
         )
         emit(
+            "tunely_udp_sessions_active",
+            "gauge",
+            "Active UDP sessions per tunnel domain",
+            [
+                (f'{{domain="{self._escape_prometheus_label(d)}"}}', self.manager.count_udp_sessions(d))
+                for d in self.manager.list_udp_session_domains()
+            ],
+        )
+        emit(
             "tunely_tunnel_bytes_in",
             "counter",
             "Bytes forwarded from external to tunnel client (cumulative)",
@@ -3055,6 +3237,224 @@ class TunnelServer:
             pass
         except Exception as e:
             logger.error(f"TCP 读取错误: conn_id={conn_id}, {e}")
+
+    # ============== UDP 监听器与会话（协议 v2 udp，docs/PROTOCOL_V2.md §5） ==============
+
+    def _resolve_udp_listen_specs(self) -> list[tuple[int, str]]:
+        """解析 WS_TUNNEL_UDP_LISTEN="port:domain[,port:domain...]"（同端口后项覆盖）"""
+        specs: dict[int, str] = {}
+        if self.config.udp_listen:
+            for entry in self.config.udp_listen.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    port_str, domain = entry.split(":", 1)
+                    port = int(port_str)
+                except ValueError:
+                    logger.warning(f"忽略无法解析的 UDP 监听配置项: {entry!r}")
+                    continue
+                specs[port] = domain.strip()
+        return list(specs.items())
+
+    async def _start_udp_listeners(self) -> None:
+        """启动全部 UDP 监听器（未配置 udp_listen 时为空操作——默认不开）"""
+        specs = self._resolve_udp_listen_specs()
+        if not specs:
+            return
+
+        host = self.config.tcp_listen_host
+        for port, domain in specs:
+            queue: asyncio.Queue = asyncio.Queue(maxsize=_UDP_QUEUE_MAXSIZE)
+            try:
+                transport, _protocol = await asyncio.get_event_loop().create_datagram_endpoint(
+                    lambda q=queue, p=port, d=domain: _UdpDatagramProtocol(self, p, d, q),
+                    local_addr=(host, port),
+                )
+            except OSError as e:
+                # F22 同款：端口冲突给可读报错（UDP/TCP 同端口号可并存，
+                # 但 UDP 端口自身被占用时仍需报错）
+                if e.errno == errno.EADDRINUSE:
+                    raise RuntimeError(
+                        f"UDP 监听端口被占用，无法绑定 {host}:{port}/udp"
+                        f"（归属隧道: {domain or '<首个在线隧道>'}）。"
+                        f"请换端口或停掉占用该端口的进程。"
+                    ) from e
+                raise
+            self._udp_transports[port] = transport
+            self._udp_listener_domains[port] = domain
+            self._udp_queues[port] = queue
+            pump = asyncio.create_task(self._udp_pump_loop(port, domain, queue))
+            self._udp_pump_tasks.append(pump)
+            logger.info(f"UDP 监听器已启动: {host}:{port}/udp -> {domain or '<首个在线隧道>'}")
+
+        # 空闲会话回收 sweeper（udp_session_timeout=0 = 不限时不启动）
+        if self.config.udp_session_timeout > 0:
+            self._udp_sweeper_task = asyncio.create_task(self._udp_session_sweeper_loop())
+
+    async def _udp_pump_loop(self, port: int, domain: str, queue: asyncio.Queue) -> None:
+        """UDP 收包 pump：顺序消费收包队列（单消费者保证 udp_open/帧发送有序）"""
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            data, addr = item
+            try:
+                await self._handle_udp_datagram(port, domain, addr, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"UDP 包处理错误: port={port}, addr={addr}, {e}")
+
+    async def _handle_udp_datagram(
+        self, port: int, domain: str, addr: tuple, data: bytes
+    ) -> None:
+        """外部 UDP 数据报落地：首包建会话（udp_open JSON + 0x03 帧），后续直接帧
+
+        会话键 = (监听端口, 外部 addr)。门控：隧道未连接或未协商 udp → 丢弃 +
+        warning（旧客户端 × 新服务端行为 = 无此流量）。上限：udp_max_sessions
+        （每隧道，0 = 不限）超限丢包（防会话表被扫爆 / 反射放大）。
+        """
+        conn = self.manager.get_connection_by_domain(domain)
+        if conn is None or "udp" not in conn.capabilities:
+            logger.warning(
+                f"丢弃 UDP 包（隧道 {domain} 未连接或未协商 udp）: "
+                f"port={port}, addr={addr}, size={len(data)}"
+            )
+            return
+
+        key = (port, tuple(addr))
+        session = self.manager.get_udp_session_by_addr(key)
+        if session is None:
+            max_sessions = self.config.udp_max_sessions
+            if max_sessions > 0 and self.manager.count_udp_sessions(domain) >= max_sessions:
+                logger.warning(
+                    f"隧道 {domain} UDP 会话数已达上限 ({max_sessions})，丢包: "
+                    f"port={port}, addr={addr}"
+                )
+                return
+            session_id = str(uuid.uuid4())
+            session = UdpSessionState(
+                session_id=session_id, domain=domain, port=port, addr=tuple(addr)
+            )
+            # 先登记会话再发送：后续同源包（同 pump 顺序）走「已有会话」分支，
+            # 保证 udp_open 严格先于首个数据帧到达客户端
+            self.manager.add_udp_session(key, session)
+            try:
+                await conn.websocket.send_text(dump_payload(udp_open_payload(session_id)))
+                await conn.websocket.send_bytes(encode_udp_data_frame(session_id, data))
+            except Exception as e:
+                self.manager.remove_udp_session(key)
+                logger.warning(f"udp_open 发送失败，会话回滚: session_id={session_id}, {e}")
+                return
+            logger.info(f"新建 UDP 会话: session_id={session_id}, domain={domain}, addr={addr}")
+        else:
+            session.last_seen = datetime.now()
+            try:
+                await conn.websocket.send_bytes(
+                    encode_udp_data_frame(session.session_id, data)
+                )
+            except Exception as e:
+                logger.warning(f"udp_data 帧发送失败: session_id={session.session_id}, {e}")
+                return
+        self._count_tunnel_bytes(domain, "bytes_out", len(data))
+
+    async def _handle_udp_data_frame(
+        self, conn: ActiveConnection, tunnel_domain: str | None, payload: bytes
+    ) -> None:
+        """客户端 → 外部方向 udp_data 二进制帧落地（协议 v2 udp，能力门控）"""
+        if "udp" not in conn.capabilities:
+            logger.warning("未协商 udp，收到 udp_data 二进制帧已丢弃")
+            return
+        try:
+            session_id, data = decode_udp_data_frame(payload)
+        except ValueError as e:
+            logger.warning(f"丢弃畸形 udp 帧: {e}")
+            return
+        session = self.manager.get_udp_session(session_id)
+        if session is None:
+            # 会话已被 sweeper 回收 / 客户端主动关闭 / 从未存在：debug 丢弃（UDP 语义）
+            logger.debug(f"udp_data 无对应会话，丢弃: session_id={session_id}")
+            return
+        if self._reject_cross_tunnel_message(
+            "udp_data", session_id, session.domain, tunnel_domain
+        ):
+            return
+        transport = self._udp_transports.get(session.port)
+        if transport is None or transport.is_closing():
+            logger.debug(f"UDP 监听器已关闭，丢弃: session_id={session_id}")
+            return
+        transport.sendto(data, session.addr)
+        session.last_seen = datetime.now()
+        self._count_tunnel_bytes(session.domain, "bytes_in", len(data))
+
+    async def _handle_udp_close_from_client(
+        self, message: UdpCloseMessage, tunnel_domain: str | None
+    ) -> None:
+        """客户端主动关闭 UDP 会话：删映射（客户端侧 socket 由它自己回收）"""
+        session = self.manager.get_udp_session(message.session_id)
+        if session is None:
+            logger.debug(f"udp_close 无对应会话（可能已被回收）: session_id={message.session_id}")
+            return
+        if self._reject_cross_tunnel_message(
+            "udp_close", message.session_id, session.domain, tunnel_domain
+        ):
+            return
+        self.manager.remove_udp_session((session.port, session.addr))
+        logger.info(
+            f"客户端关闭 UDP 会话: session_id={message.session_id}, domain={session.domain}, "
+            f"reason={message.reason or 'n/a'}"
+        )
+
+    async def _udp_session_sweeper_loop(self) -> None:
+        """UDP 空闲会话回收循环：周期扫描 last_seen 超时的会话"""
+        timeout = self.config.udp_session_timeout
+        # 扫描间隔：不超过 30s，也不小于 1s（timeout 很小时按 1s 粒度回收）
+        interval = max(1.0, min(timeout, 30.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._sweep_udp_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"UDP 会话回收失败（下轮重试）: {e}")
+
+    async def _sweep_udp_sessions(self) -> int:
+        """回收空闲超时的 UDP 会话（发 udp_close + 删映射），返回回收数
+
+        独立方法便于测试：把 udp_session_timeout 调小后可直接调用触发回收，
+        不必等 sweeper 周期。
+        """
+        timeout = self.config.udp_session_timeout
+        if timeout <= 0:
+            return 0
+        now = datetime.now()
+        expired = [
+            (key, session)
+            for key, session in self.manager.iter_udp_sessions()
+            if (now - session.last_seen).total_seconds() > timeout
+        ]
+        for key, session in expired:
+            self.manager.remove_udp_session(key)
+            await self._send_udp_close(session, reason="idle timeout")
+        if expired:
+            logger.info(f"UDP 空闲会话回收: {len(expired)} 个（timeout={timeout}s）")
+        return len(expired)
+
+    async def _send_udp_close(self, session: UdpSessionState, reason: str | None = None) -> None:
+        """向会话归属隧道下发 udp_close（尽力而为：连接不在/发送失败仅记日志）"""
+        conn = self.manager.get_connection_by_domain(session.domain)
+        if conn is None:
+            return
+        try:
+            await conn.websocket.send_text(
+                dump_payload(udp_close_payload(session.session_id, reason))
+            )
+        except Exception as e:
+            logger.debug(
+                f"udp_close 发送失败（忽略）: session_id={session.session_id}, {e}"
+            )
 
     # ============== TCP 模式支持方法（WebSocket 消息处理） ==============
 
