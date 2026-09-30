@@ -124,7 +124,15 @@ def _make_db_repo(get_by_token_return=None) -> tuple[MagicMock, AsyncMock]:
 
 
 class TestAuthFailureDelay:
-    """token 无效等认证失败路径：关闭前延迟；业务拒绝路径不受影响"""
+    """认证类失败统一出口（0.12，docs/PROBE_HARDENING.md T5）：
+
+    非 auth 首包 / token 不存在 / disabled / 已在线拒绝，全部走同一文案
+    （Authentication failed）+ 同一随机延迟区间 + close 1008——
+    历史「无效=延迟、业务拒绝=立即」的差异构成 token 存在性/在线状态 oracle。
+    """
+
+    # 与 server._AUTH_FAILURE_DELAY_RANGE 保持一致
+    DELAY_LO, DELAY_HI = 0.8, 1.6
 
     @pytest.mark.asyncio
     async def test_invalid_token_sleeps_before_close(self):
@@ -142,15 +150,19 @@ class TestAuthFailureDelay:
         ):
             await server._handle_websocket(mock_ws)
 
-        fake_sleep.assert_awaited_once_with(1.0)
+        assert fake_sleep.await_count == 1
+        (delay,), _ = fake_sleep.await_args
+        assert self.DELAY_LO <= delay <= self.DELAY_HI
         # 先发错误、再延迟、最后关闭
         mock_ws.close.assert_awaited_once_with(code=1008)
         sent = mock_ws.send_text.await_args.args[0]
-        assert "Invalid token" in sent
+        # 统一文案：不再泄露「token 是否存在」
+        assert "Authentication failed" in sent
+        assert "Invalid token" not in sent
 
     @pytest.mark.asyncio
     async def test_invalid_token_delay_measured_in_real_time(self):
-        """端到端计时验证：无效 token 的处理耗时 >= 延迟值"""
+        """端到端计时验证：无效 token 的处理耗时 >= 延迟区间下限"""
         server = TunnelServer(
             config=TunnelServerConfig(database_url="sqlite+aiosqlite:///:memory:")
         )
@@ -164,11 +176,11 @@ class TestAuthFailureDelay:
             await server._handle_websocket(mock_ws)
             elapsed = time.monotonic() - start
 
-        assert elapsed >= 0.5
+        assert elapsed >= self.DELAY_LO
 
     @pytest.mark.asyncio
     async def test_non_auth_message_first_sleeps_before_close(self):
-        """首条消息不是认证消息（认证握手失败）：同样延迟后关闭"""
+        """首条消息不是认证消息（认证握手失败）：同样统一延迟后关闭"""
         server = TunnelServer(
             config=TunnelServerConfig(database_url="sqlite+aiosqlite:///:memory:")
         )
@@ -177,12 +189,17 @@ class TestAuthFailureDelay:
         with patch("tunely.server.asyncio.sleep", new_callable=AsyncMock) as fake_sleep:
             await server._handle_websocket(mock_ws)
 
-        fake_sleep.assert_awaited_once_with(1.0)
+        assert fake_sleep.await_count == 1
+        (delay,), _ = fake_sleep.await_args
+        assert self.DELAY_LO <= delay <= self.DELAY_HI
         mock_ws.close.assert_awaited_once_with(code=1008)
 
     @pytest.mark.asyncio
-    async def test_disabled_tunnel_no_delay(self):
-        """业务拒绝（Tunnel is disabled）不加延迟"""
+    async def test_disabled_tunnel_uniform_rejection(self):
+        """业务拒绝（token 有效但 disabled）同样走统一延迟出口——不再秒回
+
+        历史 disabled 立即 close 构成「token 有效」oracle（快响应 = token 是真的）。
+        """
         server = TunnelServer(
             config=TunnelServerConfig(database_url="sqlite+aiosqlite:///:memory:")
         )
@@ -200,12 +217,17 @@ class TestAuthFailureDelay:
         ):
             await server._handle_websocket(mock_ws)
 
-        fake_sleep.assert_not_awaited()
+        assert fake_sleep.await_count == 1
+        (delay,), _ = fake_sleep.await_args
+        assert self.DELAY_LO <= delay <= self.DELAY_HI
         mock_ws.close.assert_awaited_once_with(code=1008)
+        sent = mock_ws.send_text.await_args.args[0]
+        assert "Authentication failed" in sent
+        assert "disabled" not in sent.lower()
 
     @pytest.mark.asyncio
-    async def test_already_connected_no_delay(self):
-        """业务拒绝（已有活跃连接）不加延迟"""
+    async def test_already_connected_uniform_rejection(self):
+        """业务拒绝（已有活跃连接）同样走统一延迟出口——不再秒回"""
         server = TunnelServer(
             config=TunnelServerConfig(database_url="sqlite+aiosqlite:///:memory:")
         )
@@ -228,8 +250,14 @@ class TestAuthFailureDelay:
         ):
             await server._handle_websocket(mock_ws)
 
-        fake_sleep.assert_not_awaited()
+        assert fake_sleep.await_count == 1
+        (delay,), _ = fake_sleep.await_args
+        assert self.DELAY_LO <= delay <= self.DELAY_HI
         mock_ws.close.assert_awaited_once_with(code=1008)
+        sent = mock_ws.send_text.await_args.args[0]
+        # 对外统一文案，内部拒绝原因（--force 提示）不再外泄
+        assert "Authentication failed" in sent
+        assert "--force" not in sent
 
 
 # ============== 任务3：每隧道 TCP 并发上限 ==============

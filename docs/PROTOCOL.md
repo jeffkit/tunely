@@ -68,7 +68,7 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `type` | string | ✓ | 固定为 `auth_ok` |
 | `domain` | string | ✓ | 分配的域名 |
 | `tunnel_id` | string | ✓ | 隧道 ID |
-| `server_version` | string | | 服务端版本 |
+| `server_version` | string | | 服务端版本。**0.12 起默认回空串**（版本号是主动探测的服务指纹，docs/PROBE_HARDENING.md T6；`WS_TUNNEL_EXPOSE_VERSION=true` 回真实版本） |
 | `capabilities` | string[] | | 协商启用的能力（协议 v2，见「能力协商」；缺省 = 空集合） |
 
 #### auth_error（服务端 → 客户端）
@@ -86,6 +86,12 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `type` | string | ✓ | 固定为 `auth_error` |
 | `error` | string | ✓ | 错误信息 |
 | `code` | string | | 错误代码 |
+
+> ⚠️ **0.12 探测去特征化（docs/PROBE_HARDENING.md T5）**：服务端对**全部认证类失败**
+> （非 auth 首包 / token 不存在 / tunnel disabled / 已在线拒绝）统一返回
+> `error: "Authentication failed"`、`code: "auth_failed"`，并以同一随机延迟区间
+> （0.8–1.6s）后 close 1008——历史的差异化文案与时序构成 token 存在性/在线状态 oracle。
+> 客户端不应分支消费 `code`，只展示 `error` 文案（三端现状即如此）。
 
 ### 2. 请求-响应阶段
 

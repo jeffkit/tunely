@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import logging
+import random
 import re
 import ssl
 import uuid
@@ -84,9 +85,28 @@ from .repository import TunnelRepository, TunnelRequestLogRepository, AdminAudit
 
 logger = logging.getLogger(__name__)
 
-# 认证失败断开前的延迟（秒）：提高 token 暴力尝试成本（仅认证失败路径，
-# 业务拒绝路径如 disabled / already connected 不受影响）
-_AUTH_FAILURE_DELAY = 1.0
+# 认证类失败的统一时序（docs/PROBE_HARDENING.md T5）：所有认证失败（非 auth 首包 /
+# token 不存在 / tunnel disabled / 已在线拒绝）走同一文案 + 同一随机延迟区间 + 同一关闭码。
+# 历史「无效=延迟、业务拒绝=立即」的差异构成 token 存在性/在线状态 oracle（快响应 = token 是真的），
+# 0.12 起废弃；合法客户端不分支消费 code，仅展示 error 文案（已核实 py/ts/rust 三端）。
+_AUTH_FAILURE_DELAY_RANGE = (0.8, 1.6)
+
+# 统一认证失败文案：不再区分 Invalid token / Tunnel is disabled / connection_exists，
+# 不给探测者任何「token 是否存在」的信息量
+_AUTH_FAILURE_MESSAGE = "Authentication failed"
+
+
+async def _reject_auth(websocket: WebSocket) -> None:
+    """认证类失败统一出口（探测去特征化，docs/PROBE_HARDENING.md T5）
+
+    同一 JSON 文案 → 同一随机延迟 → 同一关闭码 1008。延迟取随机区间，
+    避免固定时序本身成为指纹。
+    """
+    await websocket.send_text(
+        AuthErrorMessage(error=_AUTH_FAILURE_MESSAGE, code="auth_failed").model_dump_json()
+    )
+    await asyncio.sleep(random.uniform(*_AUTH_FAILURE_DELAY_RANGE))
+    await websocket.close(code=1008)
 
 # 流量统计落库周期（秒）：把内存计数增量累加写回 tunnels 表
 _BYTES_FLUSH_INTERVAL = 30.0
@@ -1415,13 +1435,19 @@ class TunnelServer:
             "/metrics",
             include_in_schema=False,
         )
-        async def get_metrics():
+        async def get_metrics(
+            x_api_key: str | None = Header(None, alias="x-api-key"),
+        ):
             """
-            Prometheus 指标端点（文本格式，无鉴权）。
+            Prometheus 指标端点（文本格式）。
 
-            注意：勿暴露公网，与 /api 同理。
+            T4（docs/PROBE_HARDENING.md）：指标含 registered 隧道数等活动信息，
+            与 /api 同受 admin key 门控（未配置 admin_api_key 时与既有 admin 端点
+            语义一致地放行——生产部署务必配置 key）。
             """
             from fastapi.responses import Response
+
+            self._check_admin_api_key(x_api_key)
 
             registered = 0
             if self.db:
@@ -1435,8 +1461,12 @@ class TunnelServer:
             return Response(content=text, media_type="text/plain; version=0.0.4")
 
         @self.router.get("/api/info")
-        async def get_server_info():
-            """获取服务信息和域名配置规则"""
+        async def get_server_info(
+            x_api_key: str | None = Header(None, alias="x-api-key"),
+        ):
+            """获取服务信息和域名配置规则（T4：admin key 门控，见 docs/PROBE_HARDENING.md）"""
+            self._check_admin_api_key(x_api_key)
+
             ws_url = self.config.ws_url or f"wss://{self.config.domain}{self.config.ws_path}"
 
             server_version = self._server_version()
@@ -1620,12 +1650,8 @@ class TunnelServer:
             message = parse_message(data)
 
             if not isinstance(message, AuthMessage):
-                await websocket.send_text(
-                    AuthErrorMessage(error="Expected auth message").model_dump_json()
-                )
-                # 认证失败限速：延迟后关闭，提高暴力尝试成本
-                await asyncio.sleep(_AUTH_FAILURE_DELAY)
-                await websocket.close(code=1008)
+                # 认证类失败统一出口（T5）：同一文案 + 随机延迟 + close 1008
+                await _reject_auth(websocket)
                 return
 
             token = message.token
@@ -1643,19 +1669,13 @@ class TunnelServer:
                 tunnel = await repo.get_by_token(token)
 
                 if not tunnel:
-                    await websocket.send_text(
-                        AuthErrorMessage(error="Invalid token").model_dump_json()
-                    )
-                    # 认证失败限速：延迟后关闭，防止无限速暴力尝试 token
-                    await asyncio.sleep(_AUTH_FAILURE_DELAY)
-                    await websocket.close(code=1008)
+                    # 认证类失败统一出口（T5）：随机延迟，时序不泄露 token 存在性
+                    await _reject_auth(websocket)
                     return
 
                 if not tunnel.enabled:
-                    await websocket.send_text(
-                        AuthErrorMessage(error="Tunnel is disabled").model_dump_json()
-                    )
-                    await websocket.close(code=1008)
+                    # T5：disabled 也是「token 有效」的信号，同样走统一延迟出口
+                    await _reject_auth(websocket)
                     return
 
                 tunnel_domain = tunnel.domain
@@ -1672,7 +1692,8 @@ class TunnelServer:
                 negotiated_caps = self._negotiate_capabilities(
                     getattr(message, "capabilities", None) or []
                 )
-                success, error = await self.manager.register(
+                # T5：失败原因不再对外区分（统一文案），这里只关心成功与否
+                success, _register_error = await self.manager.register(
                     websocket=websocket,
                     tunnel_id=tunnel.id,
                     domain=tunnel.domain,
@@ -1684,13 +1705,8 @@ class TunnelServer:
                 )
 
                 if not success:
-                    await websocket.send_text(
-                        AuthErrorMessage(
-                            error=error or "Connection rejected",
-                            code="connection_exists",
-                        ).model_dump_json()
-                    )
-                    await websocket.close(code=1008)
+                    # T5：已在线拒绝同样统一出口（时序与文案不再区分，避免在线状态 oracle）
+                    await _reject_auth(websocket)
                     return
 
                 # 审计：force 抢占成功
@@ -1707,7 +1723,11 @@ class TunnelServer:
                     AuthOkMessage(
                         domain=tunnel.domain,
                         tunnel_id=str(tunnel.id),
-                        server_version=self._server_version(),
+                        # T6（docs/PROBE_HARDENING.md）：默认不回真实版本（空串），
+                        # 版本号是主动探测的服务指纹；expose_version=True 才回真实值
+                        server_version=(
+                            self._server_version() if self.config.expose_version else ""
+                        ),
                         capabilities=negotiated_caps,
                     ).model_dump_json()
                 )

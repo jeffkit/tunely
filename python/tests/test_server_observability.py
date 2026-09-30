@@ -91,7 +91,10 @@ class TestMetricsEndpoint:
         assert 'tunely_tunnel_bytes_in{domain="busy"} 5' in body
         assert 'domain="no-traffic"' not in body  # 无数据域名不输出 bytes 序列
 
-    def test_metrics_no_auth_required(self, metrics_server: TunnelServer):
+    def test_metrics_open_when_key_unconfigured(self, metrics_server: TunnelServer):
+        """T4（docs/PROBE_HARDENING.md）：/metrics 受 admin key 门控，
+        未配置 admin_api_key 时与既有 admin 端点语义一致地放行；
+        配置 key 后无/错 key 401 的用例见 test_probe_hardening.py::TestT4AdminGated"""
         client = TestClient(_make_app(metrics_server))
         assert client.get("/metrics").status_code == 200  # 不带任何凭证
 

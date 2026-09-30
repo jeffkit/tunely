@@ -28,7 +28,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -42,14 +42,6 @@ from .server import (
 from .config import TunnelServerConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _pkg_version() -> str:
-    try:
-        from importlib.metadata import version
-        return version("tunely")
-    except Exception:
-        return "unknown"
 
 
 def _uvicorn_loop() -> str:
@@ -95,6 +87,10 @@ class AppSettings(BaseSettings):
     # CORS 配置（用于浏览器跨域访问）
     # 逗号分隔的允许来源列表；"*" 表示允许所有来源；空 = 仅同源（不输出 CORS 头）
     cors_origins: str = ""
+
+    # 探测面去特征化（docs/PROBE_HARDENING.md T2）：主域名 GET / 的 decoy 响应文件
+    # （text/html）。空 = 极简 "OK"；配置后返回该文件内容，供部署挂一个像样的落地页
+    root_response_file: str = ""
 
     # 控制面原生 TLS（0.11）：uvicorn 直接以 HTTPS/WSS 终止，单进程零边缘部署
     ssl_cert_file: str | None = None
@@ -213,10 +209,13 @@ def create_full_app(
     )
     
     # 创建 FastAPI 应用
+    # T1（docs/PROBE_HARDENING.md）：关闭 /docs /redoc /openapi.json 并去掉自报家门的
+    # title——它们是主动探测的强指纹（泄露框架、版本与全路由表）
     new_app = FastAPI(
-        title="Tunely Server",
-        description="WebSocket 隧道服务 - 通过子域名或路径前缀访问内网服务",
-        version=_pkg_version(),
+        title="API Server",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
         lifespan=create_lifespan(tunnel_srv),
     )
     
@@ -250,23 +249,22 @@ def create_full_app(
         """根路径"""
         host = request.headers.get("host", "")
         subdomain = extract_subdomain(host, settings.domain)
-        
+
         if subdomain:
             return await forward_to_tunnel(request, subdomain, "/")
-        
-        return {
-            "service": "Tunely Server",
-            "version": _pkg_version(),
-            "domain": settings.domain,
-            "status": "running",
-        }
+
+        # T2（docs/PROBE_HARDENING.md）：主域名根路径不回 service/version/domain——
+        # 那是「我是 tunely + 版本」的自白书。默认极简 "OK"；配置 decoy 落地页则返回它
+        if settings.root_response_file:
+            return FileResponse(settings.root_response_file, media_type="text/html")
+        return PlainTextResponse("OK")
     
     @new_app.get("/health")
     async def health():
         """健康检查"""
-        server = get_tunnel_server()
-        connected_count = len(server.manager.list_connected_domains())
-        return {"status": "healthy", "connected_tunnels": connected_count}
+        # T3（docs/PROBE_HARDENING.md）：不回 connected_tunnels——活跃隧道数是
+        # 活动 oracle；需要活跃信息的走 admin 门控的 /api/tunnels
+        return {"status": "ok"}
     
     # 注意：/api/info 接口由 TunnelServer 提供，不需要在这里重复定义
     
@@ -323,10 +321,12 @@ def create_full_app(
 
 # 默认应用实例（用于 uvicorn 直接启动）
 # 注意：这个实例不包含完整功能，请使用 create_full_app() 或 run_app()
+# T1：同样关闭自暴露面（docs/PROBE_HARDENING.md）
 app = FastAPI(
-    title="Tunely Server",
-    description="WebSocket 隧道服务 - 通过子域名或路径前缀访问内网服务",
-    version=_pkg_version(),
+    title="API Server",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 

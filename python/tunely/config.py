@@ -143,6 +143,14 @@ class TunnelServerConfig(BaseSettings):
         description="逗号分隔的能力名，从服务端能力注册表剔除（kill 开关）；env: WS_TUNNEL_DISABLE_CAPABILITIES",
     )
 
+    # 探测面去特征化（docs/PROBE_HARDENING.md T6）：auth_ok.server_version 是否回真实版本。
+    # 默认 False 回空串——版本号是主动探测的服务指纹，默认不暴露；需要版本感知的运维再打开。
+    expose_version: bool = Field(
+        default=False,
+        description="auth_ok.server_version 回真实版本；默认 False 回空串（探测去特征化）"
+        "（env: WS_TUNNEL_EXPOSE_VERSION）",
+    )
+
     # JWT 认证（公网模式：需要 JWT 令牌才能创建隧道）
     jwt_secret: str | None = Field(
         default=None, description="JWT 共享密钥（设置后创建隧道需要 Bearer JWT 认证）"

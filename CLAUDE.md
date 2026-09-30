@@ -169,7 +169,7 @@ The `id` field in messages is critical for matching requests to responses:
 ### Error Handling
 
 Common error scenarios:
-- **Invalid token**: Return `AuthErrorMessage` with code `auth_failed`
+- **Authentication failures**（无效 token / 隧道禁用 / 已在线拒绝 / 非 auth 首包）：0.12 起统一返回 `AuthErrorMessage`（`error: "Authentication failed"`，`code: "auth_failed"`）并经同一随机延迟后关闭（探测去特征化，见 `docs/PROBE_HARDENING.md`）
 - **Target service unavailable**: Return `TunnelResponse` with status 503 and error message
 - **Timeout**: Return `TunnelResponse` with status 504
 - **Connection lost**: Server cleans up pending requests after timeout
@@ -192,7 +192,7 @@ When updating the protocol:
 
 ## Version Information
 
-- Python package version: `0.10.0` (in `python/pyproject.toml`；`tunely/__init__.py` 的 `__version__` 须同步)
+- Python package version: `0.11.1` (in `python/pyproject.toml`；`tunely/__init__.py` 的 `__version__` 须同步)
 - TypeScript package version: `0.4.0` (in `typescript/package.json`；`src/version.ts` 的 `CLIENT_VERSION` 由一致性测试守住)
 - Rust package version: `0.5.0` (in `rust/Cargo.toml`；代码经 `env!("CARGO_PKG_VERSION")` 取用，无第二处硬编码)
 - Current protocol version: `2` (能力协商 + 二进制分帧，帧头 `FRAME_PROTOCOL_VERSION = 0x02`；SSE 为 v1.1 引入，见 `docs/PROTOCOL_V2.md`)
