@@ -1,8 +1,81 @@
 /**
- * 多隧道形态测试（JSON 配置 / TUNELY_TUNNELS env，与 rust/python 形态二同构）
+ * 多隧道形态测试（配置文件 TOML/JSON / TUNELY_TUNNELS env，与 rust/python 形态二同构）
  */
-import { describe, expect, it } from 'vitest';
-import { resolveTunnels } from './multitunnel.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { loadConfigFile, resolveTunnels } from './multitunnel.js';
+
+describe('loadConfigFile .toml 与 .json 兼容', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function tmp(name: string, text: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'tunely-cfg-'));
+    dirs.push(dir);
+    const p = join(dir, name);
+    writeFileSync(p, text, 'utf-8');
+    return p;
+  }
+
+  it('.toml 直接解析 rust/python 同款 client.toml（[[tunnel]] 数组）', () => {
+    // 与本机 ~/.config/tunely/client.toml 同构（三隧道真实形态）
+    const path = tmp(
+      'client.toml',
+      [
+        'server = "wss://dsht.agentstudio.cc/ws/tunnel"',
+        '',
+        '[[tunnel]]',
+        'name = "dsh"',
+        'token = "t-dsh"',
+        'target = "http://127.0.0.1:3098"',
+        '',
+        '[[tunnel]]',
+        'name = "plaita"',
+        'token = "t-plaita"',
+        'target = "http://127.0.0.1:8123"',
+      ].join('\n')
+    );
+    const cfg = loadConfigFile(path);
+    const out = resolveTunnels({ file: cfg });
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({
+      name: 'dsh',
+      token: 't-dsh',
+      serverUrl: 'wss://dsht.agentstudio.cc/ws/tunnel',
+    });
+    expect(out[1].name).toBe('plaita');
+  });
+
+  it('.json 等价形态继续可用', () => {
+    const path = tmp(
+      'client.json',
+      JSON.stringify({
+        server: 'ws://f',
+        tunnel: [{ name: 'a', token: 'ta' }],
+      })
+    );
+    const out = resolveTunnels({ file: loadConfigFile(path) });
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('a');
+  });
+
+  it('.toml 单隧道平铺形态（顶层 token/target）', () => {
+    const path = tmp('flat.toml', 'token = "t"\ntarget = "http://f:2"\n');
+    const out = resolveTunnels({ file: loadConfigFile(path) });
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBeNull();
+    expect(out[0].targetUrl).toBe('http://f:2');
+  });
+
+  it('坏 TOML → 抛错（CLI 层捕获报读取失败）', () => {
+    const path = tmp('bad.toml', '???');
+    expect(() => loadConfigFile(path)).toThrow();
+  });
+});
 
 describe('resolveTunnels 多隧道', () => {
   it('多条目展开：name 缺省 tunnel-N、target 回落顶层、全局项共享', () => {

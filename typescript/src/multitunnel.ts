@@ -2,15 +2,17 @@
  * 多隧道形态（形态二，与 rust/python 客户端同构）
  *
  * 配置来源（优先级：CLI > env > 配置文件 > 默认）：
- * - JSON 配置文件（--config）：TS 侧无 TOML 解析依赖，用等价 JSON 形态，
- *   键名与 rust/python 的 client.toml 一致：
- *     { "server": "...", "token": "...", "target": "...",
- *       "tunnel": [{ "name": "dsh", "token": "...", "target": "..." }] }
+ * - 配置文件（--config）：.toml 直接读 rust/python 同款 client.toml
+ *   （smol-toml，TOML 1.0）；.json 为 TS 侧等价形态。键名一致：
+ *     server / token / target / [[tunnel]](name|token|target) / reconnect_secs / force
  * - TUNELY_TUNNELS 环境变量：JSON 数组（systemd/launchd env 友好）
  *
  * 多隧道形态下禁止单隧道来源（--token/--target 与 TUNELY_TOKEN/TUNELY_TARGET），
  * 避免两种形态静默混用。单隧道解析行为与 0.3.x 完全一致。
  */
+
+import { readFileSync } from 'node:fs';
+import { parse as parseToml } from 'smol-toml';
 
 export interface MultiTunnelEntry {
   name?: string;
@@ -26,6 +28,15 @@ export interface MultiTunnelFileConfig {
   reconnect_secs?: number;
   max_reconnect?: number;
   force?: boolean;
+}
+
+/** 读配置文件：.toml 走 TOML 解析（与 rust/python 同一份 client.toml），其余按 JSON */
+export function loadConfigFile(path: string): MultiTunnelFileConfig {
+  const text = readFileSync(path, 'utf-8');
+  if (path.toLowerCase().endsWith('.toml')) {
+    return parseToml(text) as MultiTunnelFileConfig;
+  }
+  return JSON.parse(text) as MultiTunnelFileConfig;
 }
 
 export interface ResolvedTunnel {

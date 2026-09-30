@@ -7,9 +7,13 @@
  */
 
 import { Command } from 'commander';
-import { readFileSync } from 'node:fs';
 import { TunnelClient } from './client.js';
-import { resolveTunnels, MultiTunnelFileConfig, ResolvedTunnel } from './multitunnel.js';
+import {
+  resolveTunnels,
+  loadConfigFile,
+  MultiTunnelFileConfig,
+  ResolvedTunnel,
+} from './multitunnel.js';
 import { CLIENT_VERSION } from './version.js';
 
 const program = new Command();
@@ -30,7 +34,7 @@ program
   .option('-T, --target <url>', `本地目标服务 URL（也可通过环境变量 TUNELY_TARGET 提供，默认 ${DEFAULT_TARGET}）`)
   .option('-r, --reconnect <seconds>', '重连间隔（秒）', '5')
   .option('-f, --force', '强制抢占已有连接', false)
-  .option('-c, --config <path>', 'JSON 配置文件（多隧道形态，键名与 rust/python 的 client.toml 一致；也可用 TUNELY_TUNNELS env 传 JSON 数组）')
+  .option('-c, --config <path>', '配置文件：.toml 直接用 rust/python 同款 client.toml（[[tunnel]] 多隧道），.json 为等价形态；也可用 TUNELY_TUNNELS env 传 JSON 数组')
   .action(async (options) => {
     // 取值优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
     const cliToken = options.token ?? process.env.TUNELY_TOKEN;
@@ -39,7 +43,7 @@ program
     let file: MultiTunnelFileConfig | null = null;
     if (options.config) {
       try {
-        file = JSON.parse(readFileSync(options.config, 'utf-8')) as MultiTunnelFileConfig;
+        file = loadConfigFile(options.config);
       } catch (e) {
         console.error(`错误: 读取配置文件失败: ${(e as Error).message}`);
         process.exit(1);
