@@ -101,6 +101,23 @@ class TunnelServerConfig(BaseSettings):
         description="外部 TCP 连接空闲超时（秒）：连上不发数据的慢连接超时后被服务端关闭回收；0 = 不启用（env: WS_TUNNEL_TCP_IDLE_TIMEOUT）",
     )
 
+    # 监听原生 TLS（TCP-only 收敛 0.11，docs/MIGRATION_TCP_ONLY.md §5；
+    # 作用于全部 TCP 监听，通常配通配符证书一份；控制面 TLS 走 serve --ssl-certfile）
+    listener_tls_cert_file: str | None = Field(
+        default=None,
+        description="TCP 监听 TLS 证书（PEM，全监听共用一份；与 key 成对配置才启用）（env: WS_TUNNEL_LISTENER_TLS_CERT_FILE）",
+    )
+    listener_tls_key_file: str | None = Field(
+        default=None,
+        description="TCP 监听 TLS 私钥（PEM）（env: WS_TUNNEL_LISTENER_TLS_KEY_FILE）",
+    )
+    listener_tls_alpn: str = Field(
+        default="http/1.1",
+        description="监听 TLS 的 ALPN 协议列表（逗号分隔）。默认恒锁 http/1.1——TLS 终止后"
+        "解出的字节原样入隧道，协商出 h2 而内网目标只讲 HTTP/1.1 即断连；"
+        "gRPC(h2) 目标可改 'h2'；'none' = 不做 ALPN（env: WS_TUNNEL_LISTENER_TLS_ALPN）",
+    )
+
     # UDP 监听配置（协议 v2 udp 能力，可选；启用后经隧道转发 UDP 数据报）
     udp_listen: str | None = Field(
         default=None,

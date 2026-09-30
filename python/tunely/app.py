@@ -96,6 +96,9 @@ class AppSettings(BaseSettings):
     # 逗号分隔的允许来源列表；"*" 表示允许所有来源；空 = 仅同源（不输出 CORS 头）
     cors_origins: str = ""
 
+    # 控制面原生 TLS（0.11）：uvicorn 直接以 HTTPS/WSS 终止，单进程零边缘部署
+    ssl_cert_file: str | None = None
+    ssl_key_file: str | None = None
 
 
 # 全局配置实例
@@ -491,6 +494,8 @@ def run_app(
     admin_api_key: str | None = None,
     jwt_secret: str | None = None,
     ws_path: str = "/ws/tunnel",
+    ssl_certfile: str | None = None,
+    ssl_keyfile: str | None = None,
 ):
     """
     运行 Tunely Server
@@ -503,6 +508,8 @@ def run_app(
         admin_api_key: 管理 API 密钥
         jwt_secret: JWT 共享密钥
         ws_path: WebSocket 路径
+        ssl_certfile: 控制面 TLS 证书（PEM）；配对提供后 uvicorn 以 HTTPS/WSS 终止
+        ssl_keyfile: 控制面 TLS 私钥（PEM）
     """
     import uvicorn
 
@@ -516,6 +523,12 @@ def run_app(
         jwt_secret=jwt_secret,
         ws_path=ws_path,
     )
+    # CLI 参数优先，缺省回退 TUNELY_SSL_CERT_FILE/TUNELY_SSL_KEY_FILE
+    ssl_certfile = ssl_certfile or settings.ssl_cert_file
+    ssl_keyfile = ssl_keyfile or settings.ssl_key_file
+    if bool(ssl_certfile) != bool(ssl_keyfile):
+        raise RuntimeError("控制面 TLS 配置不完整：--ssl-certfile 与 --ssl-keyfile 必须成对提供")
+
     # 创建完整的应用
     full_app = create_full_app(
         domain=domain,
@@ -532,6 +545,8 @@ def run_app(
         loop=_uvicorn_loop(),  # uvloop 可用则加速，不可用回退默认
         ws_ping_interval=30,   # 每 30s 向客户端发 WebSocket ping，检测静默死连接
         ws_ping_timeout=10,    # 10s 内未收到 pong 则关闭连接
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
     )
 
 

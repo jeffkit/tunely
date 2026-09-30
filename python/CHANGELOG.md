@@ -18,9 +18,17 @@
   HTTP 入口命中 `mode=tcp` 隧道时快速失败 410（不再误入 TCP 分派悬挂至超时）。
 
 #### Added
+- **监听原生 TLS（数据面）**：`WS_TUNNEL_LISTENER_TLS_CERT_FILE/KEY_FILE` 对全部 TCP 监听启用
+  TLS（通配符证书一份共用）；ALPN 默认恒锁 `http/1.1`（防 h2 协商后内网目标不认），
+  可经 `WS_TUNNEL_LISTENER_TLS_ALPN` 覆盖；配置不完整直接报错不静默降级明文。
+  UDP 监听不支持 TLS（stdlib 无 DTLS），配置了证书时显式告警。
+- **控制面原生 TLS**：`tunely serve --ssl-certfile/--ssl-keyfile`（回退读
+  `TUNELY_SSL_CERT_FILE/TUNELY_SSL_KEY_FILE`），uvicorn 以 HTTPS/WSS 终止——
+  单进程 + 一张证书即可零边缘公网部署。
 - alembic `005_normalize_mode_tcp`：存量隧道 `mode` 归一为 `tcp`（单向迁移，执行前备份 mode 列）。
 - `python/tools/e2e_dataplane.py`：数据面字节保真/测量工具——
   `local`（TCP 面验收：JSON/二进制/gzip/SSE/1MiB 上传/嵌套 WS 逐字节一致）、
+  `local-tls`（自签证书 + TLS 监听复跑全套矩阵 + ALPN 锁握手断言 + 控制面 HTTPS，8/8）、
   `local-httpproxy`（同一真值经 `/t/` 的损伤对照）、`measure`（现网 `/t/` 损伤特征探测）。
 - wire.json：http 消息族 10 场景标记 `"deprecated": true`（py/rust 消费方跳过逐字段断言，
   保留宽松解析容忍）；新增退役场景清单锚定测试。

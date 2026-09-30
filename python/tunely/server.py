@@ -34,6 +34,7 @@ import hmac
 import json
 import logging
 import re
+import ssl
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -3093,12 +3094,18 @@ class TunnelServer:
         if not specs:
             return
 
+        # 原生 TLS（0.11，docs/MIGRATION_TCP_ONLY.md §5）：配了证书/私钥即对全部
+        # TCP 监听启用。TLS 终止后解出的字节原样入隧道——ALPN 默认恒锁 http/1.1，
+        # 防止客户端与监听协商出 h2 而内网目标只讲 HTTP/1.1。
+        tls_ctx = self._build_listener_ssl_context()
+
         for port, host, domain in specs:
             try:
                 tcp_server = await asyncio.start_server(
                     self._make_tcp_handler(port),
                     host=host,
                     port=port,
+                    ssl=tls_ctx,
                 )
             except OSError as e:
                 # F22：端口冲突给可读报错（含 host:port 与归属域），
@@ -3113,7 +3120,37 @@ class TunnelServer:
             self._tcp_servers.append(tcp_server)
             if domain:
                 self._listener_domains[port] = domain
-            logger.info(f"TCP 监听器已启动: {host}:{port} -> {domain or '<首个在线隧道>'}")
+            logger.info(
+                f"TCP 监听器已启动: {host}:{port} -> {domain or '<首个在线隧道>'}"
+                + (f"（TLS, alpn={self.config.listener_tls_alpn}）" if tls_ctx else "")
+            )
+
+    def _build_listener_ssl_context(self) -> ssl.SSLContext | None:
+        """构建 TCP 监听共用 TLS context（未配证书/私钥时返回 None = 明文）
+
+        配置不完整（只给 cert 没给 key 等）直接 RuntimeError，不静默降级明文
+        ——静默降级会让人误以为流量已加密。
+        """
+        cert = self.config.listener_tls_cert_file
+        key = self.config.listener_tls_key_file
+        if not cert and not key:
+            return None
+        if not (cert and key):
+            raise RuntimeError(
+                "监听 TLS 配置不完整：WS_TUNNEL_LISTENER_TLS_CERT_FILE 与 "
+                "WS_TUNNEL_LISTENER_TLS_KEY_FILE 必须成对提供"
+            )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            ctx.load_cert_chain(cert, key)
+        except (ssl.SSLError, OSError, FileNotFoundError) as e:
+            raise RuntimeError(f"加载监听 TLS 证书/私钥失败: {e}") from e
+        alpn_raw = (self.config.listener_tls_alpn or "").strip()
+        if alpn_raw and alpn_raw.lower() != "none":
+            protocols = [p.strip() for p in alpn_raw.split(",") if p.strip()]
+            if protocols:
+                ctx.set_alpn_protocols(protocols)
+        return ctx
 
     def _make_tcp_handler(self, port: int):
         """为指定监听端口生成连接回调（携带端口以便路由到绑定隧道）"""
@@ -3298,6 +3335,14 @@ class TunnelServer:
         specs = self._resolve_udp_listen_specs()
         if not specs:
             return
+
+        # 原生 TLS 仅覆盖 TCP 监听：UDP 加密 = DTLS，stdlib 无实现，静默明文会
+        # 让人误以为已加密——显式告警（docs/MIGRATION_TCP_ONLY.md §5）。
+        if self.config.listener_tls_cert_file or self.config.listener_tls_key_file:
+            logger.warning(
+                "WS_TUNNEL_LISTENER_TLS_* 已配置，但 UDP 监听不支持 TLS（stdlib 无 DTLS）；"
+                "UDP 监听仍为明文，公网部署请自行评估或改走 TCP。"
+            )
 
         host = self.config.tcp_listen_host
         for port, domain in specs:

@@ -73,6 +73,8 @@ def main():
 @click.option("--api-key", "-k", help="管理 API 密钥（未提供时回退读环境变量 WS_TUNNEL_ADMIN_API_KEY）")
 @click.option("--ws-path", default="/ws/tunnel", help="WebSocket 路径")
 @click.option("--cors-origins", default="", help="CORS 允许的来源（逗号分隔；* 表示全部；默认空 = 仅同源）")
+@click.option("--ssl-certfile", default=None, help="控制面 TLS 证书（PEM）；与 --ssl-keyfile 成对提供后以 HTTPS/WSS 终止（缺省回退读 TUNELY_SSL_CERT_FILE）")
+@click.option("--ssl-keyfile", default=None, help="控制面 TLS 私钥（PEM）（缺省回退读 TUNELY_SSL_KEY_FILE）")
 @click.option("--verbose", "-v", is_flag=True, help="详细日志")
 def serve(
     host: str,
@@ -82,6 +84,8 @@ def serve(
     api_key: str,
     ws_path: str,
     cors_origins: str,
+    ssl_certfile: str | None,
+    ssl_keyfile: str | None,
     verbose: bool,
 ):
     """启动 Tunely Server（独立隧道服务）"""
@@ -107,9 +111,13 @@ def serve(
     
     # 设置 CORS 环境变量（供 AppSettings 读取）
     os.environ["TUNELY_CORS_ORIGINS"] = cors_origins
-    
+
+    if ssl_certfile or ssl_keyfile:
+        console.print(f"  TLS(控制面): {'已启用（HTTPS/WSS）' if ssl_certfile and ssl_keyfile else '配置不完整！cert/key 必须成对'}")
+    console.print(f"[dim]提示:[/dim] TCP/UDP 监听 TLS 见 WS_TUNNEL_LISTENER_TLS_CERT_FILE/KEY_FILE")
+
     from .app import run_app
-    
+
     run_app(
         host=host,
         port=port,
@@ -117,6 +125,8 @@ def serve(
         database_url=database,
         admin_api_key=api_key,
         ws_path=ws_path,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
     )
 
 
