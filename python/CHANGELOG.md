@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-30
+
+### Security
+- **`POST /api/tunnels/{domain}/forward` 补齐鉴权**（与其他管理端点对齐）：
+  `WS_TUNNEL_ADMIN_API_KEY` 已配置时强制校验 `x-api-key`（无/错 key → 401）；
+  未配置保持内网模式放行（行为不变）。该端点在 mode=tcp 隧道上等价于对
+  目标服务的裸 TCP 管道，此前是无鉴权面（评审 P0）。
+- 新增 HTTP 层负面安全测试（test_forward_auth.py：无 key/错 key/对 key/鉴权先于 path 校验/内网模式兼容）。
+
 ## [0.11.0] - 2026-09-30（deprecation，TCP-only 收敛第一批，docs/MIGRATION_TCP_ONLY.md）
 
 #### Changed

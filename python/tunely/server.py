@@ -1367,7 +1367,12 @@ class TunnelServer:
             domain: str,
             request: ForwardRequest,
             response: Response,
+            x_api_key: str | None = Header(None, alias="x-api-key"),
         ):
+            # 鉴权与其他管理端点对齐（0.11.1）：admin key 未配置 = 内网模式放行；
+            # 已配置则强制校验——该端点在 mode=tcp 隧道上等价于对目标服务的
+            # 裸 TCP 管道，绝不能是无鉴权面。
+            self._check_admin_api_key(x_api_key)
             # HTTP 模式退役（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md）：命中即告警 + 标记。
             # 1.0 删除本路由；期间迁移指引见该文档 §7（nginx → TCP 端口）。
             _warn_http_mode_deprecated("forward-api", domain)

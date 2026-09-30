@@ -121,7 +121,7 @@ def test_client_symbols_available_without_server_deps():
         "TunnelServerConfig",
         "TunnelRequest",
         "MessageType",
-        "0.10.0",
+        "0.11.1",
     ], out
     assert lines[1] == "False False", out
 

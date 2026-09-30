@@ -18,7 +18,7 @@ WS-Tunnel - WebSocket 透明反向代理隧道
 
 import importlib
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 from .protocol import (
     TunnelRequest,
