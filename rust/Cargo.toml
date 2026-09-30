@@ -1,6 +1,6 @@
 [package]
 name = "tunely"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "WebSocket Tunnel Client — 透明反向代理隧道（Rust 版客户端，与服务端 wire 协议对齐）"
 license = "MIT"
@@ -9,6 +9,9 @@ repository = "https://github.com/jeffkit/tunely"
 [lib]
 name = "tunely"
 path = "src/lib.rs"
+# lib  = Rust 宿主 `cargo add tunely` 进程内嵌入
+# cdylib/staticlib = C ABI（include/tunely.h），供 Go/C/C#/Java 等宿主嵌入
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [[bin]]
 name = "tunely"

@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::handler::{HandlerOutcome, HandlerRequest, HandlerResponse, HandlerStream, RequestHandler};
 use crate::protocol::{
     backoff_delay_ms, decode_tcp_data_frame, decode_udp_data_frame, encode_tcp_data_frame,
     encode_udp_data_frame, jitter, parse_target, Message, FRAME_TYPE_UDP_DATA,
@@ -180,6 +181,8 @@ struct Session {
     target_host: String,
     target_port: u16,
     request_timeout: Duration,
+    /// 进程内请求处理器（None = HTTP 请求一律转发 target_url，与历史行为一致）
+    handler: Option<Arc<dyn RequestHandler>>,
     /// 本连接是否协商了 binary_frames 能力（协议 v2，AuthOk.capabilities 快照；
     /// 未协商 = false，tcp_data 全走 JSON+base64，行为与 0.7.x 一致）
     binary_frames: bool,
@@ -194,6 +197,10 @@ pub struct TunnelClient {
     events: Mutex<Events>,
     running: AtomicBool,
     stop: Arc<Notify>,
+    /// 进程内请求处理器；`None` = HTTP 请求全部转发 target_url。
+    /// 用 std Mutex（非 tokio Mutex）是为了让 FFI 侧能在 `&self` 上装入，
+    /// 且锁只在克隆快照时短暂持有、不跨 await。
+    handler: std::sync::Mutex<Option<Arc<dyn RequestHandler>>>,
 }
 
 impl TunnelClient {
@@ -203,7 +210,49 @@ impl TunnelClient {
             events: Mutex::new(Events::default()),
             running: AtomicBool::new(false),
             stop: Arc::new(Notify::new()),
+            handler: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 取当前 handler 快照（会话建立时克隆一次；装入新 handler 需重连才生效）
+    fn handler_snapshot(&self) -> Option<Arc<dyn RequestHandler>> {
+        self.handler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 装入进程内请求处理器（builder 形态，便于 `TunnelClient::new(cfg).with_request_handler(h)`）
+    ///
+    /// handler 在**连接建立时**被克隆进会话；`run()` 之后再装入需要重连一次才生效。
+    pub fn with_request_handler<H: RequestHandler>(self, handler: H) -> Self {
+        self.set_request_handler(handler);
+        self
+    }
+
+    /// 装入进程内请求处理器（就地形态，`&self` 即可）
+    pub fn set_request_handler<H: RequestHandler>(&self, handler: H) {
+        self.set_request_handler_arc(Arc::new(handler));
+    }
+
+    /// 装入已装箱的 handler（FFI 侧用：回调只能包成 `Arc<dyn RequestHandler>` 后传入）
+    pub fn set_request_handler_arc(&self, handler: Arc<dyn RequestHandler>) {
+        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+
+    /// 卸载 handler：HTTP 请求回到「全部转发 target_url」语义
+    pub fn clear_request_handler(&self) {
+        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 是否已装入请求处理器（`false` = 全部转发到 target_url）
+    pub fn has_request_handler(&self) -> bool {
+        self.handler_snapshot().is_some()
+    }
+
+    /// 是否处于运行态（`run()` 已被调用且尚未 `stop()`）
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 
     /// 日志前缀：多隧道模式下区分会话；单隧道为空串（日志与 0.3.x 逐字节一致）
@@ -415,6 +464,7 @@ impl TunnelClient {
             target_host,
             target_port,
             request_timeout: self.config.request_timeout,
+            handler: self.handler_snapshot(),
             binary_frames: false,
             udp_enabled: false,
         };
@@ -565,7 +615,17 @@ impl TunnelClient {
                             f(&id, &method, &path);
                         }
                     }
-                    spawn_http_request(&session, id, method, path, headers, body, timeout);
+                    spawn_http_request(
+                        &session,
+                        HttpRequestTask {
+                            id,
+                            method,
+                            path,
+                            headers,
+                            body,
+                            timeout,
+                        },
+                    );
                 }
                 Message::TcpConnect { conn_id } => handle_tcp_connect(&session, &conn_id).await,
                 Message::TcpData { conn_id, data, .. } => {
@@ -613,113 +673,200 @@ impl TunnelClient {
 
 // ============== HTTP 模式 ==============
 
-fn spawn_http_request(
-    session: &Session,
+/// 一条服务端下发的 HTTP 请求（分发用；字段与 wire 的 `request` 对齐）
+struct HttpRequestTask {
     id: String,
     method: String,
     path: String,
     headers: HashMap<String, String>,
     body: Option<String>,
     timeout: Option<f64>,
-) {
+}
+
+/// 分发一条服务端下发的 HTTP 请求。
+///
+/// 装了进程内 handler 时先交给它：`Forward` 表示「不处理」，回落到
+/// [`forward_http_request`]（语义与不装 handler 时逐字节一致）；`Response` /
+/// `Stream` 直接答给服务端，**不碰 target_url**——宿主因此可以不起本地端口。
+fn spawn_http_request(session: &Session, request: HttpRequestTask) {
     let session = session.clone();
     tokio::spawn(async move {
         let start = std::time::Instant::now();
-        let url = format!("{}{}", session.target_base, normalize_path(&path));
-        let http_method = match reqwest::Method::from_bytes(method.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
-                // F18：非法 HTTP 方法不能静默变 GET——回退保留，但必须留下日志
-                warn(format!(
-                    "非法 HTTP 方法 '{method}'（request {id}），回退为 GET"
-                ));
-                reqwest::Method::GET
-            }
-        };
 
-        let timeout_secs = timeout.unwrap_or(session.request_timeout.as_secs_f64());
-        let timeout_dur = Duration::from_secs_f64(timeout_secs.max(0.0));
-
-        let mut req = session.http.request(http_method, &url).timeout(timeout_dur);
-        for (k, v) in &headers {
-            if HOP_BY_HOP_HEADERS.contains(&k.to_lowercase().as_str()) {
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                reqwest::header::HeaderValue::from_str(v),
-            ) {
-                req = req.header(name, val);
-            }
-        }
-        if let Some(b) = body {
-            req = req.body(b);
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let mut resp_headers: HashMap<String, String> = HashMap::new();
-                for (name, value) in resp.headers().iter() {
-                    let key = name.as_str().to_string();
-                    let val = String::from_utf8_lossy(value.as_bytes()).to_string();
-                    resp_headers
-                        .entry(key)
-                        .and_modify(|existing| {
-                            existing.push_str(", ");
-                            existing.push_str(&val);
-                        })
-                        .or_insert(val);
+        if let Some(handler) = session.handler.clone() {
+            let view = HandlerRequest {
+                id: request.id.clone(),
+                method: request.method.clone(),
+                path: request.path.clone(),
+                headers: request.headers.clone(),
+                body: request.body.clone(),
+            };
+            match handler.handle(view).await {
+                HandlerOutcome::Forward => {}
+                HandlerOutcome::Response(resp) => {
+                    send_handler_response(&session, &request.id, resp, start).await;
+                    return;
                 }
+                HandlerOutcome::Stream(stream) => {
+                    send_handler_stream(&session, &request.id, stream, start).await;
+                    return;
+                }
+            }
+        }
 
-                let is_sse = resp_headers
-                    .get("content-type")
-                    .map(|c| c.to_lowercase().contains("text/event-stream"))
-                    .unwrap_or(false);
+        forward_http_request(&session, &request, start).await;
+    });
+}
 
-                if is_sse {
-                    handle_sse(&session, &id, status, resp_headers, resp, start).await;
-                } else {
-                    let body = resp.text().await.unwrap_or_default();
-                    let duration = start.elapsed().as_millis() as u64;
+/// handler 缓冲响应 → 单条 `Message::Response`
+async fn send_handler_response(
+    session: &Session,
+    id: &str,
+    resp: HandlerResponse,
+    start: std::time::Instant,
+) {
+    let duration = start.elapsed().as_millis() as u64;
+    let _ = session
+        .tx
+        .send(
+            Message::response(id, resp.status, resp.headers, resp.body, resp.error, duration).into(),
+        )
+        .await;
+}
+
+/// handler 流式响应 → `stream_start` / `stream_chunk*` / `stream_end`
+/// （与 SSE 回传同一套消息语义与序号规则）
+async fn send_handler_stream(
+    session: &Session,
+    id: &str,
+    mut stream: HandlerStream,
+    start: std::time::Instant,
+) {
+    let _ = session
+        .tx
+        .send(Message::stream_start(id, stream.status, stream.headers).into())
+        .await;
+
+    let mut seq: u32 = 0;
+    let mut error_msg: Option<String> = None;
+    while let Some(item) = stream.chunks.next().await {
+        match item {
+            Ok(text) => {
+                if !text.is_empty() {
                     let _ = session
                         .tx
-                        .send(Message::response(
-                            &id,
-                            status,
-                            resp_headers,
-                            Some(body),
-                            None,
-                            duration,
-                        )
-                        .into())
+                        .send(Message::stream_chunk(id, text, seq).into())
                         .await;
+                    seq += 1;
                 }
             }
             Err(e) => {
+                error_msg = Some(e);
+                break;
+            }
+        }
+    }
+
+    let duration = start.elapsed().as_millis() as u64;
+    let _ = session
+        .tx
+        .send(Message::stream_end(id, error_msg, duration, seq).into())
+        .await;
+}
+
+/// 默认语义：把请求转发到 `config.target_url`（HTTP 模式）
+async fn forward_http_request(
+    session: &Session,
+    request: &HttpRequestTask,
+    start: std::time::Instant,
+) {
+    let url = format!("{}{}", session.target_base, normalize_path(&request.path));
+    let http_method = match reqwest::Method::from_bytes(request.method.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            // F18：非法 HTTP 方法不能静默变 GET——回退保留，但必须留下日志
+            warn(format!(
+                "非法 HTTP 方法 '{}'（request {}），回退为 GET",
+                request.method, request.id
+            ));
+            reqwest::Method::GET
+        }
+    };
+
+    let timeout_secs = request
+        .timeout
+        .unwrap_or(session.request_timeout.as_secs_f64());
+    let timeout_dur = Duration::from_secs_f64(timeout_secs.max(0.0));
+
+    let mut req = session.http.request(http_method, &url).timeout(timeout_dur);
+    for (k, v) in &request.headers {
+        if HOP_BY_HOP_HEADERS.contains(&k.to_lowercase().as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            req = req.header(name, val);
+        }
+    }
+    if let Some(b) = &request.body {
+        req = req.body(b.clone());
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let mut resp_headers: HashMap<String, String> = HashMap::new();
+            for (name, value) in resp.headers().iter() {
+                let key = name.as_str().to_string();
+                let val = String::from_utf8_lossy(value.as_bytes()).to_string();
+                resp_headers
+                    .entry(key)
+                    .and_modify(|existing| {
+                        existing.push_str(", ");
+                        existing.push_str(&val);
+                    })
+                    .or_insert(val);
+            }
+
+            let is_sse = resp_headers
+                .get("content-type")
+                .map(|c| c.to_lowercase().contains("text/event-stream"))
+                .unwrap_or(false);
+
+            if is_sse {
+                handle_sse(session, &request.id, status, resp_headers, resp, start).await;
+            } else {
+                let body = resp.text().await.unwrap_or_default();
                 let duration = start.elapsed().as_millis() as u64;
-                let (status, error) = if e.is_timeout() {
-                    (504, "Target service timeout".to_string())
-                } else if e.is_connect() {
-                    (503, format!("Target service unavailable: {e}"))
-                } else {
-                    (500, format!("{e}"))
-                };
                 let _ = session
                     .tx
-                    .send(Message::response(
-                        &id,
-                        status,
-                        HashMap::new(),
-                        None,
-                        Some(error),
-                        duration,
+                    .send(
+                        Message::response(&request.id, status, resp_headers, Some(body), None, duration)
+                            .into(),
                     )
-                    .into())
                     .await;
             }
         }
-    });
+        Err(e) => {
+            let duration = start.elapsed().as_millis() as u64;
+            let (status, error) = if e.is_timeout() {
+                (504, "Target service timeout".to_string())
+            } else if e.is_connect() {
+                (503, format!("Target service unavailable: {e}"))
+            } else {
+                (500, format!("{e}"))
+            };
+            let _ = session
+                .tx
+                .send(
+                    Message::response(&request.id, status, HashMap::new(), None, Some(error), duration)
+                        .into(),
+                )
+                .await;
+        }
+    }
 }
 
 async fn handle_sse(
@@ -1152,6 +1299,7 @@ mod tests {
             target_host: "127.0.0.1".into(),
             target_port,
             request_timeout: std::time::Duration::from_secs(5),
+            handler: None,
             binary_frames: true,
             udp_enabled,
         };

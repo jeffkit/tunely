@@ -8,6 +8,8 @@ WebSocket 透明反向代理隧道，支持服务端嵌入和客户端 SDK。
 - 🏠 **服务端 SDK**：可嵌入到 FastAPI 应用中
 - 🖥️ **客户端 SDK**：Python / TypeScript / Rust 三版本，支持独立运行和嵌入使用
 - 🦀 **Rust 客户端**：单个静态二进制、零运行时依赖（见 `rust/`），适合内网机器分发部署（crates.io: `cargo install tunely`）
+- 🧩 **库形态嵌入**：Rust 版既能 `cargo add tunely` 当库用，也提供 C ABI（`cdylib`/`staticlib`）
+  供 Go/C/C#/Java 宿主进程内嵌入；内置 handler 可让宿主**不起本地端口**直接应答隧道请求——见 [`docs/EMBEDDING.md`](docs/EMBEDDING.md)
 - 🐳 **Docker**：服务端镜像 ghcr.io/jeffkit/tunely（python-v* tag 自动构建）
 - 🔐 **多隧道**：`WS_TUNNEL_TCP_LISTEN="9080:dsh,9081:foo"` 一实例多端口、每端口绑一条隧道；API 暴露每隧道流量统计
 - 🔐 **预注册机制**：域名 + Token 认证，安全可控
@@ -100,6 +102,13 @@ curl -X POST http://localhost:8000/api/tunnels/my-agent/forward \
   }'
 ```
 
+## 以库的形式嵌入
+
+三个客户端都是「库 + CLI」双形态，宿主进程可以把隧道跑在自己进程里（不用 spawn 子进程、
+不用管状态文件）；Rust 版还额外提供进程内 handler（宿主自己应答请求，**不必监听本地端口**）
+与 C ABI（`cdylib`/`staticlib`，供 Go/C/C#/Java 宿主嵌入）。完整说明与代码见
+[`docs/EMBEDDING.md`](docs/EMBEDDING.md)。
+
 ## 项目结构
 
 ```
@@ -107,6 +116,7 @@ tunely/
 ├── README.md                  # 本文件
 ├── docs/
 │   ├── PROTOCOL.md           # 协议文档
+│   ├── EMBEDDING.md          # 以库的形式嵌入客户端（Rust 库 / C ABI / Python / TS）
 │   └── QUICKSTART.md         # 快速开始
 │
 ├── python/                    # Python 服务端 + 客户端 SDK（PyPI: tunely）
