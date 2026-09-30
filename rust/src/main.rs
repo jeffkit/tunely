@@ -123,67 +123,113 @@ async fn run_connect(cli: CliOverrides, config_path: Option<PathBuf>) {
         println!("已加载配置文件: {}", path.display());
     }
 
-    let settings = match config::resolve(&cli, &file_cfg, &config::real_env) {
+    let settings_list = match config::resolve_all(&cli, &file_cfg, &config::real_env) {
         Ok(s) => s,
         Err(e) => fail(&e),
     };
 
     println!("tunely - WebSocket Tunnel Client (Rust)");
-    println!("  服务端: {}", settings.server);
-    println!("  目标: {}", settings.target);
-    if settings.force {
-        println!("  强制模式: 将抢占已有连接");
+    println!("  服务端: {}", settings_list[0].server);
+    let multi = settings_list.len() > 1;
+    if multi {
+        println!("  隧道 ({}):", settings_list.len());
+        for s in &settings_list {
+            println!(
+                "    - {} -> {}",
+                s.name.as_deref().unwrap_or("-"),
+                s.target
+            );
+        }
+    } else {
+        println!("  目标: {}", settings_list[0].target);
+        if settings_list[0].force {
+            println!("  强制模式: 将抢占已有连接");
+        }
     }
     println!();
 
-    let client = TunnelClient::new(TunnelClientConfig {
-        server_url: settings.server,
-        token: settings.token,
-        target_url: settings.target,
-        reconnect_interval: Duration::from_secs(settings.reconnect),
-        max_reconnect_attempts: settings.max_reconnect,
-        request_timeout: Duration::from_secs(settings.request_timeout),
-        force: settings.force,
-        keepalive_interval: Duration::from_secs(settings.keepalive_interval),
-        keepalive_timeout: Duration::from_secs(settings.keepalive_timeout),
-    });
-
-    // 状态文件：在连接成功 / 断开进入重连 / 报错 / 停止 时更新
-    let tracker = Arc::new(StatusTracker::new(status::default_state_path()));
+    // 状态文件：在连接成功 / 断开进入重连 / 报错 / 停止 时更新；
+    // 槽位按会话标签（name，单隧道为 "default"）键控
+    let tracker = Arc::new(StatusTracker::new(
+        status::default_state_path(),
+        settings_list
+            .iter()
+            .map(|s| s.name.clone().unwrap_or_else(|| "default".into()))
+            .collect(),
+    ));
     tracker.mark_starting();
 
-    {
-        let tracker = tracker.clone();
-        client.on_connect(move |domain| {
-            println!("✓ 已连接: domain={domain}");
-            tracker.set_connected(domain);
+    let mut clients: Vec<Arc<TunnelClient>> = Vec::new();
+    for settings in &settings_list {
+        let label = settings.name.clone().unwrap_or_else(|| "default".into());
+        let prefix = if multi {
+            format!("[{label}] ")
+        } else {
+            String::new()
+        };
+        let client = TunnelClient::new(TunnelClientConfig {
+            server_url: settings.server.clone(),
+            token: settings.token.clone(),
+            target_url: settings.target.clone(),
+            reconnect_interval: Duration::from_secs(settings.reconnect),
+            max_reconnect_attempts: settings.max_reconnect,
+            request_timeout: Duration::from_secs(settings.request_timeout),
+            force: settings.force,
+            keepalive_interval: Duration::from_secs(settings.keepalive_interval),
+            keepalive_timeout: Duration::from_secs(settings.keepalive_timeout),
+            name: settings.name.clone(),
         });
+        let client = Arc::new(client);
+        {
+            let tracker = tracker.clone();
+            let label = label.clone();
+            let prefix = prefix.clone();
+            client.on_connect(move |domain| {
+                println!("{prefix}✓ 已连接: domain={domain}");
+                tracker.set_connected(&label, domain);
+            });
+        }
+        {
+            let tracker = tracker.clone();
+            let label = label.clone();
+            let prefix = prefix.clone();
+            client.on_disconnect(move || {
+                println!("{prefix}! 连接断开");
+                tracker.set_reconnecting(&label);
+            });
+        }
+        {
+            let tracker = tracker.clone();
+            let prefix = prefix.clone();
+            client.on_error(move |msg| {
+                eprintln!("{prefix}✗ 错误: {msg}");
+                tracker.set_error(&label, msg);
+            });
+        }
+        clients.push(client);
     }
+
     {
-        let tracker = tracker.clone();
-        client.on_disconnect(move || {
-            println!("! 连接断开");
-            tracker.set_reconnecting();
-        });
-    }
-    {
-        let tracker = tracker.clone();
-        client.on_error(move |msg| {
-            eprintln!("✗ 错误: {msg}");
-            tracker.set_error(msg);
+        let clients = clients.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("\n收到 Ctrl-C，正在停止…");
+            for c in &clients {
+                c.stop();
+            }
+            // 不在此处 process::exit：让 run() 自然返回后统一写最终状态
         });
     }
 
-    let client = Arc::new(client);
-    let c2 = client.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        println!("\n收到 Ctrl-C，正在停止…");
-        c2.stop();
-        // 不在此处 process::exit：让 run() 自然返回后统一写最终状态
-    });
-
-    client.run().await;
+    // 每条隧道一个独立任务：会话间重连/退避互不影响；
+    // 全部退出（stop 或耗尽 max_reconnect）后进程才结束
+    let handles: Vec<_> = clients
+        .into_iter()
+        .map(|c| tokio::spawn(async move { c.run().await }))
+        .collect();
+    for handle in handles {
+        let _ = handle.await;
+    }
     tracker.set_stopped();
 }
 
@@ -212,24 +258,45 @@ fn print_status(data: &StatusData) {
         data.last_error.as_deref().unwrap_or("-")
     );
     println!("  updated_at:      {}", data.updated_at);
+    if let Some(tunnels) = &data.tunnels {
+        println!("  tunnels ({}):", tunnels.len());
+        for t in tunnels {
+            println!(
+                "    - {:<10} {:<12} domain={:<20} reconnect_count={} last_error={}",
+                t.name,
+                t.state.as_str(),
+                t.domain.as_deref().unwrap_or("-"),
+                t.reconnect_count,
+                t.last_error.as_deref().unwrap_or("-"),
+            );
+        }
+    }
 }
 
-/// 状态文件写入器：聚合当前连接状态，在状态变化点落盘
+/// 状态文件写入器：聚合当前连接状态，在状态变化点落盘。
+/// 多隧道模式下每条隧道一个槽位（按配置 name 键控），状态文件带 tunnels 数组；
+/// 单隧道模式保持 0.3.x 的单状态形状（tunnels=None 不落盘）。
 struct StatusTracker {
     path: Option<PathBuf>,
     pid: u32,
     inner: Mutex<Inner>,
 }
 
-struct Inner {
-    state: RunState,
+struct Slot {
+    name: String,
     domain: Option<String>,
+    state: RunState,
     reconnect_count: u32,
     last_error: Option<String>,
 }
 
+struct Inner {
+    slots: Vec<Slot>,
+    stopped: bool,
+}
+
 impl StatusTracker {
-    fn new(path: Option<PathBuf>) -> Self {
+    fn new(path: Option<PathBuf>, names: Vec<String>) -> Self {
         if path.is_none() {
             eprintln!("警告: 未设置 TUNELY_STATE_FILE 且无法确定 HOME，状态文件功能不可用");
         }
@@ -237,10 +304,17 @@ impl StatusTracker {
             path,
             pid: std::process::id(),
             inner: Mutex::new(Inner {
-                state: RunState::Reconnecting,
-                domain: None,
-                reconnect_count: 0,
-                last_error: None,
+                slots: names
+                    .into_iter()
+                    .map(|name| Slot {
+                        name,
+                        domain: None,
+                        state: RunState::Reconnecting,
+                        reconnect_count: 0,
+                        last_error: None,
+                    })
+                    .collect(),
+                stopped: false,
             }),
         }
     }
@@ -250,35 +324,44 @@ impl StatusTracker {
         self.flush();
     }
 
-    fn set_connected(&self, domain: &str) {
+    fn set_connected(&self, name: &str, domain: &str) {
         let mut g = self.inner.lock().unwrap();
-        g.state = RunState::Connected;
-        g.domain = Some(domain.to_string());
-        g.reconnect_count = 0;
-        g.last_error = None;
+        if let Some(slot) = g.slots.iter_mut().find(|s| s.name == name) {
+            slot.state = RunState::Connected;
+            slot.domain = Some(domain.to_string());
+            slot.reconnect_count = 0;
+            slot.last_error = None;
+        }
         drop(g);
         self.flush();
     }
 
-    fn set_reconnecting(&self) {
+    fn set_reconnecting(&self, name: &str) {
         let mut g = self.inner.lock().unwrap();
-        g.state = RunState::Reconnecting;
+        if let Some(slot) = g.slots.iter_mut().find(|s| s.name == name) {
+            slot.state = RunState::Reconnecting;
+        }
         drop(g);
         self.flush();
     }
 
-    fn set_error(&self, msg: &str) {
+    fn set_error(&self, name: &str, msg: &str) {
         let mut g = self.inner.lock().unwrap();
-        g.state = RunState::Reconnecting;
-        g.last_error = Some(msg.to_string());
-        g.reconnect_count += 1;
+        if let Some(slot) = g.slots.iter_mut().find(|s| s.name == name) {
+            slot.state = RunState::Reconnecting;
+            slot.last_error = Some(msg.to_string());
+            slot.reconnect_count += 1;
+        }
         drop(g);
         self.flush();
     }
 
     fn set_stopped(&self) {
         let mut g = self.inner.lock().unwrap();
-        g.state = RunState::Disconnected;
+        g.stopped = true;
+        for slot in &mut g.slots {
+            slot.state = RunState::Disconnected;
+        }
         drop(g);
         self.flush();
     }
@@ -287,13 +370,33 @@ impl StatusTracker {
         let Some(path) = &self.path else { return };
         let data = {
             let g = self.inner.lock().unwrap();
+            // 聚合口径：任一隧道 Connected 即 Connected；全停才 Disconnected
+            let state = if g.stopped {
+                RunState::Disconnected
+            } else if g.slots.iter().any(|s| s.state == RunState::Connected) {
+                RunState::Connected
+            } else {
+                RunState::Reconnecting
+            };
             StatusData {
                 pid: self.pid,
-                state: g.state,
-                domain: g.domain.clone(),
-                reconnect_count: g.reconnect_count,
-                last_error: g.last_error.clone(),
+                state,
+                domain: g.slots.iter().find_map(|s| s.domain.clone()),
+                reconnect_count: g.slots.iter().map(|s| s.reconnect_count).sum(),
+                last_error: g.slots.iter().find_map(|s| s.last_error.clone()),
                 updated_at: status::now_rfc3339(),
+                tunnels: (g.slots.len() > 1).then(|| {
+                    g.slots
+                        .iter()
+                        .map(|s| status::TunnelStatus {
+                            name: s.name.clone(),
+                            state: s.state,
+                            domain: s.domain.clone(),
+                            reconnect_count: s.reconnect_count,
+                            last_error: s.last_error.clone(),
+                        })
+                        .collect()
+                }),
             }
         };
         if let Err(e) = status::write_status(path, &data) {

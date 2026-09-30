@@ -35,6 +35,16 @@ impl RunState {
     }
 }
 
+/// 单条隧道的运行状态（多隧道模式下的 tunnels 数组元素）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TunnelStatus {
+    pub name: String,
+    pub state: RunState,
+    pub domain: Option<String>,
+    pub reconnect_count: u32,
+    pub last_error: Option<String>,
+}
+
 /// 状态文件内容（JSON）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatusData {
@@ -45,6 +55,10 @@ pub struct StatusData {
     pub last_error: Option<String>,
     /// RFC3339（UTC）
     pub updated_at: String,
+    /// 多隧道模式专属：每条隧道独立状态；单隧道模式为 None（wire 形状与
+    /// 0.3.x 完全一致，老版本 status 消费方不受影响）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnels: Option<Vec<TunnelStatus>>,
 }
 
 /// 当前 UTC 时间的 RFC3339 表示
@@ -125,6 +139,7 @@ mod tests {
             reconnect_count: 3,
             last_error: Some("connection reset".into()),
             updated_at: now_rfc3339(),
+            tunnels: None,
         }
     }
 
@@ -149,6 +164,7 @@ mod tests {
             reconnect_count: 0,
             last_error: None,
             updated_at: "2026-09-25T00:00:00Z".into(),
+            tunnels: None,
         };
         write_status(&path, &data).unwrap();
         assert_eq!(read_status(&path).unwrap(), data);
@@ -196,6 +212,7 @@ mod tests {
             reconnect_count: 2,
             last_error: None,
             updated_at: "t".into(),
+            tunnels: None,
         };
         let j = serde_json::to_string(&data).unwrap();
         assert!(j.contains(r#""pid":7"#), "{j}");
@@ -204,6 +221,39 @@ mod tests {
         assert!(j.contains(r#""reconnect_count":2"#), "{j}");
         assert!(j.contains(r#""last_error":null"#), "{j}");
         assert!(j.contains(r#""updated_at":"t""#), "{j}");
+        // 单隧道形态不出现 tunnels 键（0.3.x wire 兼容）
+        assert!(!j.contains("tunnels"), "{j}");
+    }
+
+    #[test]
+    fn multi_tunnel_shape_roundtrips() {
+        let data = StatusData {
+            pid: 9,
+            state: RunState::Reconnecting,
+            domain: Some("dsh.example.com".into()),
+            reconnect_count: 1,
+            last_error: None,
+            updated_at: "t".into(),
+            tunnels: Some(vec![
+                TunnelStatus {
+                    name: "dsh".into(),
+                    state: RunState::Connected,
+                    domain: Some("dsh.example.com".into()),
+                    reconnect_count: 0,
+                    last_error: None,
+                },
+                TunnelStatus {
+                    name: "plaita".into(),
+                    state: RunState::Reconnecting,
+                    domain: None,
+                    reconnect_count: 1,
+                    last_error: Some("rejected".into()),
+                },
+            ]),
+        };
+        let j = serde_json::to_string(&data).unwrap();
+        assert!(j.contains(r#""tunnels""#), "{j}");
+        assert_eq!(serde_json::from_str::<StatusData>(&j).unwrap(), data);
     }
 
     #[test]

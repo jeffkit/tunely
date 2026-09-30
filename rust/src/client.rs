@@ -73,6 +73,9 @@ pub struct TunnelClientConfig {
     pub keepalive_interval: Duration,
     /// keepalive：超过该时长未收到 pong 判定连接死亡并重连，默认 45s
     pub keepalive_timeout: Duration,
+    /// 多隧道模式下的会话标签（单隧道为 None）；用于连接期日志前缀，
+    /// 认证成功后的日志自带 domain 不依赖此值
+    pub name: Option<String>,
 }
 
 impl Default for TunnelClientConfig {
@@ -87,6 +90,7 @@ impl Default for TunnelClientConfig {
             force: false,
             keepalive_interval: Duration::from_secs(25),
             keepalive_timeout: Duration::from_secs(45),
+            name: None,
         }
     }
 }
@@ -202,6 +206,15 @@ impl TunnelClient {
         }
     }
 
+    /// 日志前缀：多隧道模式下区分会话；单隧道为空串（日志与 0.3.x 逐字节一致）
+    fn log_prefix(&self) -> String {
+        self.config
+            .name
+            .as_deref()
+            .map(|n| format!("[{n}] "))
+            .unwrap_or_default()
+    }
+
     pub fn on_connect<F: Fn(&str) + Send + Sync + 'static>(&self, f: F) {
         if let Ok(mut e) = self.events.try_lock() {
             e.on_connect = Some(Box::new(f));
@@ -251,11 +264,18 @@ impl TunnelClient {
         // 静默回退 localhost:8080——历史上吃过亏，这里把解析结果亮出来
         if session_target_looks_suspicious(&self.config.target_url, &target_host, target_port) {
             warn(format!(
-                "target 解析可疑: config='{}' -> {}:{}（target 需带 scheme，如 http://host:port）",
+                "{}target 解析可疑: config='{}' -> {}:{}（target 需带 scheme，如 http://host:port）",
+                self.log_prefix(),
                 self.config.target_url, target_host, target_port
             ));
         }
-        info(format!("目标解析: {}:{} (from '{}')", target_host, target_port, self.config.target_url));
+        info(format!(
+            "{}目标解析: {}:{} (from '{}')",
+            self.log_prefix(),
+            target_host,
+            target_port,
+            self.config.target_url
+        ));
         let target_base = self.config.target_url.trim_end_matches('/').to_string();
 
         while self.running.load(Ordering::SeqCst) {
@@ -281,7 +301,8 @@ impl TunnelClient {
                         break;
                     }
                     info(format!(
-                        "连接已关闭，{:.1}秒后重连",
+                        "{}连接已关闭，{:.1}秒后重连",
+                        self.log_prefix(),
                         self.config.reconnect_interval.as_secs_f32()
                     ));
                     self.sleep_interruptible(self.config.reconnect_interval)
@@ -299,7 +320,10 @@ impl TunnelClient {
                     let reconnect_count = state.reconnect_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let max = self.config.max_reconnect_attempts;
                     if max > 0 && reconnect_count > max {
-                        error(format!("超过最大重连次数 ({max})，停止"));
+                        error(format!(
+                            "{}超过最大重连次数 ({max})，停止",
+                            self.log_prefix()
+                        ));
                         break;
                     }
 
@@ -319,7 +343,8 @@ impl TunnelClient {
                         backoff_factor,
                     ));
                     warn(format!(
-                        "连接断开: {err}，{:.1}秒后重连 (第 {reconnect_count} 次, backoff={backoff_factor})",
+                        "{}连接断开: {err}，{:.1}秒后重连 (第 {reconnect_count} 次, backoff={backoff_factor})",
+                        self.log_prefix(),
                         delay as f32 / 1000.0
                     ));
                     self.sleep_interruptible(Duration::from_millis(delay)).await;
@@ -353,7 +378,11 @@ impl TunnelClient {
         target_host: String,
         target_port: u16,
     ) -> Result<(), ConnectError> {
-        info(format!("正在连接到 {}...", self.config.server_url));
+        info(format!(
+            "{}正在连接到 {}...",
+            self.log_prefix(),
+            self.config.server_url
+        ));
 
         let (ws, _resp) = connect_async(&self.config.server_url)
             .await

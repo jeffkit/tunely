@@ -21,12 +21,25 @@ pub struct FileConfig {
     pub server: Option<String>,
     pub token: Option<String>,
     pub target: Option<String>,
+    /// 多隧道形态（TOML `[[tunnel]]` 数组-of-tables，文档键为 `tunnel`）。
+    /// 非空时进入多隧道模式：顶层 token/target 视为各条目的回退与单隧道形态互斥。
+    #[serde(default, rename = "tunnel")]
+    pub tunnels: Vec<TunnelEntry>,
     pub reconnect_secs: Option<u64>,
     pub max_reconnect: Option<u32>,
     pub request_timeout_secs: Option<u64>,
     pub force: Option<bool>,
     pub keepalive_interval_secs: Option<u64>,
     pub keepalive_timeout_secs: Option<u64>,
+}
+
+/// `[[tunnel]]` 单条目：token 必填（缺省在 resolve_all 按序号报错，比反序列化
+/// 错误更可定位）；target 缺省回落顶层 target；name 缺省 tunnel-N
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TunnelEntry {
+    pub name: Option<String>,
+    pub token: Option<String>,
+    pub target: Option<String>,
 }
 
 /// CLI 侧可覆盖项（None = 未提供；数值旗标不再用 clap 默认值，才能区分「没传」与「传了默认值」）
@@ -49,6 +62,8 @@ pub struct Settings {
     pub token: String,
     pub server: String,
     pub target: String,
+    /// 多隧道模式下的会话标签（单隧道为 None）
+    pub name: Option<String>,
     pub reconnect: u64,
     pub max_reconnect: u32,
     pub request_timeout: u64,
@@ -57,37 +72,31 @@ pub struct Settings {
     pub keepalive_timeout: u64,
 }
 
-/// 按 CLI > env > file > 默认 的优先级合并出最终配置；
-/// 三处都拿不到 token 时返回 Err。
-pub fn resolve(
+/// 跨隧道共享的全局配置（server 与重连/keepalive 参数）
+#[derive(Debug, Clone)]
+pub struct Globals {
+    pub server: String,
+    pub reconnect: u64,
+    pub max_reconnect: u32,
+    pub request_timeout: u64,
+    pub force: bool,
+    pub keepalive_interval: u64,
+    pub keepalive_timeout: u64,
+}
+
+/// 按 CLI > env > file 解析全局项（不含 token/target——它们按隧道区分）
+fn resolve_globals(
     cli: &CliOverrides,
     file: &FileConfig,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Settings, String> {
-    let token = cli
-        .token
-        .clone()
-        .or_else(|| env(ENV_TOKEN))
-        .or_else(|| file.token.clone())
-        .ok_or_else(|| {
-            format!("缺少 token：请通过 --token、环境变量 {ENV_TOKEN} 或配置文件提供")
-        })?;
-    let server = cli
-        .server
-        .clone()
-        .or_else(|| env(ENV_SERVER))
-        .or_else(|| file.server.clone())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-    let target = cli
-        .target
-        .clone()
-        .or_else(|| env(ENV_TARGET))
-        .or_else(|| file.target.clone())
-        .unwrap_or_else(|| DEFAULT_TARGET.to_string());
-    Ok(Settings {
-        token,
-        server,
-        target,
+) -> Globals {
+    Globals {
+        server: cli
+            .server
+            .clone()
+            .or_else(|| env(ENV_SERVER))
+            .or_else(|| file.server.clone())
+            .unwrap_or_else(|| DEFAULT_SERVER.to_string()),
         reconnect: cli.reconnect.or(file.reconnect_secs).unwrap_or(5),
         max_reconnect: cli.max_reconnect.or(file.max_reconnect).unwrap_or(0),
         request_timeout: cli
@@ -103,7 +112,98 @@ pub fn resolve(
             .keepalive_timeout
             .or(file.keepalive_timeout_secs)
             .unwrap_or(45),
+    }
+}
+
+/// 按 CLI > env > file > 默认 的优先级合并出最终配置（单隧道形态）；
+/// 三处都拿不到 token 时返回 Err。
+pub fn resolve(
+    cli: &CliOverrides,
+    file: &FileConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Settings, String> {
+    let token = cli
+        .token
+        .clone()
+        .or_else(|| env(ENV_TOKEN))
+        .or_else(|| file.token.clone())
+        .ok_or_else(|| {
+            format!("缺少 token：请通过 --token、环境变量 {ENV_TOKEN} 或配置文件提供")
+        })?;
+    let target = cli
+        .target
+        .clone()
+        .or_else(|| env(ENV_TARGET))
+        .or_else(|| file.target.clone())
+        .unwrap_or_else(|| DEFAULT_TARGET.to_string());
+    let g = resolve_globals(cli, file, env);
+    Ok(Settings {
+        token,
+        server: g.server,
+        target,
+        name: None,
+        reconnect: g.reconnect,
+        max_reconnect: g.max_reconnect,
+        request_timeout: g.request_timeout,
+        force: g.force,
+        keepalive_interval: g.keepalive_interval,
+        keepalive_timeout: g.keepalive_timeout,
     })
+}
+
+/// 解析全部隧道：FileConfig 带 `[[tunnel]]` 数组时按条目展开（多隧道形态，
+/// 顶层 target 作为各条目的回退）；否则退化为单隧道（resolve）。
+///
+/// 多隧道形态下禁止单隧道来源（--token/--target 与 TUNELY_TOKEN/TUNELY_TARGET），
+/// 避免两种形态静默混用。
+pub fn resolve_all(
+    cli: &CliOverrides,
+    file: &FileConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<Settings>, String> {
+    if file.tunnels.is_empty() {
+        return Ok(vec![resolve(cli, file, env)?]);
+    }
+    if cli.token.is_some() || cli.target.is_some() {
+        return Err(
+            "配置了 [[tunnel]] 多隧道数组时不能再指定单隧道参数 --token/--target".into(),
+        );
+    }
+    if env(ENV_TOKEN).is_some() || env(ENV_TARGET).is_some() {
+        return Err(format!(
+            "配置了 [[tunnel]] 多隧道数组时不能再设置 {ENV_TOKEN}/{ENV_TARGET}"
+        ));
+    }
+    let g = resolve_globals(cli, file, env);
+    let mut out = Vec::with_capacity(file.tunnels.len());
+    for (i, entry) in file.tunnels.iter().enumerate() {
+        let token = entry.token.as_deref().map(str::trim).unwrap_or("");
+        if token.is_empty() {
+            return Err(format!("[[tunnel]] 第 {} 条缺少 token", i + 1));
+        }
+        let target = entry
+            .target
+            .clone()
+            .or_else(|| file.target.clone())
+            .unwrap_or_else(|| DEFAULT_TARGET.to_string());
+        let name = entry
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("tunnel-{}", i + 1));
+        out.push(Settings {
+            token: token.to_string(),
+            server: g.server.clone(),
+            target,
+            name: Some(name),
+            reconnect: g.reconnect,
+            max_reconnect: g.max_reconnect,
+            request_timeout: g.request_timeout,
+            force: g.force,
+            keepalive_interval: g.keepalive_interval,
+            keepalive_timeout: g.keepalive_timeout,
+        });
+    }
+    Ok(out)
 }
 
 /// 真实环境变量查找：读取后去除首尾空白，空白串视为未设置
@@ -362,5 +462,108 @@ force = true
         );
         assert_eq!(config_paths_with(None).len(), 1);
         assert_eq!(config_paths_with(Some("")).len(), 1);
+    }
+
+    // ============== 多隧道形态（[[tunnel]]） ==============
+
+    #[test]
+    fn toml_tunnel_array_parses_and_flat_form_still_works() {
+        let multi: FileConfig = toml::from_str(
+            r#"
+server = "wss://srv/ws/tunnel"
+
+[[tunnel]]
+name = "dsh"
+token = "t-dsh"
+target = "http://127.0.0.1:3098"
+
+[[tunnel]]
+token = "t-p2"
+target = "http://127.0.0.1:8123"
+"#,
+        )
+        .unwrap();
+        assert_eq!(multi.tunnels.len(), 2);
+        assert_eq!(multi.tunnels[0].name.as_deref(), Some("dsh"));
+        assert_eq!(multi.tunnels[0].token.as_deref(), Some("t-dsh"));
+        assert_eq!(multi.tunnels[1].name, None);
+        assert_eq!(multi.tunnels[1].token.as_deref(), Some("t-p2"));
+
+        // 单隧道平铺形态不受影响
+        let flat: FileConfig = toml::from_str("token = \"x\"\n").unwrap();
+        assert!(flat.tunnels.is_empty());
+        assert_eq!(flat.token.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn resolve_all_expands_tunnels_with_fallbacks() {
+        let file: FileConfig = toml::from_str(
+            r#"
+server = "wss://srv/ws/tunnel"
+target = "http://fallback:1"
+
+[[tunnel]]
+name = "dsh"
+token = " t-dsh "
+target = "http://127.0.0.1:3098"
+
+[[tunnel]]
+token = "t-p2"
+"#,
+        )
+        .unwrap();
+        let list = resolve_all(&CliOverrides::default(), &file, &env(&[])).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name.as_deref(), Some("dsh"));
+        assert_eq!(list[0].target, "http://127.0.0.1:3098");
+        // 第 2 条无 name/target：name 缺省 tunnel-2，target 回落顶层
+        assert_eq!(list[1].name.as_deref(), Some("tunnel-2"));
+        assert_eq!(list[1].target, "http://fallback:1");
+        // token 去首尾空白；全局项共享
+        assert_eq!(list[0].token, "t-dsh");
+        assert_eq!(list[1].server, "wss://srv/ws/tunnel");
+        assert_eq!(list[1].reconnect, 5);
+    }
+
+    #[test]
+    fn resolve_all_rejects_single_tunnel_sources_in_multi_mode() {
+        let file: FileConfig = toml::from_str("[[tunnel]]\ntoken = \"t\"\n").unwrap();
+        // CLI 单隧道参数冲突
+        let cli = CliOverrides {
+            token: Some("t-cli".into()),
+            ..Default::default()
+        };
+        let err = resolve_all(&cli, &file, &env(&[])).unwrap_err();
+        assert!(err.contains("--token"), "{err}");
+        // env 单隧道变量冲突
+        let err = resolve_all(
+            &CliOverrides::default(),
+            &file,
+            &env(&[(ENV_TARGET, "http://x")]),
+        )
+        .unwrap_err();
+        assert!(err.contains(ENV_TARGET), "{err}");
+    }
+
+    #[test]
+    fn resolve_all_reports_missing_token_with_index() {
+        let file: FileConfig = toml::from_str(
+            "[[tunnel]]\ntoken = \"a\"\n\n[[tunnel]]\ntarget = \"http://x\"\n",
+        )
+        .unwrap();
+        let err = resolve_all(&CliOverrides::default(), &file, &env(&[])).unwrap_err();
+        assert!(err.contains("第 2 条"), "{err}");
+    }
+
+    #[test]
+    fn resolve_all_delegates_to_resolve_when_no_array() {
+        let file = FileConfig {
+            token: Some("t-file".into()),
+            ..Default::default()
+        };
+        let list = resolve_all(&CliOverrides::default(), &file, &env(&[])).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].token, "t-file");
+        assert_eq!(list[0].name, None);
     }
 }
