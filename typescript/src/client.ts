@@ -125,7 +125,6 @@ export class TunnelClient {
   private negotiated: Set<string> = new Set();
   private reconnectCount = 0;
   private consecutiveRejectCount = 0;
-  private wasConnectedBefore = false;
   private events: TunnelClientEvents = {};
 
   // TCP 模式：conn_id -> 本地连接状态
@@ -282,7 +281,11 @@ export class TunnelClient {
       }, this.config.keepaliveInterval);
 
       ws.on('open', () => {
-        const useForce = this.config.force || (this.wasConnectedBefore && this.consecutiveRejectCount > 0);
+        // force 仅来自显式配置，绝不做「被拒后自动升级强抢」：两个客户端只要都曾
+        // 连上过同一隧道，被拒后会互相升级 force 形成互踢死循环（2026-09-30
+        // /dsh/ 失联事故）。本客户端的僵尸会话由服务端回收（不健康或心跳
+        // >120s 自动替换），被拒只说明对方活着，退避等待即可。
+        const useForce = this.config.force;
         const authMessage = createAuthMessage(this.config.token, useForce);
         ws.send(JSON.stringify(authMessage));
       });
@@ -372,7 +375,6 @@ export class TunnelClient {
     // 不带该字段时全 JSON，行为与 0.7.x 一致）
     this.negotiated = new Set(message.capabilities ?? []);
     this.connected = true;
-    this.wasConnectedBefore = true;
     this.reconnectCount = 0;
     this.consecutiveRejectCount = 0;
     console.log(`已连接: domain=${this.domain}`);

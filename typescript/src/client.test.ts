@@ -1423,3 +1423,69 @@ describe('TunnelClient - chunked_http（协议 v2 T3）', () => {
     expect(sentOfId(mockWs, 'response', 'req-ch-7')).toHaveLength(0);
   });
 });
+
+describe('TunnelClient - 认证被拒不自动升级 force（互踢防护回归 2026-09-30）', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.restoreAllMocks();
+  });
+
+  it('曾连接过、被 auth_error 拒绝后，重连认证也不得携带 force', async () => {
+    const WebSocketMock = vi.mocked((await import('ws')).default);
+    WebSocketMock.mockReset();
+    const instances: MockWebSocket[] = [];
+    WebSocketMock.mockImplementation(() => {
+      const ws = new MockWebSocket();
+      instances.push(ws);
+      return ws as any;
+    });
+
+    const client = new TunnelClient({
+      serverUrl: 'ws://test-server',
+      token: 'test-token',
+      targetUrl: 'http://localhost:3000',
+      reconnectInterval: 10,
+    });
+    const runPromise = client.run();
+    await new Promise((r) => setImmediate(r));
+
+    // 1) 首次连接成功
+    expect(instances[0]).toBeTruthy();
+    instances[0].emit('open');
+    instances[0].emit(
+      'message',
+      Buffer.from(JSON.stringify({ type: 'auth_ok', domain: 'dsh' }))
+    );
+    await waitUntil(() => instances[0].send.mock.calls.some(([d]) => String(d).includes('"auth"')));
+
+    // 2) 服务端断开 → 客户端自动重连
+    instances[0].emit('close');
+    await waitUntil(() => instances.length >= 2);
+
+    // 3) 第二次连接被拒（已被另一客户端占用）
+    instances[1].emit('open');
+    instances[1].emit(
+      'message',
+      Buffer.from(
+        JSON.stringify({
+          type: 'auth_error',
+          error: '已有活跃连接存在，使用 --force 参数可强制抢占',
+          code: 'auth_failed',
+        })
+      )
+    );
+
+    // 4) 第三次连接的认证帧必须 force=false——被拒不升级强抢，
+    //    否则两个客户端互相 force 抢占形成互踢死循环（09-30 /dsh/ 失联事故）
+    await waitUntil(() => instances.length >= 3);
+    instances[2].emit('open');
+    const thirdAuth = instances[2].send.mock.calls.find(([d]) =>
+      String(d).includes('"auth"')
+    );
+    expect(thirdAuth).toBeTruthy();
+    expect(JSON.parse(String(thirdAuth![0])).force).toBe(false);
+
+    client.stop();
+    await runPromise.catch(() => {});
+  });
+});

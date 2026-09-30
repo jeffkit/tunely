@@ -2,7 +2,9 @@
 //!
 //! 重连/退避/抢占语义与 typescript/src/client.ts 对齐：
 //! 干净断开按固定间隔重连；错误按指数退避（封顶 5 分钟、factor 封顶 8、±20% 抖动）；
-//! 认证被拒（already connected）累积 consecutive_reject 并在下一次认证自动带 force。
+//! 认证被拒（already connected）累积 consecutive_reject 仅用于加速退避，
+//! 绝不自动升级 force（两个客户端互踢死循环，2026-09-30 /dsh/ 失联事故）——
+//! 僵尸会话由服务端回收（不健康或心跳 >120s 自动替换），force 仅来自显式配置。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -133,7 +135,6 @@ impl std::fmt::Display for ConnectError {
 #[derive(Default)]
 struct RunState {
     connected: AtomicBool,
-    was_connected: AtomicBool,
     reconnect_count: AtomicU32,
     consecutive_reject: AtomicU32,
 }
@@ -331,9 +332,9 @@ impl TunnelClient {
         let target_base = self.config.target_url.trim_end_matches('/').to_string();
 
         while self.running.load(Ordering::SeqCst) {
-            let force = self.config.force
-                || (state.was_connected.load(Ordering::SeqCst)
-                    && state.consecutive_reject.load(Ordering::SeqCst) > 0);
+            // force 仅来自显式配置，绝不自动升级（互踢死循环，见文件头注释）；
+            // 被拒说明对方连接活着，退避等待服务端回收僵尸即可。
+            let force = self.config.force;
 
             match self
                 .connect_and_run(
@@ -583,7 +584,6 @@ impl TunnelClient {
                     session.binary_frames = capabilities.iter().any(|c| c == "binary_frames");
                     session.udp_enabled = capabilities.iter().any(|c| c == "udp");
                     state.connected.store(true, Ordering::SeqCst);
-                    state.was_connected.store(true, Ordering::SeqCst);
                     state.reconnect_count.store(0, Ordering::SeqCst);
                     state.consecutive_reject.store(0, Ordering::SeqCst);
                     info(format!("已连接: domain={domain}"));

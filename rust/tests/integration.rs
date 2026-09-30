@@ -446,12 +446,13 @@ async fn ws_disconnect_cleans_tcp_and_reconnects() {
 }
 
 #[tokio::test]
-async fn auth_rejected_then_reconnects_with_force() {
-    // 与 TS 客户端一致：force 仅在「曾成功连接过之后再被拒」时自动携带
+async fn auth_rejected_then_reconnects_without_force() {
+    // 与 TS 客户端一致：被拒绝不自动升级 force（互踢死循环，2026-09-30 事故）。
+    // 对方连接活着就退避等待；僵尸会话由服务端回收（不健康/心跳 >120s）。
     let mut server = FakeServer::start().await;
     let mut h = spawn_client(&server.ws_url(), "http://127.0.0.1:1").await;
 
-    // 1) 首次连接成功（was_connected = true）
+    // 1) 首次连接成功
     let mut conn1 = server.next_conn().await;
     let (_, f1) = conn1.expect_auth().await;
     assert!(!f1);
@@ -472,10 +473,10 @@ async fn auth_rejected_then_reconnects_with_force() {
     conn2.sink.close().await.unwrap();
     drop(conn2);
 
-    // 4) 下一次认证应自动 force=true 抢占
+    // 4) 曾连接过且被拒后，重连也不得自动 force——否则双客户端互踢
     let mut conn3 = server.next_conn().await;
     let (_, f3) = conn3.expect_auth().await;
-    assert!(f3, "曾连接过且被拒后，重连应自动 force");
+    assert!(!f3, "被拒后重连不得自动 force（显式配置除外）");
     conn3.send_auth_ok("dsh").await;
     h.expect_connected("dsh").await;
 
