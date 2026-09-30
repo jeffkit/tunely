@@ -1,7 +1,10 @@
 # Rust 客户端发布：推送 `rust-v*` tag（或手动 workflow_dispatch）时发布 crates.io
 #
-# 前置：仓库 Secrets 需配置 CRATES_IO_TOKEN（crates.io 账号 → Account Settings → API Tokens）。
-# 未配置时本 workflow 仅告警跳过，不会失败。
+# 前置：仓库 Secrets 配置下列**任一**即可（crates.io 账号 → Account Settings → API Tokens）：
+#   - CRATES_IO_TOKEN —— 本仓历史惯用名
+#   - CRATES_TOKEN    —— im-agentproc 跨仓发布通道用的名字
+#     （im-agentproc/.github/workflows/publish-tunely-rust.yml，本仓自身未配 secret 时的实际发布通道）
+# 两个都没配时本 workflow 仅告警跳过，不会失败。
 name: release-rust
 
 on:
@@ -36,17 +39,27 @@ jobs:
 
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          # 两个 secret 名都接受，避免运维误判「配了 CRATES_IO_TOKEN 却没生效」。
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}
         run: |
           set -uo pipefail
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::Secret CRATES_IO_TOKEN is not set — crates.io publish skipped."
+          token="${CRATES_IO_TOKEN:-}"
+          used="CRATES_IO_TOKEN"
+          if [ -z "$token" ]; then
+            token="${CRATES_TOKEN:-}"
+            used="CRATES_TOKEN"
+          fi
+          if [ -z "$token" ]; then
+            echo "::warning::Neither CRATES_IO_TOKEN nor CRATES_TOKEN is set — crates.io publish skipped."
             exit 0
           fi
+          echo "Using secret ${used} for crates.io auth."
+          version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
           # 版本已发布过则跳过（重复触发幂等）
-          out=$(cargo publish --registry crates-io 2>&1) && { echo "$out"; exit 0; }
+          out=$(CARGO_REGISTRY_TOKEN="$token" cargo publish --registry crates-io 2>&1) && { echo "$out"; exit 0; }
           if echo "$out" | grep -q "already exists"; then
-            echo "tunely v$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2) already published — skipping."
+            echo "tunely v${version} already published — skipping."
             exit 0
           fi
           echo "$out"

@@ -1,0 +1,72 @@
+# TypeScript 客户端发布：推送 `ts-v*` tag（或手动 workflow_dispatch）时发布 npm 包 `tunely`。
+#
+# 前置：仓库 Secrets 需配置 NPM_TOKEN（npmjs.com → Access Tokens，需对包 `tunely`
+# 具备 read+write 权限；该包当前 maintainer 为 jeffkit）。
+# 未配置时本 workflow 仅告警跳过，不会失败（与 release-rust.yml / pypi.yml 语义一致）。
+#
+# 版本唯一来源 = typescript/package.json 的 version；src/version.ts 的 CLIENT_VERSION
+# 由 protocol.conformance.test.ts 断言与 package.json 一致，故版本漂移会被测试拦住。
+name: release-npm
+
+on:
+  push:
+    tags:
+      - 'ts-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      # typescript/package.json 没有 packageManager 字段，这里固定 pnpm 版本（与 test.yml 一致）
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+          # 生成 .npmrc：//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Publish to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::warning::Secret NPM_TOKEN is not set — npm publish skipped."
+            exit 0
+          fi
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "Publishing ${name}@${version} to npm..."
+          # package.json 的 prepublishOnly 会在 publish 前再跑一次 build（本 workflow 已显式
+          # build 过），tsc 幂等覆盖 dist/，属冗余但无害，不会导致失败。
+          out=$(pnpm publish --no-git-checks 2>&1) && { echo "$out"; exit 0; }
+          if echo "$out" | grep -qE "already exists|EPUBLISHCONFLICT|cannot publish over the previously published versions"; then
+            echo "${name}@${version} already published — skipping."
+            exit 0
+          fi
+          echo "$out"
+          exit 1

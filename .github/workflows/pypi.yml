@@ -28,7 +28,9 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
           set -uo pipefail
-          if [ -z "$UV_PUBLISH_TOKEN" ]; then
+          # ${VAR:-} 而非 $VAR：set -u 下变量完全未定义会直接报 unbound variable 退出，
+          # 那就不满足「无 token 只告警不失败」的语义了。
+          if [ -z "${UV_PUBLISH_TOKEN:-}" ]; then
             echo "::warning::Secret PYPI_TOKEN is not set — PyPI publish skipped."
             exit 0
           fi
