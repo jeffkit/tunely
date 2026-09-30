@@ -154,3 +154,88 @@ journalctl -u tunely-server -p warning  # 只看告警以上
 ```
 
 > journald 默认重启后可能丢历史日志；如需持久化，确保 `/var/log/journal/` 存在（`Storage=persistent`）。
+
+## 6. 探测面加固（Anti-Probe Hardening，运维侧 T8）
+
+> SDK 侧去特征化（0.12）已落地，见 [`docs/PROBE_HARDENING.md`](../docs/PROBE_HARDENING.md)。
+> 本节是**部署侧**配套动作，目标是：主动扫描公网入口只看到一个普通站点，而不是一台隧道服务器。
+
+### 6.1 清单（按优先级）
+
+1. **必须配置 `WS_TUNNEL_ADMIN_API_KEY`**（长随机串）：0.12 起 `/api/info`、`/metrics` 受其门控；**不配置则这两端点仍开放**（与既有 admin 端点语义一致）。
+2. **wss-only**：控制面务必走 TLS（`serve --ssl-certfile/--ssl-keyfile` 原生 TLS，或边缘 nginx TLS）。裸 `ws://` 下协议 JSON、base64 数据明文可读，秒识别。
+3. **`ws_path` 随机化**：默认 `/ws/tunnel` 是可猜测路径。`serve --ws-path /<随机段>/ws/tunnel`，客户端 `server` URL 同步修改。
+4. **入口收敛 + decoy**：根路径配置像样的落地页（见 6.4 的 `TUNELY_ROOT_RESPONSE_FILE`；原生无 nginx 时也生效），不要用「空白 404」——那本身就是特征。
+5. **域名拆分**：portal/downloads 所在域名与隧道 wss 入口域名分离（见 6.5）。
+6. **TLS 细节取舍**：见 6.3（ALPN 默认恒锁 `http/1.1` 属弱指纹，记录在案）。
+
+### 6.2 nginx 参考配置（边缘反代形态）
+
+只反代必要路径，其余全部落到 decoy 静态站：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name <隧道域名>;
+    server_tokens off;                 # Server 头只露 "nginx"，不带版本
+
+    # 不向客户端透传上游 Server 头（uvicorn 指纹）
+    proxy_hide_header Server;
+
+    # —— 控制面 WebSocket：精确匹配随机化路径 ——
+    location = /<随机段>/ws/tunnel {    # 与 serve --ws-path 一致
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;      # 长连接：需大于心跳超时（默认 90s）
+    }
+
+    # —— 路径前缀转发与管理 API ——
+    location /t/   { proxy_pass http://127.0.0.1:8000; proxy_set_header Host $host; }
+    location /api/ { proxy_pass http://127.0.0.1:8000; proxy_set_header Host $host; }
+    location = /health { proxy_pass http://127.0.0.1:8000; }
+
+    # —— decoy：像样的静态落地页，其余路径全部落到这里 ——
+    location / { root /var/www/decoy-site; index index.html; }
+}
+```
+
+### 6.3 原生 TLS（0.11，无边缘反代）的取舍
+
+- `serve --ssl-certfile/--ssl-keyfile` 单进程终止 TLS，零边缘部署；
+- 监听 TLS 的 ALPN 由 `WS_TUNNEL_LISTENER_TLS_ALPN` 控制，**默认恒锁 `http/1.1`**——真实站点普遍 h2+http/1.1 并存，属弱指纹；仅 gRPC(h2) 内网目标才需要改；
+- 原生 TLS 模式没有 nginx 兜底，`Server: uvicorn` 头会直出；在意就在前面加一层 6.2 的 nginx；
+- 原生模式下无「其余路径落 decoy」能力，根路径 decoy 靠 `TUNELY_ROOT_RESPONSE_FILE`（下文）。
+
+### 6.4 根路径 decoy（`TUNELY_ROOT_RESPONSE_FILE`）
+
+```bash
+# /etc/tunely/env 追加（AppSettings 读取，serve/uvicorn 直启均生效）
+TUNELY_ROOT_RESPONSE_FILE="/var/www/decoy-site/index.html"
+```
+
+配置后主域名 `GET /` 返回该 HTML（`text/html`）；不配置默认回极简 `OK`。子域名转发行为不受影响。
+
+### 6.5 域名拆分
+
+- `deploy/install.sh` 的 `BASE`（portal/downloads 所在域）与隧道 wss 域名**分离**：portal 已有登录鉴权（`deploy/portal/app.py`），但不要与隧道入口混布在同一 server 块 / 同一证书语义下；
+- 效果：扫描 portal 域名看不到隧道端点，扫描隧道域名拿不到客户端二进制。
+
+### 6.6 验收（复测命令）
+
+```bash
+# 以下全部应当「像普通站点」：
+curl -s https://<隧道域名>/                  # decoy 落地页或 OK；无 tunely/version/domain 字样
+curl -s https://<隧道域名>/health            # {"status":"ok"}，无 connected_tunnels
+curl -s -o /dev/null -w "%{http_code}\n" https://<隧道域名>/api/info    # 401（配置 admin key 后）
+curl -s -o /dev/null -w "%{http_code}\n" https://<隧道域名>/metrics     # 401
+curl -s -o /dev/null -w "%{http_code}\n" https://<隧道域名>/docs        # 404
+curl -s -o /dev/null -w "%{http_code}\n" https://<隧道域名>/openapi.json # 404
+curl -sI https://<隧道域名>/ | grep -i '^server'  # 只见 nginx，无 uvicorn/tunely
+
+# WS：无 token / 错 token / 禁用 token 的连接都应回统一文案
+# {"type":"auth_error","error":"Authentication failed","code":"auth_failed"}
+# 并在 0.8–1.6s 随机延迟后以 1008 关闭——相互时序不可区分（token 枚举 oracle 已消除）
+```
