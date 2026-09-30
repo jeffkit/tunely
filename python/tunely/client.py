@@ -462,6 +462,12 @@ class TunnelClient:
             self._target_port = 8080
 
     @property
+    def _log_prefix(self) -> str:
+        """多隧道模式日志前缀；单隧道为空串（日志与 0.9.x 逐字节一致）"""
+        name = getattr(self.config, "name", None)
+        return f"[{name}] " if name else ""
+
+    @property
     def is_connected(self) -> bool:
         """是否已连接"""
         return self._connected
@@ -506,11 +512,11 @@ class TunnelClient:
                 max_attempts = self.config.max_reconnect_attempts
 
                 if max_attempts > 0 and self._reconnect_count > max_attempts:
-                    logger.error(f"超过最大重连次数 ({max_attempts})，停止")
+                    logger.error(f"{self._log_prefix}超过最大重连次数 ({max_attempts})，停止")
                     break
 
                 logger.warning(
-                    f"连接断开: {e}，{self.config.reconnect_interval}秒后重连 "
+                    f"{self._log_prefix}连接断开: {e}，{self.config.reconnect_interval}秒后重连 "
                     f"(第 {self._reconnect_count} 次)"
                 )
                 await asyncio.sleep(self.config.reconnect_interval)

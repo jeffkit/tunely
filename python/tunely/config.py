@@ -185,8 +185,97 @@ class TunnelClientConfig(BaseSettings):
         "0 = 从不流式（env: WS_TUNNEL_CLIENT_STREAM_THRESHOLD_BYTES）",
     )
 
+    # 多隧道模式下的会话标签（单隧道为 None）；用于日志前缀
+    name: str | None = Field(default=None, description="多隧道会话标签")
+
     model_config = {
         "env_prefix": "WS_TUNNEL_CLIENT_",
         "env_file": ".env",
         "extra": "ignore",
     }
+
+
+# ============== 多隧道形态（TOML [[tunnel]]，与 rust 客户端同构） ==============
+
+_DEFAULT_SERVER = "ws://localhost:8000/ws/tunnel"
+_DEFAULT_TARGET = "http://localhost:8080"
+
+
+def load_client_settings_from_toml(
+    path: str,
+    cli_server: str | None = None,
+    cli_token: str | None = None,
+    cli_target: str | None = None,
+    cli_reconnect: float | None = None,
+    cli_force: bool | None = None,
+) -> list[dict]:
+    """读取 connect 的 TOML 配置文件，解析出 TunnelClientConfig 字段字典列表。
+
+    形态（与 rust 客户端 client.toml 同键名）::
+
+        server = "wss://..."
+        target = "http://..."            # 可作 [[tunnel]] 各条目的回退
+        reconnect_secs = 5
+        force = false
+
+        [[tunnel]]
+        name = "dsh"                     # 可选，缺省 tunnel-N
+        token = "tun_..."
+        target = "http://..."            # 可选
+
+    无 [[tunnel]] 时为单隧道形态（顶层 token/target）。多隧道形态下
+    禁止单隧道 CLI 来源（--token/--target），避免两种形态静默混用。
+
+    返回值是 TunnelClientConfig(**item) 可直接展开的字段字典列表
+    （含 name，单隧道为 None）。
+    """
+    import tomllib
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(f"配置文件 {path} 内容不是 TOML 表")
+
+    entries = data.get("tunnel") or []
+    if entries and (cli_token or cli_target):
+        raise ValueError("配置了 [[tunnel]] 多隧道数组时不能再指定单隧道参数 --token/--target")
+
+    server = cli_server or data.get("server") or _DEFAULT_SERVER
+    reconnect = (
+        cli_reconnect
+        if cli_reconnect is not None
+        else float(data.get("reconnect_secs", 5.0))
+    )
+    force = bool(cli_force) or bool(data.get("force", False))
+    max_reconnect = int(data.get("max_reconnect", 0))
+
+    def _base(name: str | None, token: str, target: str) -> dict:
+        return {
+            "server_url": server,
+            "token": token,
+            "target_url": target,
+            "reconnect_interval": reconnect,
+            "max_reconnect_attempts": max_reconnect,
+            "force": force,
+            "name": name,
+        }
+
+    if not entries:
+        token = (cli_token or data.get("token") or "").strip()
+        if not token:
+            raise ValueError("缺少 token：请通过 --token 或配置文件提供")
+        target = cli_target or data.get("target") or _DEFAULT_TARGET
+        return [_base(None, token, target)]
+
+    out: list[dict] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"[[tunnel]] 第 {i + 1} 条不是表")
+        token = (entry.get("token") or "").strip()
+        if not token:
+            raise ValueError(f"[[tunnel]] 第 {i + 1} 条缺少 token")
+        name = entry.get("name") or f"tunnel-{i + 1}"
+        target = entry.get("target") or data.get("target") or _DEFAULT_TARGET
+        out.append(_base(name, token, target))
+    return out

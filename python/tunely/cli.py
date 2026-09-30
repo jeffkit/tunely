@@ -121,53 +121,104 @@ def serve(
 
 
 @main.command()
+@click.option("--server", "-s", default=None, help="服务端 WebSocket URL")
+@click.option("--token", "-t", default=None, help="隧道令牌（--config 多隧道时省略）")
+@click.option("--target", "-T", default=None, help="本地目标服务 URL")
+@click.option("--reconnect", "-r", default=None, type=float, help="重连间隔（秒）")
+@click.option("--force", "-f", is_flag=True, default=None, help="强制抢占已有连接")
 @click.option(
-    "--server",
-    "-s",
-    default="ws://localhost:8000/ws/tunnel",
-    help="服务端 WebSocket URL",
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="TOML 配置文件（支持 [[tunnel]] 多隧道，键名与 rust 客户端 client.toml 一致）",
 )
-@click.option("--token", "-t", required=True, help="隧道令牌")
-@click.option(
-    "--target",
-    "-T",
-    default="http://localhost:8080",
-    help="本地目标服务 URL",
-)
-@click.option("--reconnect", "-r", default=5.0, help="重连间隔（秒）")
-@click.option("--force", "-f", is_flag=True, help="强制抢占已有连接")
 @click.option("--verbose", "-v", is_flag=True, help="详细日志")
-def connect(server: str, token: str, target: str, reconnect: float, force: bool, verbose: bool):
-    """连接到隧道服务器"""
+def connect(
+    server: str | None,
+    token: str | None,
+    target: str | None,
+    reconnect: float | None,
+    force: bool | None,
+    config_path: str | None,
+    verbose: bool,
+):
+    """连接到隧道服务器（--config 支持单进程多隧道）"""
     setup_logging(verbose)
 
-    console.print(f"[bold blue]WS-Tunnel Client[/bold blue]")
-    console.print(f"  服务端: {server}")
-    console.print(f"  目标: {target}")
-    if force:
-        console.print(f"  [yellow]强制模式: 将抢占已有连接[/yellow]")
+    if config_path:
+        from .config import load_client_settings_from_toml
+
+        try:
+            settings_list = load_client_settings_from_toml(
+                config_path,
+                cli_server=server,
+                cli_token=token,
+                cli_target=target,
+                cli_reconnect=reconnect,
+                cli_force=force,
+            )
+        except ValueError as e:
+            console.print(f"[red]配置错误: {e}[/red]")
+            sys.exit(1)
+    else:
+        if not token:
+            console.print("[red]错误: 缺少 --token（或用 --config 指定配置文件）[/red]")
+            sys.exit(1)
+        settings_list = [
+            {
+                "server_url": server or "ws://localhost:8000/ws/tunnel",
+                "token": token,
+                "target_url": target or "http://localhost:8080",
+                "reconnect_interval": reconnect if reconnect is not None else 5.0,
+                "force": bool(force),
+                "name": None,
+            }
+        ]
+
+    multi = len(settings_list) > 1
+    console.print("[bold blue]WS-Tunnel Client[/bold blue]")
+    console.print(f"  服务端: {settings_list[0]['server_url']}")
+    if multi:
+        console.print(f"  隧道 ({len(settings_list)}):")
+        for s in settings_list:
+            console.print(f"    - {s['name']} -> {s['target_url']}")
+    else:
+        console.print(f"  目标: {settings_list[0]['target_url']}")
+        if settings_list[0]["force"]:
+            console.print("  [yellow]强制模式: 将抢占已有连接[/yellow]")
     console.print()
 
-    config = TunnelClientConfig(
-        server_url=server,
-        token=token,
-        target_url=target,
-        reconnect_interval=reconnect,
-        force=force,
-    )
-    client = TunnelClient(config=config)
+    async def run_all() -> None:
+        clients = []
+        for s in settings_list:
+            prefix = f"[{s['name']}] " if multi else ""
+            client = TunnelClient(config=TunnelClientConfig(**s))
 
-    def on_connect():
-        console.print(f"[green]✓[/green] 已连接: domain={client.domain}")
+            def make_callbacks(c=client, p=prefix):
+                def on_connect():
+                    console.print(f"{p}[green]✓[/green] 已连接: domain={c.domain}")
 
-    def on_disconnect():
-        console.print(f"[yellow]![/yellow] 连接断开")
+                def on_disconnect():
+                    console.print(f"{p}[yellow]![/yellow] 连接断开")
 
-    client.on_connect(on_connect)
-    client.on_disconnect(on_disconnect)
+                return on_connect, on_disconnect
+
+            on_conn, on_disc = make_callbacks(c=client, p=prefix)
+            client.on_connect(on_conn)
+            client.on_disconnect(on_disc)
+            clients.append(client)
+
+        # 每条隧道一个独立任务：重连互不影响，全部退出才结束
+        tasks = [asyncio.create_task(c.run()) for c in clients]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await asyncio.gather(*(c.stop() for c in clients), return_exceptions=True)
 
     try:
-        asyncio.run(client.run())
+        asyncio.run(run_all())
     except KeyboardInterrupt:
         console.print("\n[dim]已停止[/dim]")
         sys.exit(0)
