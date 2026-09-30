@@ -58,6 +58,8 @@ export interface TunnelClientConfig {
    * 0 = 从不流式。env: TUNELY_STREAM_THRESHOLD_BYTES
    */
   streamThresholdBytes?: number;
+  /** 多隧道模式下的会话标签（单隧道不设）；用于连接期日志前缀 */
+  name?: string;
 }
 
 // 共享 undici Agent（0.7.3：连接池跨请求复用，此前每请求新建+关闭，TLS 握手无法复用）。
@@ -145,8 +147,14 @@ export class TunnelClient {
       force: config.force ?? false,
       keepaliveInterval: config.keepaliveInterval ?? 25000,
       keepaliveTimeout: config.keepaliveTimeout ?? 45000,
+      name: config.name ?? '',
     };
     this.parseTargetUrl();
+  }
+
+  /** 多隧道日志前缀；单隧道为空串（日志与 0.3.x 逐字节一致） */
+  private get logPrefix(): string {
+    return this.config.name ? `[${this.config.name}] ` : '';
   }
 
   /** 是否已连接 */
@@ -177,7 +185,9 @@ export class TunnelClient {
         if (!this.running) break;
         this.notifyDisconnect();
         const reconnectDelay = this.config.reconnectInterval;
-        console.warn(`连接已关闭，${(reconnectDelay / 1000).toFixed(1)}秒后重连`);
+        console.warn(
+          `${this.logPrefix}连接已关闭，${(reconnectDelay / 1000).toFixed(1)}秒后重连`
+        );
         await this.sleep(reconnectDelay);
         continue;
       } catch (error) {
@@ -189,7 +199,7 @@ export class TunnelClient {
         const maxAttempts = this.config.maxReconnectAttempts;
 
         if (maxAttempts > 0 && this.reconnectCount > maxAttempts) {
-          console.error(`超过最大重连次数 (${maxAttempts})，停止`);
+          console.error(`${this.logPrefix}超过最大重连次数 (${maxAttempts})，停止`);
           break;
         }
 
@@ -212,7 +222,7 @@ export class TunnelClient {
         const actualDelay = Math.round(jitter);
 
         console.warn(
-          `连接断开: ${error}，${(actualDelay / 1000).toFixed(1)}秒后重连 ` +
+          `${this.logPrefix}连接断开: ${error}，${(actualDelay / 1000).toFixed(1)}秒后重连 ` +
             `(第 ${this.reconnectCount} 次, backoff=${backoffFactor})`
         );
         await this.sleep(actualDelay);
