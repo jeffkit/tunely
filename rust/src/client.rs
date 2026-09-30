@@ -157,6 +157,9 @@ struct UdpConn {
 /// 生产者（HTTP/SSE/TCP 读循环）在此阻塞而不是无界占用内存。
 const TX_CHANNEL_CAPACITY: usize = 256;
 
+/// 断开时等待出口队列排空的上限：够把已排队的帧写完，又不至于为冲刷拖住重连。
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// WS 出站帧：控制面 JSON 消息 or 数据面二进制帧（协议 v2 binary_frames）
 enum OutFrame {
     Text(String),
@@ -439,7 +442,7 @@ impl TunnelClient {
 
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = mpsc::channel::<OutFrame>(TX_CHANNEL_CAPACITY);
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 let ws_msg = match msg {
                     OutFrame::Text(t) => WsMessage::Text(t),
@@ -653,14 +656,21 @@ impl TunnelClient {
         }
 
         // 丢弃全部本地 TCP 连接（服务端会重新分配 conn_id），防止 socket 泄漏。
-        // 不等待 writer：残留的 TCP 读任务还持有 tx 克隆，若目标迟迟不关写侧会拖住整个重连；
-        // WebSocket 已死，直接中止 writer，读任务会在后续 send 失败时自行退出。
         cleanup_tcp(&session).await;
         // UDP 会话同理回收（协议 v2 udp：socket 不跨连接复用，服务端重连后
         // 会以新 session_id 重建）
         cleanup_udp(&session).await;
+
+        // 出口队列冲刷窗口：stop() 之后可能还有「刚答完、尚未落盘」的帧在队列里
+        //（嵌入式 handler 典型形态就是答完一个请求就停）。此时立即 abort writer
+        // 会把响应整条丢掉，所以先释放本会话持有的所有 tx 克隆，让 writer 在队列
+        // 排空后自然结束；只在超时（仍有任务持有 tx，例如卡在目标服务上的请求）
+        // 时才强杀——不能为了冲刷而拖住重连。
+        drop(session);
         drop(tx);
-        writer.abort();
+        if tokio::time::timeout(FLUSH_TIMEOUT, &mut writer).await.is_err() {
+            writer.abort();
+        }
         ticker.abort();
 
         let outcome = failure.lock().await.take();
