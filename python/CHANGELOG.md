@@ -6,7 +6,7 @@
 
 ## [Unreleased]
 
-### 0.11.0（deprecation，TCP-only 收敛第一批，docs/MIGRATION_TCP_ONLY.md）
+## [0.11.0] - 2026-09-30（deprecation，TCP-only 收敛第一批，docs/MIGRATION_TCP_ONLY.md）
 
 #### Changed
 - **能力注册表摘除 `chunked_http`**（`SERVER_CAPABILITIES`）：客户端即便声明也协商为空集，
