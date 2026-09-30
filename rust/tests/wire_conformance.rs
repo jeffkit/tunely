@@ -34,6 +34,15 @@ fn wire_conformance_all_scenarios() {
 
     for scenario in &scenarios {
         let name = scenario["name"].as_str().expect("场景缺少 name");
+
+        // deprecated 场景（TCP-only 收敛退役的 http 消息族，docs/MIGRATION_TCP_ONLY.md §4.3）
+        // 退出逐字段断言；解析容忍仍保留（0.11 服务端/客户端仍须接受旧 wire 输入）
+        if scenario.get("deprecated").and_then(Value::as_bool) == Some(true) {
+            Message::parse(scenario["input_json"].as_str().expect("场景缺少 input_json"))
+                .unwrap_or_else(|e| panic!("{name}: deprecated 场景仍必须可解析: {e}"));
+            continue;
+        }
+
         let input_json = scenario["input_json"]
             .as_str()
             .expect("场景缺少 input_json");

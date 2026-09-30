@@ -89,6 +89,8 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 
 ### 2. 请求-响应阶段
 
+> ⚠️ **0.11 DEPRECATED（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md）**：本节所述消息族将于 1.0 删除；新部署请使用 TCP 监听出口（文档 §7）。0.11 内服务端仍容忍这些消息（收到按原逻辑处理/告警），但不再为新隧道启用。
+
 #### request（服务端 → 客户端）
 
 ```json
@@ -147,6 +149,8 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 | `timestamp` | string | | 响应时间 |
 
 ### 3. 流式响应阶段（SSE，v1.1 新增）
+
+> ⚠️ **0.11 DEPRECATED（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md）**：本节所述消息族将于 1.0 删除；新部署请使用 TCP 监听出口（文档 §7）。0.11 内服务端仍容忍这些消息（收到按原逻辑处理/告警），但不再为新隧道启用。
 
 当客户端检测到上游响应为 SSE（`Content-Type: text/event-stream`）时，不再回单个 `response`，
 改按 `stream_start` → `stream_chunk`* → `stream_end` 三段推送；三者 `id` 均对应原 `request.id`。
@@ -400,6 +404,8 @@ WS-Tunnel 协议定义了服务端和客户端之间的通信格式，基于 Web
 见「UDP 会话语义」）；接收侧按 `[1]` 帧类型分派，两种帧类型互斥不可互换解码。
 
 ### chunked_http 语义（已落地）
+
+> ⚠️ **0.11 DEPRECATED（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md）**：本节所述消息族将于 1.0 删除；新部署请使用 TCP 监听出口（文档 §7）。0.11 内服务端仍容忍这些消息（收到按原逻辑处理/告警），但不再为新隧道启用。
 
 非 SSE 大响应（超过客户端流式阈值）改按 `stream_start` → `stream_chunk`* → `stream_end`
 分块回传，避免两端全量缓冲。**非 SSE 流式仅发生在 `stream_ok` 请求上**：

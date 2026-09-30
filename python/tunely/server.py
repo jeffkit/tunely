@@ -41,7 +41,7 @@ from typing import Any, AsyncIterator, Literal
 
 import httpx
 import jwt as pyjwt
-from fastapi import APIRouter, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict
 
 from .config import TunnelServerConfig
@@ -117,7 +117,10 @@ _UDP_QUEUE_MAXSIZE = 1024
 # 认证时按「服务端注册表 ∩ 客户端声明 − disable_capabilities」回交集。
 # T2 binary_frames：WS binary 数据面帧；T3 chunked_http：非 SSE 大响应流式回传；
 # T4 udp：UDP 会话透传（0x03 二进制帧数据面 + udp_open/udp_close JSON 控制面）。
-SERVER_CAPABILITIES: list[str] = ["binary_frames", "chunked_http", "udp"]
+SERVER_CAPABILITIES: list[str] = ["binary_frames", "udp"]
+# chunked_http 已随 TCP-only 收敛退役（docs/MIGRATION_TCP_ONLY.md §4.2）：
+# 从注册表剔除后，客户端即便声明也协商为空集，chunked 流式回传自动关闭。
+# 消息模型/桥接代码 1.0 才删（deprecation 窗口）。
 
 
 def _client_ip(http_request: Request | None) -> str | None:
@@ -160,6 +163,24 @@ def is_valid_forward_path(path: str) -> bool:
 def normalize_forward_path(path: str) -> str:
     """归一化转发路径：缺 "/" 前缀时补上（浏览器 /t/ 路由对空/相对路径容错）"""
     return path if is_valid_forward_path(path) else f"/{path}"
+
+
+# ============== HTTP 模式退役告警（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md） ==============
+
+#: 已打过去重告警的「入口:domain」组合（进程级，重启即清零——告警是提醒不是审计）
+_HTTP_MODE_DEPRECATION_WARNED: set[str] = set()
+
+
+def _warn_http_mode_deprecated(entry: str, domain: str | None) -> None:
+    """HTTP 模式入口命中时告警（每 入口+域名 只告警一次，避免日志风暴）"""
+    key = f"{entry}:{domain or '-'}"
+    if key in _HTTP_MODE_DEPRECATION_WARNED:
+        return
+    _HTTP_MODE_DEPRECATION_WARNED.add(key)
+    logger.warning(
+        f"DEPRECATED: HTTP 模式入口 {entry} 命中 (domain={domain})——该数据面将在 1.0 删除，"
+        f"请迁移到 TCP 监听出口（docs/MIGRATION_TCP_ONLY.md §7）"
+    )
 
 
 # ============== 数据结构 ==============
@@ -1344,7 +1365,13 @@ class TunnelServer:
         async def forward_request(
             domain: str,
             request: ForwardRequest,
+            response: Response,
         ):
+            # HTTP 模式退役（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md）：命中即告警 + 标记。
+            # 1.0 删除本路由；期间迁移指引见该文档 §7（nginx → TCP 端口）。
+            _warn_http_mode_deprecated("forward-api", domain)
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "1.0.0"
             # path 安全校验（@-SSRF）：非法 path 直接 400，不触达隧道客户端
             if not is_valid_forward_path(request.path):
                 raise HTTPException(
@@ -1940,7 +1967,7 @@ class TunnelServer:
                 domain=request.domain,
                 name=request.name,
                 description=request.description,
-                mode=request.mode,
+                mode="tcp",  # 0.11 起新隧道恒为 tcp（mode 入参忽略，docs/MIGRATION_TCP_ONLY.md §4.4）
             )
 
             await session.commit()
@@ -2053,8 +2080,8 @@ class TunnelServer:
                 update_values['description'] = request.description
             if request.enabled is not None:
                 update_values['enabled'] = request.enabled
-            if request.mode is not None:
-                update_values['mode'] = request.mode
+            # mode 入参忽略（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md §4.4）：
+            # 请求模型保留该字段仅为 wire 兼容（extra="forbid" 下删字段会 422 旧客户端）。
             if update_values:
                 update_values['updated_at'] = datetime.now(timezone.utc)
 

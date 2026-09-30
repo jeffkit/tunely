@@ -97,6 +97,7 @@ class AppSettings(BaseSettings):
     cors_origins: str = ""
 
 
+
 # 全局配置实例
 settings = AppSettings()
 
@@ -331,16 +332,39 @@ async def forward_to_tunnel(
 ) -> Response | StreamingResponse:
     """
     转发请求到隧道
-    
+
+    DEPRECATED（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md）：本函数是 /t/ 与
+    子域名两类 HTTP 模式入口的汇聚点，1.0 随路由一并删除。命中即去重告警 +
+    打 Deprecation/Sunset 头。
+
     Args:
         request: FastAPI 请求对象
         domain: 隧道域名（子域名）
         path: 请求路径（包含查询参数）
-        
+
     Returns:
         响应对象
     """
+    from .server import _warn_http_mode_deprecated
+
+    _warn_http_mode_deprecated("http-proxy", domain)
+    deprecation_headers = {"Deprecation": "true", "Sunset": "1.0.0"}
     server = get_tunnel_server()
+
+    # 0.11 起新隧道恒为 mode='tcp'：HTTP 入口命中 TCP 隧道时快速失败，
+    # 不进入 forward() 的 TCP 分派（否则 body 语义错位且悬挂至请求超时）。
+    conn = server.manager.get_connection_by_domain(domain)
+    if conn is not None and conn.mode == "tcp":
+        return Response(
+            content=(
+                f'{{"error": "HTTP 模式已退役（TCP-only 收敛）：隧道 {domain} 为 TCP 模式，'
+                f'请改走 TCP 监听出口，见 docs/MIGRATION_TCP_ONLY.md §7"}}'
+            ),
+            status_code=410,
+            media_type="application/json",
+            headers={**deprecation_headers, "Link": "<docs/MIGRATION_TCP_ONLY.md>; rel=\"deprecation\""},
+        )
+
     
     # 检查隧道是否连接
     if not server.manager.is_connected(domain):
@@ -383,6 +407,7 @@ async def forward_to_tunnel(
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                **deprecation_headers,
             },
         )
     else:
@@ -396,12 +421,12 @@ async def forward_to_tunnel(
                 body=body,
                 timeout=settings.request_timeout,
             )
-            
+
             return Response(
-                content=response.body if isinstance(response.body, (str, bytes)) else 
+                content=response.body if isinstance(response.body, (str, bytes)) else
                     __import__("json").dumps(response.body),
                 status_code=response.status,
-                headers=response.headers,
+                headers={**response.headers, **deprecation_headers},
                 media_type=response.headers.get("content-type", "application/json"),
             )
         except Exception as e:
@@ -410,6 +435,7 @@ async def forward_to_tunnel(
                 content=f'{{"error": "Forward failed: {str(e)}"}}',
                 status_code=502,
                 media_type="application/json",
+                headers=deprecation_headers,
             )
 
 
@@ -468,7 +494,7 @@ def run_app(
 ):
     """
     运行 Tunely Server
-    
+
     Args:
         host: 监听地址
         port: 监听端口
@@ -479,7 +505,7 @@ def run_app(
         ws_path: WebSocket 路径
     """
     import uvicorn
-    
+
     global settings, app
     settings = AppSettings(
         host=host,
@@ -490,7 +516,6 @@ def run_app(
         jwt_secret=jwt_secret,
         ws_path=ws_path,
     )
-    
     # 创建完整的应用
     full_app = create_full_app(
         domain=domain,
@@ -499,7 +524,7 @@ def run_app(
         jwt_secret=jwt_secret,
         ws_path=ws_path,
     )
-    
+
     uvicorn.run(
         full_app,
         host=host,

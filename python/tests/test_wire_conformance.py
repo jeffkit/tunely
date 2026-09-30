@@ -33,9 +33,15 @@ def load_scenarios() -> list[dict[str, Any]]:
 
 
 SCENARIOS = load_scenarios()
+# deprecated 场景（TCP-only 收敛退役的 http 消息族，docs/MIGRATION_TCP_ONLY.md §4.3）
+# 退出逐字段断言；单独保留宽松解析测试（0.11 服务端仍须容忍这些输入，F10）。
+DEPRECATED_SCENARIOS = [s for s in SCENARIOS if s.get("deprecated") is True]
+ACTIVE_SCENARIOS = [s for s in SCENARIOS if s.get("deprecated") is not True]
 
 
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=[s["name"] for s in SCENARIOS])
+@pytest.mark.parametrize(
+    "scenario", ACTIVE_SCENARIOS, ids=[s["name"] for s in ACTIVE_SCENARIOS]
+)
 def test_wire_conformance(scenario: dict[str, Any]):
     """同一 input_json 解析后，type 与 expect.fields 子集必须成立。"""
     name = scenario["name"]
@@ -54,3 +60,26 @@ def test_wire_conformance(scenario: dict[str, Any]):
         assert dumped[key] == expected, (
             f"{name}: 字段 {key!r} 不一致: {dumped[key]!r} != {expected!r}"
         )
+
+
+def test_deprecated_scenarios_inventory():
+    """退役场景清单与收敛设计 §4.3 对齐（防标记遗漏/漂移）。"""
+    expected = {
+        "request_full", "request_minimal_get", "request_stream_ok",
+        "response_success", "response_upstream_error",
+        "stream_start_sse", "stream_chunk_with_sequence",
+        "stream_chunk_encoding_base64", "stream_end_normal", "stream_end_error",
+    }
+    assert {s["name"] for s in DEPRECATED_SCENARIOS} == expected
+    # 活跃场景 = auth 6 + tcp 5 + udp 3 + ping/pong 2 = 16
+    assert len(ACTIVE_SCENARIOS) == 16
+
+
+@pytest.mark.parametrize(
+    "scenario", DEPRECATED_SCENARIOS, ids=[s["name"] for s in DEPRECATED_SCENARIOS]
+)
+def test_deprecated_scenarios_still_parse(scenario: dict[str, Any]):
+    """0.11 deprecation 窗口：旧消息输入仍必须被容忍解析（不断言字段，1.0 才收紧为丢弃）"""
+    wire_obj = json.loads(scenario["input_json"])
+    msg = parse_message(wire_obj)  # 只要不抛异常即容忍
+    assert msg is not None

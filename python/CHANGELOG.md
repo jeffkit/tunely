@@ -6,6 +6,29 @@
 
 ## [Unreleased]
 
+### 0.11.0（deprecation，TCP-only 收敛第一批，docs/MIGRATION_TCP_ONLY.md）
+
+#### Changed
+- **能力注册表摘除 `chunked_http`**（`SERVER_CAPABILITIES`）：客户端即便声明也协商为空集，
+  chunked 流式回传自动关闭；消息模型与桥接代码 1.0 删除。
+- **新隧道 `mode` 恒为 `tcp`**：`POST /api/tunnels` 忽略 `mode` 入参；`PUT /api/tunnels/{domain}`
+  忽略 `mode` 变更（请求模型保留字段仅为 wire 兼容）。
+- **`/t/`、子域名与 `/api/tunnels/{domain}/forward` 进入退役**：响应带
+  `Deprecation: true` / `Sunset: 1.0.0` 头，命中打去重 WARNING 日志；
+  HTTP 入口命中 `mode=tcp` 隧道时快速失败 410（不再误入 TCP 分派悬挂至超时）。
+
+#### Added
+- alembic `005_normalize_mode_tcp`：存量隧道 `mode` 归一为 `tcp`（单向迁移，执行前备份 mode 列）。
+- `python/tools/e2e_dataplane.py`：数据面字节保真/测量工具——
+  `local`（TCP 面验收：JSON/二进制/gzip/SSE/1MiB 上传/嵌套 WS 逐字节一致）、
+  `local-httpproxy`（同一真值经 `/t/` 的损伤对照）、`measure`（现网 `/t/` 损伤特征探测）。
+- wire.json：http 消息族 10 场景标记 `"deprecated": true`（py/rust 消费方跳过逐字段断言，
+  保留宽松解析容忍）；新增退役场景清单锚定测试。
+
+#### Deprecated
+- HTTP 数据面整体（`/t/`、子域名路由、`/forward`、`forward_stream`）：1.0 删除，
+  迁移指引见 `docs/MIGRATION_TCP_ONLY.md §7`（nginx → TCP 端口 / 原生 TLS 直发）。
+
 ## [0.7.0] - 2026-09-26
 
 稳定性/性能批次 P1（协议 wire 格式零变更）：消灭无界缓冲、修复正确性问题、

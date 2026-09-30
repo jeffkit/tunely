@@ -117,29 +117,31 @@ class TestServerModeApi:
 
     @pytest.mark.asyncio
     async def test_create_default_mode_visible_in_list(self, server: TunnelServer):
+        """0.11 起 API 创建恒为 tcp（TCP-only 收敛，docs/MIGRATION_TCP_ONLY.md §4.4）"""
         request = CreateTunnelRequest(domain="api-http")
         response = await server._create_tunnel(request, api_key=None)
 
-        assert response.mode == "http"
+        assert response.mode == "tcp"
 
         tunnels = await server._list_tunnels(api_key=None)
-        assert [t.mode for t in tunnels if t.domain == "api-http"] == ["http"]
+        assert [t.mode for t in tunnels if t.domain == "api-http"] == ["tcp"]
 
     @pytest.mark.asyncio
-    async def test_update_mode(self, server: TunnelServer):
+    async def test_update_mode_ignored(self, server: TunnelServer):
+        """0.11 起 mode 不可再经 API 变更：入参被忽略、值恒为 tcp（§4.4）"""
         await server._create_tunnel(
             CreateTunnelRequest(domain="api-switch"), api_key=None
         )
 
         updated = await server._update_tunnel(
-            "api-switch", UpdateTunnelRequest(mode="tcp"), api_key=None
+            "api-switch", UpdateTunnelRequest(mode="http"), api_key=None
         )
         assert updated.mode == "tcp"
 
         updated = await server._update_tunnel(
-            "api-switch", UpdateTunnelRequest(mode="http"), api_key=None
+            "api-switch", UpdateTunnelRequest(mode="tcp"), api_key=None
         )
-        assert updated.mode == "http"
+        assert updated.mode == "tcp"
 
 
 class TestForwardModeDispatch:
