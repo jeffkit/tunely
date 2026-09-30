@@ -20,6 +20,16 @@ import { StatusBadge } from './StatusBadge'
 import { formatDate, formatRelativeTime, formatNumber, formatBytes } from '../utils/format'
 import { RequestLogs } from '../pages/RequestLogs'
 
+// 隧道子域名模式的 base domain（构建时注入，见 .env.example）。
+// 未配置时回退相对路径 /<domain>/（依赖服务端 /t/ 或 catch-all 路由语义）。
+const TUNNEL_BASE_DOMAIN: string | undefined = import.meta.env.VITE_TUNNEL_BASE_DOMAIN
+
+function tunnelHref(domain: string): string {
+  return TUNNEL_BASE_DOMAIN
+    ? `https://${domain}.${TUNNEL_BASE_DOMAIN}/`
+    : `/${domain}/`
+}
+
 interface TunnelListProps {
   tunnels: Tunnel[]
   loading: boolean
@@ -73,7 +83,7 @@ export function TunnelList({
       key: 'domain',
       width: 200,
       render: (domain: string) => (
-        <a href={`/${domain}/`} target="_blank" rel="noreferrer" title="在新窗口打开该服务">
+        <a href={tunnelHref(domain)} target="_blank" rel="noreferrer" title="在新窗口打开该服务">
           <code>{domain}</code>
         </a>
       ),

@@ -95,3 +95,6 @@ htmlcov/
 # Alembic
 alembic/versions/__pycache__/
 .worktrees/
+
+# 实例发布产物（客户端二进制，构建后上传下载站；源在独立运维仓 crypto-ops）
+dist-clients/

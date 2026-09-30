@@ -220,7 +220,8 @@ TUNELY_ROOT_RESPONSE_FILE="/var/www/decoy-site/index.html"
 
 ### 6.5 域名拆分
 
-- `deploy/install.sh` 的 `BASE`（portal/downloads 所在域）与隧道 wss 域名**分离**：portal 已有登录鉴权（`deploy/portal/app.py`），但不要与隧道入口混布在同一 server 块 / 同一证书语义下；
+- portal/downloads 所在域名与隧道 wss 域名**分离**：portal 已有登录鉴权，但不要与隧道入口混布在同一 server 块 / 同一证书语义下；
+- dsht 实例的 portal 源码、install.sh 与下载产物已迁至独立运维仓 `~/projects/crypto-ops`（本仓只剩通用模板，见该仓 README 的发布纪律）；
 - 效果：扫描 portal 域名看不到隧道端点，扫描隧道域名拿不到客户端二进制。
 
 ### 6.6 验收（复测命令）

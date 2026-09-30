@@ -104,7 +104,7 @@
 - nginx：`server_tokens off` + `proxy_hide_header Server`（或覆写为 `Server: nginx`）；
   只反代精确路径（`location = <ws_path>`、`/t/`、`/api/`），其余 fallback 到 decoy 静态站；
 - `ws_path` 随机化：config 已支持，部署指南加随机路径生成示例；
-- portal / downloads 与隧道入口**拆域名**（`deploy/install.sh` 的 `BASE` 域名与 wss 域名分离）；
+- portal / downloads 与隧道入口**拆域名**（实例的安装脚本/门户已迁独立运维仓 crypto-ops，见 deploy/README.md §6.5）；
 - 原生 TLS 部署（0.11）：ALPN 仅 `http/1.1` 的取舍记录在案（放开 h2 属后续项）。
 
 ## 3. 不在本期（记录在案）
