@@ -186,6 +186,9 @@ tunely/
 | `WS_TUNNEL_REQUEST_LOG_RETENTION_DAYS` | `30` | 请求日志保留天数，后台周期清理；`0` = 永久保留 |
 | `WS_TUNNEL_HTTP_MAX_RESPONSE_BYTES` | `104857600` | HTTP 模式单请求响应体上限（字节），超限 502；`0` = 不限制 |
 | `WS_TUNNEL_TCP_FORWARD_MAX_BUFFER_BYTES` | `10485760` | TCP 转发单请求响应累积上限（字节），超限 502；`0` = 不限制 |
+| `WS_TUNNEL_UDP_LISTEN` | - | UDP 多监听器（协议 v2 udp）：`"port:domain[,port:domain...]"` 每端口绑一条隧道，UDP/TCP 可同端口号并存；监听地址复用 `WS_TUNNEL_TCP_LISTEN_HOST`（默认仅回环）；缺省不开 |
+| `WS_TUNNEL_UDP_SESSION_TIMEOUT` | `60` | UDP 会话空闲超时（秒），超时发 `udp_close` 并回收；`0` = 不限 |
+| `WS_TUNNEL_UDP_MAX_SESSIONS` | `256` | 每隧道 UDP 会话数上限，超限丢包；`0` = 不限制（公网暴露面评估见 PROTOCOL.md「UDP 会话语义」） |
 | `WS_TUNNEL_CLIENT_MAX_RESPONSE_BYTES` | `104857600` | （py 客户端）普通响应体内存上限（字节），超限中止读取并返回 502；`0` = 不限制 |
 | `TUNELY_MAX_RESPONSE_BYTES` | `104857600` | （TS 客户端 CLI）普通响应体内存上限（字节），超限中止读取并返回 502；`0` = 不限制 |
 
@@ -200,7 +203,7 @@ tunely/
 
 ## 协议版本
 
-当前协议版本：**2.0**（2.0 新增能力协商、binary_frames 二进制数据帧、chunked_http 非SSE流式；1.1 新增 SSE 流式响应与 TCP 透传）
+当前协议版本：**2.0**（2.0 新增能力协商、binary_frames 二进制数据帧、chunked_http 非SSE流式、udp UDP会话透传；1.1 新增 SSE 流式响应与 TCP 透传）
 
 详见 [PROTOCOL.md](docs/PROTOCOL.md)
 
