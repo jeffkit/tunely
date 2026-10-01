@@ -79,16 +79,17 @@ export interface AdminUser {
   tunnel_count?: number
 }
 
-/** POST /api/console/admin/users 请求（禁用/启用用户） */
-export interface AdminSetUserDisabledRequest {
-  username: string
-  disabled: boolean
+/** PATCH /api/console/admin/users/{username} 请求（契约 v1.1：禁用/降级自己 → 409 self_lockout） */
+export interface AdminUpdateUserRequest {
+  disabled?: boolean
+  role?: ConsoleRole
 }
 
-/** POST /api/console/admin/invites 请求 */
+/** POST /api/console/admin/invites 请求（契约 v1.1：role 默认 tenant，签发 admin 邀请前端需二次确认） */
 export interface AdminCreateInviteRequest {
   max_uses?: number
   expires_days?: number
+  role?: ConsoleRole
 }
 
 /** POST /api/console/admin/invites 响应 */

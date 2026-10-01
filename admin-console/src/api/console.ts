@@ -1,17 +1,17 @@
 /**
  * 多租户控制台 API 封装
- * 契约：docs/CONSOLE_MULTITENANT.md §5，统一前缀 /api/console，错误 {"error": {code, message}}。
+ * 契约：docs/CONSOLE_MULTITENANT.md §5（v1.1），统一前缀 /api/console，错误 {"error": {code, message}}。
  *
  * 会话：HttpOnly cookie（同源自动携带；配置了跨源后端地址时显式 withCredentials）。
- * 前端不持久化任何凭据（不写 localStorage/token）。管理端点按契约使用 admin key，
- * 若后端配置管理中已设置则随 x-api-key 附带，已登录 admin 会话 cookie 亦同时携带。
+ * 前端不持久化任何凭据（不写 localStorage/token），也绝不携带/下发 admin key
+ * （契约 v1.1：管理端点 admin 会话与 admin key 任一即可，前端 /admin 只用会话；admin key 仅供服务器脚本）。
  */
 import axios, { AxiosError, type AxiosInstance } from 'axios'
 import axiosRetry from 'axios-retry'
 import type {
   AdminCreateInviteRequest,
   AdminInviteCreated,
-  AdminSetUserDisabledRequest,
+  AdminUpdateUserRequest,
   AdminUser,
   ConsoleLoginRequest,
   ConsoleLoginResponse,
@@ -25,7 +25,6 @@ import type {
 import { ConsoleApiError, NetworkError, TimeoutError } from '../types/errors'
 import { API_CONFIG } from '../constants'
 import { getCurrentBackendConfig } from '../utils/backendConfig'
-import { getStoredApiKey } from './client'
 
 /**
  * 控制台 API 基地址：沿用现有封装的后端配置优先级（后端配置 > 旧 localStorage > 环境变量 > 同源 /api）
@@ -68,16 +67,7 @@ function createConsoleClient(): AxiosInstance {
     },
   })
 
-  // 请求拦截器：管理端点按契约附带 admin key（如有配置）
-  client.interceptors.request.use((config) => {
-    const apiKey = getStoredApiKey()
-    if (apiKey) {
-      config.headers['x-api-key'] = apiKey
-    }
-    return config
-  })
-
-  // 响应拦截器：统一转 ConsoleApiError（注意：401 不清除 admin key，控制台会话与 admin key 互不相干）
+  // 响应拦截器：统一转 ConsoleApiError（控制台仅凭 cookie 会话，与 admin key 互不相干）
   client.interceptors.response.use(
     (response) => response,
     (error: AxiosError) => {
@@ -153,7 +143,7 @@ export const consoleApi = {
     return response.data
   },
 
-  // ---- 管理端（契约：admin key 鉴权） ----
+  // ---- 管理端（契约 v1.1：admin 会话或 admin key 任一即可；前端仅凭会话 cookie） ----
 
   /** GET /api/console/admin/users：用户列表 */
   async adminListUsers(): Promise<AdminUser[]> {
@@ -161,12 +151,12 @@ export const consoleApi = {
     return response.data
   },
 
-  /** POST /api/console/admin/users：禁用/启用用户 */
-  async adminSetUserDisabled(data: AdminSetUserDisabledRequest): Promise<void> {
-    await client.post('/admin/users', data)
+  /** PATCH /api/console/admin/users/{username}：{disabled?, role?}；禁用/降级自己 → 409 self_lockout */
+  async adminUpdateUser(username: string, data: AdminUpdateUserRequest): Promise<void> {
+    await client.patch(`/admin/users/${encodeURIComponent(username)}`, data)
   },
 
-  /** POST /api/console/admin/invites：{max_uses?, expires_days?} → {code} */
+  /** POST /api/console/admin/invites：{max_uses?, expires_days?, role?} → {code} */
   async adminCreateInvite(data: AdminCreateInviteRequest): Promise<AdminInviteCreated> {
     const response = await client.post('/admin/invites', data)
     return response.data

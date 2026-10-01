@@ -45,14 +45,6 @@ function getApiKey(): string | null {
   return localStorage.getItem('tunely_api_key')
 }
 
-/**
- * 只读取当前已配置的 admin key（不修改任何存储）。
- * 供控制台 admin 端点复用（契约：管理端 API 使用 admin key 鉴权）。
- */
-export function getStoredApiKey(): string | null {
-  return getApiKey()
-}
-
 // 设置 API Key
 export function setApiKey(apiKey: string | null) {
   if (apiKey) {
