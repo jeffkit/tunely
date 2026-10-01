@@ -40,6 +40,7 @@ from .server import (
     normalize_forward_path,
 )
 from .config import TunnelServerConfig
+from .console_api import mount_console_api
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,11 @@ def create_full_app(
     
     # 包含 TunnelServer 的路由（API 和 WebSocket）
     new_app.include_router(tunnel_srv.router)
+
+    # 多租户自助控制台（docs/CONSOLE_MULTITENANT.md §5）：/api/console/*
+    # 含统一错误 handler（ConsoleError → {"error": {"code","message"}}），
+    # 只作用于控制台自身抛出的业务错误，不影响既有 admin 通道错误形状
+    mount_console_api(new_app, tunnel_srv)
     
     # ============== 基础路由 ==============
     

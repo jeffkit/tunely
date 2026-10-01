@@ -6,6 +6,26 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-01
+
+### Added
+- **多租户自助控制台后端（Console v2，docs/CONSOLE_MULTITENANT.md 契约 v1）**：
+  - 新模型 `users` / `invites`，`tunnels` 新增可空列 `owner_id`（NULL = admin/遗留，
+    admin key 通道行为零变化）；alembic 迁移 006（纯加法，旧库升级零影响）。
+  - 新模块 `tunely/console_api.py` 实现 `/api/console/*` 全部端点：
+    register（邀请码）/ login / logout / me / tunnels 列表与自助创建 /
+    rotate-token（旧 token 失效并断开存量连接）/ delete / entry 接入模板，
+    以及 admin key 门控的 `admin/users`（列出/禁用）、`admin/invites`（签发）。
+  - 会话：无状态 HMAC-SHA256 签名 cookie `console_session`（7 天，
+    HttpOnly + SameSite=Lax + Path=/；Secure 交部署层）；
+    登录失败固定延迟 1s（`WS_TUNNEL_CONSOLE_LOGIN_FAILURE_DELAY` 可调）。
+  - 密码：stdlib `hashlib.scrypt`（n=2^14, r=8, p=1，16B 盐，
+    `scrypt$n$r$p$salt$hash` hex 存储）。
+  - 所有权：tenant 只能触碰自己的隧道，越权一律 404（不泄露存在性）；
+    token 明文仅 create / rotate-token 响应返回。
+  - 新配置：`WS_TUNNEL_CONSOLE_TUNNELS_PER_USER`（默认 3，0 = 禁建）、
+    `WS_TUNNEL_CONSOLE_SESSION_SECRET` / `*_FILE`（会话签名密钥）。
+
 ## [0.11.1] - 2026-09-30
 
 ### Security
