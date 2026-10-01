@@ -15,6 +15,22 @@ WebSocket 透明反向代理隧道 - Python 服务端和客户端 SDK。
 pip install tunely
 ```
 
+## 数据库迁移
+
+alembic 已随主依赖安装（迁移是存量库升级的必经路径，见 pyproject dependencies 注释）。
+
+```bash
+cd python
+WS_TUNNEL_DATABASE_URL="sqlite+aiosqlite:////path/to/tunnels.db" alembic upgrade head
+```
+
+- **执行方式**：用 `alembic` 可执行入口；不要用 `python -m alembic` —— `python/alembic/`
+  迁移目录在部分环境下会遮蔽同名模块。
+- **全新部署**：首次启动时 `DatabaseManager` 的 create_all 自动建全部表，可不跑迁移。
+- **存量库升级（0.11 → 0.12+）**：必须跑迁移 —— create_all 只建缺失表、不会给既有表
+  加列（如 0.12 的 `tunnels.owner_id`），不跑迁移则多租户控制台功能不完整。
+  纯加法迁移，对既有数据零影响。
+
 ## 安装自检
 
 uv 的缓存损坏可能导致**安装截断**——装出来的包文件不完整、部分路由缺失（uv 已知问题，参见 [astral-sh/uv#11043](https://github.com/astral-sh/uv/issues/11043)；hardlink 跨文件系统回退复制时也可能出问题）。因此装完必须自检 `server.py` 行数是否与仓库一致：

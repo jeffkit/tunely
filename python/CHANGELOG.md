@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`tunely serve` 尊重 `WS_TUNNEL_DATABASE_URL`**：`-D/--database` 未显式给出时
+  回退 env（此前 CLI 硬编码默认值覆盖 env，横幅与实际连接都不是所配库）；
+  解析顺序 CLI > env > 内置默认，横幅打印生效值（test_cli.py 覆盖）。
+- **CLI 横幅/`--version` 版本号陈旧**（曾显示 v0.7.0）：`_pkg_version` 改为优先
+  运行代码自身的 `tunely.__version__`，安装元数据（可能过期谎报）仅作回退，
+  与 `server._server_version` 同一决策。
+
+### Added
+- **alembic 进主依赖**（此前完全未声明，全新环境无法执行 `python/alembic/` 迁移）：
+  存量库升级必经路径（create_all 不会给既有表加列），非 extras；执行方式与
+  「全新部署可不跑、存量库必须跑」的说明见 python/README.md「数据库迁移」。
+
 ## [0.12.0] - 2026-10-01
 
 ### Added

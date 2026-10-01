@@ -16,6 +16,7 @@ WS-Tunnel 命令行工具
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +29,9 @@ from .client import TunnelClient
 from .config import TunnelClientConfig
 
 console = Console()
+
+# serve 数据库 URL 内置默认（CLI -D / env 均未提供时兜底）
+_DEFAULT_DATABASE_URL = "sqlite+aiosqlite:///./data/tunely.db"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -42,15 +46,37 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def _pkg_version() -> str:
+    """运行代码自身的包版本
+
+    优先取当前执行代码的 tunely.__version__（与 server._server_version 同一决策，
+    0.7.2 起）：importlib.metadata 读到的安装元数据可能过期谎报（升级源码而
+    未重装时横幅仍显示旧版本，如曾显示 v0.7.0），因此只作回退。
+    """
     try:
-        from importlib.metadata import version
-        return version("tunely")
+        from . import __version__ as _v
+
+        return _v
     except Exception:
         try:
-            from . import __version__ as _v
-            return _v
+            from importlib.metadata import version
+
+            return version("tunely")
         except Exception:
             return "unknown"
+
+
+def _resolve_database_url(cli_value: str | None) -> str:
+    """解析 serve 生效的数据库 URL：CLI -D 显式值 > env WS_TUNNEL_DATABASE_URL > 内置默认
+
+    CLI 选项不再内置硬编码默认值——否则 pydantic-settings 的 env 读取
+    （WS_TUNNEL_DATABASE_URL）会被覆盖，出现「横幅/实际连接的不是所配库」。
+    """
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get("WS_TUNNEL_DATABASE_URL", "").strip()
+    if env_value:
+        return env_value
+    return _DEFAULT_DATABASE_URL
 
 
 @click.group()
@@ -67,8 +93,8 @@ def main():
 @click.option(
     "--database",
     "-D",
-    default="sqlite+aiosqlite:///./data/tunely.db",
-    help="数据库连接 URL",
+    default=None,
+    help="数据库连接 URL（未提供时回退 env WS_TUNNEL_DATABASE_URL，再回退 sqlite+aiosqlite:///./data/tunely.db）",
 )
 @click.option("--api-key", "-k", help="管理 API 密钥（未提供时回退读环境变量 WS_TUNNEL_ADMIN_API_KEY）")
 @click.option("--ws-path", default="/ws/tunnel", help="WebSocket 路径")
@@ -80,7 +106,7 @@ def serve(
     host: str,
     port: int,
     domain: str,
-    database: str,
+    database: str | None,
     api_key: str,
     ws_path: str,
     cors_origins: str,
@@ -89,13 +115,14 @@ def serve(
     verbose: bool,
 ):
     """启动 Tunely Server（独立隧道服务）"""
-    import os
     setup_logging(verbose)
 
     # --api-key 未显式提供时回退到环境变量（避免密钥只能经命令行传入、被 ps 看到）
     if api_key is None:
         api_key = os.environ.get("WS_TUNNEL_ADMIN_API_KEY")
-    
+    # --database 未显式提供时回退 env（WS_TUNNEL_DATABASE_URL），否则内置默认
+    database = _resolve_database_url(database)
+
     console.print(f"[bold blue]Tunely Server v{_pkg_version()}[/bold blue]")
     console.print(f"  监听: {host}:{port}")
     console.print(f"  域名: {domain}")
