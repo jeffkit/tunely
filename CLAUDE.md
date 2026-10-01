@@ -192,7 +192,7 @@ When updating the protocol:
 
 ## Version Information
 
-- Python package version: `0.11.1` (in `python/pyproject.toml`；`tunely/__init__.py` 的 `__version__` 须同步)
+- Python package version: `0.12.0` (in `python/pyproject.toml`；`tunely/__init__.py` 的 `__version__` 须同步)
 - TypeScript package version: `0.5.0` (in `typescript/package.json`；`src/version.ts` 的 `CLIENT_VERSION` 由一致性测试守住)
 - Rust package version: `0.6.0` (in `rust/Cargo.toml`；代码经 `env!("CARGO_PKG_VERSION")` 取用，无第二处硬编码)
 - Current protocol version: `2` (能力协商 + 二进制分帧，帧头 `FRAME_PROTOCOL_VERSION = 0x02`；SSE 为 v1.1 引入，见 `docs/PROTOCOL_V2.md`)
