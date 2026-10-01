@@ -37,7 +37,13 @@ tunely server（多租户控制台 + 数据面）
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `console_tunnels_per_user` | `3` | 每租户可建隧道数；`0` = 禁止创建 |
-| console 会话密钥 | 复用 server 既有 secret 文件机制 | HMAC 签名 cookie `console_session`（7 天） |
+| `WS_TUNNEL_CONSOLE_SESSION_SECRET`（或 `*_FILE`） | 未配置时进程内随机（重启会话失效并告警） | HMAC 签名 cookie `console_session`（7 天） |
+| 登录失败延迟 | `1.0s`（`console_login_failure_delay`） | 防爆破 |
+
+部署提示：
+- 独立 `tunely serve` 启动时数据库用 `-D/--database` 指定（注意 CLI 的 `-D` 默认值会覆盖
+  `WS_TUNNEL_DATABASE_URL` 环境变量——该不一致已登记修复）；schema 变更用 alembic 迁移。
+- admin-console 静态产物由 nginx 挂到 `/console/` 之类路径（哈希路由，无需回退配置）。
 
 ## 安全边界
 
