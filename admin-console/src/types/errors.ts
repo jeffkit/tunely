@@ -105,6 +105,57 @@ export class NetworkError extends ApiError {
   }
 }
 
+/** 控制台接口的状态码默认文案 */
+const CONSOLE_STATUS_MESSAGES: Record<number, string> = {
+  400: '请求参数错误',
+  401: '未登录或会话已过期',
+  403: '没有权限执行此操作',
+  404: '资源不存在',
+  409: '资源冲突',
+  422: '请求数据验证失败',
+  429: '请求过于频繁，请稍后再试',
+  500: '服务器内部错误',
+  502: '网关错误',
+  503: '服务暂时不可用',
+  504: '网关超时',
+}
+
+/**
+ * 控制台 API 错误
+ * 契约（CONSOLE_MULTITENANT.md §5）：错误统一 {"error": {"code", "message"}}
+ */
+export class ConsoleApiError extends ApiError {
+  /** 语义化错误码（如 quota_exceeded / invite_invalid），可能为空 */
+  public readonly code?: string
+
+  constructor(
+    message: string,
+    statusCode: number,
+    code?: string,
+    detail?: string,
+    originalError?: any
+  ) {
+    super(message, statusCode, detail, originalError)
+    this.name = 'ConsoleApiError'
+    this.code = code
+    Object.setPrototypeOf(this, ConsoleApiError.prototype)
+  }
+
+  /**
+   * 从 axios 错误创建 ConsoleApiError（解析 {"error": {code, message}} 错误体）
+   */
+  static fromAxiosError(error: any): ConsoleApiError {
+    const statusCode = error.response?.status || 500
+    const payload = error.response?.data?.error
+    const code: string | undefined = payload?.code
+    const detail: string | undefined =
+      payload?.message || error.response?.data?.detail || error.message
+    const baseMessage = CONSOLE_STATUS_MESSAGES[statusCode] || '请求失败'
+    const message = detail ? `${baseMessage}: ${detail}` : baseMessage
+    return new ConsoleApiError(message, statusCode, code, detail, error)
+  }
+}
+
 /**
  * 超时错误
  */
