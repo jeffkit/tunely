@@ -7,8 +7,9 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
-    // antd 动效在 jsdom 下走真实定时器，组件测试整体偏慢，放宽单测超时
-    testTimeout: 20000,
+    // antd 动效在 jsdom 下走真实定时器，组件测试整体偏慢：放宽单测超时并串行跑文件，避免负载抖动
+    testTimeout: 30000,
+    fileParallelism: false,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
