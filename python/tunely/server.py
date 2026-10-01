@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 # 认证类失败的统一时序（docs/PROBE_HARDENING.md T5）：所有认证失败（非 auth 首包 /
 # token 不存在 / tunnel disabled / 已在线拒绝）走同一文案 + 同一随机延迟区间 + 同一关闭码。
 # 历史「无效=延迟、业务拒绝=立即」的差异构成 token 存在性/在线状态 oracle（快响应 = token 是真的），
-# 0.12 起废弃；合法客户端不分支消费 code，仅展示 error 文案（已核实 py/ts/rust 三端）。
+# 已废弃（现行行为）；合法客户端不分支消费 code，仅展示 error 文案（已核实 py/ts/rust 三端）。
 _AUTH_FAILURE_DELAY_RANGE = (0.8, 1.6)
 
 # 统一认证失败文案：不再区分 Invalid token / Tunnel is disabled / connection_exists，

@@ -124,7 +124,7 @@ def _make_db_repo(get_by_token_return=None) -> tuple[MagicMock, AsyncMock]:
 
 
 class TestAuthFailureDelay:
-    """认证类失败统一出口（0.12，docs/PROBE_HARDENING.md T5）：
+    """认证类失败统一出口（docs/PROBE_HARDENING.md T5）：
 
     非 auth 首包 / token 不存在 / disabled / 已在线拒绝，全部走同一文案
     （Authentication failed）+ 同一随机延迟区间 + close 1008——

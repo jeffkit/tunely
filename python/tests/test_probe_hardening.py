@@ -1,5 +1,5 @@
 """
-探测面去特征化测试（0.12，docs/PROBE_HARDENING.md）
+探测面去特征化测试（docs/PROBE_HARDENING.md）
 
 - T1: /docs /redoc /openapi.json 关闭（404），主动探测拿不到框架与全路由表
 - T2: 主域名 GET / 不回 service/version/domain；默认极简 "OK"，decoy 落地页可配

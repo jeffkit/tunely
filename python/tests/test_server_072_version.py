@@ -4,7 +4,7 @@
 - 注册时记录 AuthMessage.client_version，manager 查询面可取（未连接 None）
 - register 缺省 unknown（不再是假值 0.1.0）
 - py 客户端上报真实版本（历史不传被默认成假值 0.1.0）
-- AuthOk.server_version：0.12 起默认回空串（探测去特征化，docs/PROBE_HARDENING.md T6），
+- AuthOk.server_version：默认回空串（探测去特征化已落地，docs/PROBE_HARDENING.md T6），
   WS_TUNNEL_EXPOSE_VERSION=true 才回真实版本；/api/info 不受该开关影响
 """
 
@@ -50,7 +50,7 @@ class TestServerVersionReporting:
             assert client.get("/api/info").json()["version"] == tunely.__version__
 
     def test_auth_ok_server_version_default_empty(self):
-        """0.12 默认不回真实版本（docs/PROBE_HARDENING.md T6）：auth_ok.server_version = """""
+        """默认不回真实版本（已落地）（docs/PROBE_HARDENING.md T6）：auth_ok.server_version = """""
         from fastapi.testclient import TestClient
 
         from tunely.app import create_full_app
