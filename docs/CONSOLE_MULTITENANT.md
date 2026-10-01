@@ -1,8 +1,10 @@
-# 多租户自助控制台（Console v2）设计契约 v1
+# 多租户自助控制台（Console v2）设计契约 v1.1
 
-> 状态：v1 契约（甲模式，jeffkit 已拍板）。本文件是并行实现的**唯一权威契约**；
+> 状态：v1.1（2026-10-01 机主拍板管理台鉴权 = 方案 A：admin 角色会话）。本文件是并行实现的**唯一权威契约**；
 > 实现细节（代码放置、内部函数命名）各实现者自定，但 API 形状、数据模型、安全决策不得偏离。
 > 背景讨论见会话记录：甲模式 = 租户自带后端服务（如 DSH），tunely 部署方只出租隧道。
+> **v1.1 变更**：管理端点鉴权从「仅 admin key」改为「admin key **或** role=admin 会话」；
+> 邀请码支持签发 admin 角色；管理员可提升/降级用户角色。前端 /admin 改用会话，不再向前端下发 admin key。
 
 ## 1. 目标与非目标
 
@@ -20,7 +22,7 @@
 
 | 角色 | 说明 |
 |---|---|
-| admin | 持既有 admin key 的部署方；管理用户、邀请码、全部隧道 |
+| admin | 部署方账号：`role='admin'` 的 users 行（经 admin 邀请码注册，或由既有 admin 提升）；另可持 admin key 供服务器脚本使用 |
 | tenant（租户） | 受邀注册的用户；只能操作 owner 是自己的隧道 |
 
 ## 3. 数据模型（新增 + 迁移）
@@ -62,9 +64,12 @@ tunnels      新增列 owner_id(FK users.id, nullable)  —— NULL 视为 admin
 配额：配置项 `console_tunnels_per_user`（默认 3，0 = 该租户禁建）。
 注册开关：无有效邀请码机制即天然关闭（register 必须带邀请码）。
 
-管理端：**全部复用既有 admin key API**（/api/tunnels 等），新增：
-- `GET/POST /api/console/admin/users`（admin key）：列出/禁用用户
-- `POST /api/console/admin/invites`（admin key）：`{max_uses?, expires_days?}` → `{code}`
+| `POST /api/console/admin/invites` | admin key 或 admin 会话 | `{max_uses?, expires_days?, role?('tenant'\|'admin', 默认 tenant)}` → `{code}` |
+| `GET  /api/console/admin/users` | admin key 或 admin 会话 | 用户列表 `{id,username,role,disabled,created_at,tunnel_count}` |
+| `PATCH /api/console/admin/users/{username}` | admin key 或 admin 会话 | `{disabled?, role?('tenant'\|'admin')?}`；不可降级/禁用自己（409 self_lockout） |
+
+admin 会话鉴权：会话用户 `role='admin'` 且未禁用（每请求查库，禁用即时生效）。
+admin key 通道保持不变（服务器脚本用）。admin 会话与 admin key 通过任一即可。
 
 **所有权规则**：tenant 只能触碰 `owner_id == 自己` 的隧道；越权一律 404（不泄露存在性）。
 admin key 通道可操作全部（现状不变）。
@@ -75,7 +80,9 @@ admin key 通道可操作全部（现状不变）。
 - `/login`、`/register`（带邀请码输入）
 - `/tunnels`（租户主页）：隧道列表（在线状态徽标、流量）、新建（前缀输入 → 展示 `域名 + token`，
   token 明文展示一次 + 复制按钮 + 「我已保存」确认）、rotate、删除（二次确认）、接入二维码弹层
-- `/admin`（仅 admin 可见入口）：用户列表/禁用、邀请码签发
+- `/admin`（仅 role=admin 可见入口）：用户列表/禁用/角色调整、邀请码签发（**含角色选择**，默认 tenant；
+  签发 admin 邀请需二次确认）。**鉴权只依赖会话 cookie，不向前端下发或粘贴 admin key**
+  （admin key 仅供服务器脚本；既有默认路径的 key 管理台保持原样不动）。
 
 约定：
 - API 层沿用 admin-console 现有 `src/api` 封装风格；cookie 会话（无 token 存储）。
