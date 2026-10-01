@@ -63,9 +63,8 @@ export function Login() {
             </Button>
           </Form.Item>
         </Form>
-        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <div>
           <Typography.Link href="#/register">没有账号？使用邀请码注册</Typography.Link>
-          <Typography.Link href="#/legacy">admin key 管理台（旧版）</Typography.Link>
         </div>
       </Card>
     </div>

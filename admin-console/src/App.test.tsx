@@ -139,12 +139,22 @@ describe('App 默认路由会话探测', () => {
     })
   })
 
-  it('登录页提供 legacy 入口链接', async () => {
+  it('登录页不再出现 legacy 入口（#/legacy 仅保留显式地址访问）', async () => {
     mockConsoleApi.me.mockRejectedValue(new ConsoleApiError('未登录或会话已过期', 401))
 
     render(<App />)
 
-    const link = await screen.findByText('admin key 管理台（旧版）')
-    expect(link).toHaveAttribute('href', '#/legacy')
+    // 落到登录页后，不应有任何指向 legacy 的引导入口
+    await screen.findByText('没有账号？使用邀请码注册')
+    expect(screen.queryByText('admin key 管理台（旧版）')).not.toBeInTheDocument()
+    expect(document.body.querySelector('a[href="#/legacy"]')).toBeNull()
+  })
+
+  it('#/legacy 路由本身保留：直接输入地址仍可访问', async () => {
+    window.location.hash = '#/legacy'
+
+    render(<App />)
+
+    expect(await screen.findByText('旧版管理台需要 admin key')).toBeInTheDocument()
   })
 })
