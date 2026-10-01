@@ -205,7 +205,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 集成测试用真实 WebSocket（`accept_async` 起假服务端）+ 真实本地 TCP/HTTP 目标服务，
-覆盖认证、双向转发、幂等关闭、目标拒绝、断线清理重连、force 抢占、HTTP/SSE 转发；
+覆盖认证、双向转发、幂等关闭、目标拒绝、断线清理重连、被拒累积退避（绝不自动升级 force）、HTTP/SSE 转发；
 `embed_handler` 另外覆盖进程内 handler 的缓冲/流式/回落三条路径与 C ABI 端到端
 （`target_url` 故意指向不可达端口，证明 handler 应答不依赖本地目标服务）。
 
@@ -214,4 +214,4 @@ cargo clippy --all-targets -- -D warnings
 - 协议消息里的 `timestamp` 等纯元数据字段不发送（协议可选，服务端不强依赖）
 - **无 WS 压缩**：底层的 tokio-tungstenite 0.24 不支持 permessage-deflate 扩展，
   Rust 客户端不启用 WebSocket 压缩
-- 其余 wire 行为与 `typescript/` 客户端逐语义对齐（含连续被拒累积退避、force 抢占）
+- 其余 wire 行为与 `typescript/` 客户端逐语义对齐（含连续被拒累积退避；force 需显式传入，绝不自动升级）
