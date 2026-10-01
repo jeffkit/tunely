@@ -27,6 +27,7 @@ class TunnelRepository:
         name: str | None = None,
         description: str | None = None,
         mode: str = "http",
+        owner_id: int | None = None,
     ) -> Tunnel:
         """
         创建隧道
@@ -37,6 +38,7 @@ class TunnelRepository:
             name: 隧道名称（可选）
             description: 隧道描述（可选）
             mode: 隧道模式: http/tcp
+            owner_id: 所有者用户 id（多租户控制台；None = admin/遗留）
 
         Returns:
             创建的隧道对象
@@ -50,6 +52,7 @@ class TunnelRepository:
             name=name,
             description=description,
             mode=mode,
+            owner_id=owner_id,
             enabled=True,
         )
         self.session.add(tunnel)
@@ -128,6 +131,22 @@ class TunnelRepository:
     async def count_tunnels(self) -> int:
         """统计隧道总数"""
         result = await self.session.execute(select(func.count(Tunnel.id)))
+        return result.scalar_one() or 0
+
+    async def list_by_owner(self, owner_id: int) -> list[Tunnel]:
+        """列出指定所有者的隧道（多租户控制台）"""
+        result = await self.session.execute(
+            select(Tunnel)
+            .where(Tunnel.owner_id == owner_id)
+            .order_by(Tunnel.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def count_by_owner(self, owner_id: int) -> int:
+        """统计指定所有者的隧道数（配额检查用）"""
+        result = await self.session.execute(
+            select(func.count(Tunnel.id)).where(Tunnel.owner_id == owner_id)
+        )
         return result.scalar_one() or 0
 
     async def increment_tunnel_bytes(

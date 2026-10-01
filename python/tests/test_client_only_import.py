@@ -18,6 +18,8 @@ import pathlib
 import subprocess
 import sys
 
+import tunely
+
 # python/ 目录（本文件位于 python/tests/ 下）
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -115,14 +117,15 @@ def test_client_symbols_available_without_server_deps():
         "print('fastapi' in sys.modules, 'sqlalchemy' in sys.modules)"
     )
     lines = out.splitlines()
-    assert lines[0].split() == [
+    # 版本号动态比对（与 pyproject/`__init__.__version__` 同步维护，不在此处再硬编码一份）
+    assert lines[0].split()[:5] == [
         "TunnelClient",
         "TunnelClientConfig",
         "TunnelServerConfig",
         "TunnelRequest",
         "MessageType",
-        "0.11.1",
     ], out
+    assert lines[0].split()[5] == tunely.__version__, out
     assert lines[1] == "False False", out
 
 

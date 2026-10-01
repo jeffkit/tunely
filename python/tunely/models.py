@@ -10,7 +10,7 @@ WS-Tunnel 数据库模型
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, Index, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, Index, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -92,6 +92,16 @@ class Tunnel(Base):
         comment="累计出流量（内网→外部，字节，跨重启累计）",
     )
 
+    # 所有者（多租户控制台，docs/CONSOLE_MULTITENANT.md §3）：
+    # NULL = admin/遗留隧道（admin key 通道创建，行为不变）
+    owner_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=True,
+        index=True,
+        comment="所有者用户 id（users.id）；NULL = admin/遗留所有",
+    )
+
     def __repr__(self) -> str:
         return f"<Tunnel(domain={self.domain!r}, enabled={self.enabled})>"
 
@@ -104,6 +114,7 @@ class Tunnel(Base):
             "description": self.description,
             "mode": self.mode,
             "enabled": self.enabled,
+            "owner_id": self.owner_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "last_connected_at": (
@@ -289,3 +300,74 @@ class AdminAuditLog(Base):
             "detail": self.detail,
             "source_ip": self.source_ip,
         }
+
+
+class User(Base):
+    """
+    控制台用户（多租户自助控制台，docs/CONSOLE_MULTITENANT.md §3）
+
+    tenant 经邀请注册；admin 预留（admin 实际操作走 admin key 通道）。
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    username: Mapped[str] = mapped_column(
+        String(32),
+        unique=True,
+        nullable=False,
+        index=True,
+        comment="用户名（3-32 位，[a-z0-9_-]）",
+    )
+    password_hash: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="scrypt 密码哈希（格式 scrypt$n$r$p$salt$hash，hex 存储）",
+    )
+    role: Mapped[str] = mapped_column(
+        String(10), default="tenant", nullable=False, comment="角色: admin/tenant"
+    )
+    disabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, comment="是否禁用（禁用后登录/me 均 403/401）"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=func.now(), nullable=False, comment="创建时间"
+    )
+
+    def __repr__(self) -> str:
+        return f"<User(username={self.username!r}, role={self.role!r}, disabled={self.disabled})>"
+
+
+class Invite(Base):
+    """
+    注册邀请码（多租户自助控制台，docs/CONSOLE_MULTITENANT.md §3）
+
+    无有效邀请码即天然关闭注册（register 必须携带邀请码）。
+    """
+
+    __tablename__ = "invites"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    code: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True, comment="邀请码（可读格式，如 dsh-x7k2-9f3a）"
+    )
+    created_by: Mapped[str] = mapped_column(
+        String(32), default="admin", nullable=False, comment="签发者标识（admin key 通道签发为 'admin'）"
+    )
+    max_uses: Mapped[int] = mapped_column(
+        Integer, default=1, nullable=False, comment="最大使用次数"
+    )
+    used_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, comment="已使用次数"
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="过期时间（UTC；NULL = 永不过期）"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=func.now(), nullable=False, comment="创建时间"
+    )
+
+    def __repr__(self) -> str:
+        return f"<Invite(code={self.code!r}, used={self.used_count}/{self.max_uses})>"

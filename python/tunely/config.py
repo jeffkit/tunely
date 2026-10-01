@@ -171,6 +171,29 @@ class TunnelServerConfig(BaseSettings):
         description="Webhook HMAC-SHA256 共享密钥（env: WS_TUNNEL_DISPATCH_WEBHOOK_SECRET），设置后每次请求附加 X-Webhook-Signature 头",
     )
 
+    # ============== 多租户自助控制台（Console v2，docs/CONSOLE_MULTITENANT.md） ==============
+    console_tunnels_per_user: int = Field(
+        default=3,
+        description="每租户可创建隧道配额（0 = 该部署对租户禁建隧道）（env: WS_TUNNEL_CONSOLE_TUNNELS_PER_USER）",
+    )
+    console_session_secret: str | None = Field(
+        default=None,
+        description="控制台会话 cookie 的 HMAC-SHA256 密钥；优先级高于 secret 文件。"
+        "未设置且无 secret 文件时用进程内随机密钥（重启后会话全部失效）"
+        "（env: WS_TUNNEL_CONSOLE_SESSION_SECRET）",
+    )
+    console_session_secret_file: str = Field(
+        default="",
+        description="控制台会话密钥文件路径（内容 strip 后作密钥；无则生成并写回，"
+        "保证重启后会话连续）。仅在 console_session_secret 未设置时生效"
+        "（env: WS_TUNNEL_CONSOLE_SESSION_SECRET_FILE）",
+    )
+    console_login_failure_delay: float = Field(
+        default=1.0,
+        description="控制台登录失败固定延迟秒数（防爆破，契约 §4）；0 = 不延迟（仅供测试）"
+        "（env: WS_TUNNEL_CONSOLE_LOGIN_FAILURE_DELAY）",
+    )
+
     model_config = {
         "env_prefix": "WS_TUNNEL_",
         "env_file": ".env",
