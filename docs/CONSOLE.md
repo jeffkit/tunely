@@ -41,8 +41,11 @@ tunely server（多租户控制台 + 数据面）
 | 登录失败延迟 | `1.0s`（`console_login_failure_delay`） | 防爆破 |
 
 部署提示：
-- 独立 `tunely serve` 启动时数据库用 `-D/--database` 指定（注意 CLI 的 `-D` 默认值会覆盖
-  `WS_TUNNEL_DATABASE_URL` 环境变量——该不一致已登记修复）；schema 变更用 alembic 迁移。
+- 独立 `tunely serve` 启动时数据库用 `-D/--database` 指定；未显式给出时回退
+  `WS_TUNNEL_DATABASE_URL`，再回退内置默认（解析链：CLI > env > 默认）。
+- alembic 已是主依赖：全新部署可不跑迁移（建表即最新）；**存量库升级必须跑**
+  `alembic upgrade head`（在 `python/` 目录下用 console script，勿用 `python -m alembic`
+  ——本地 `alembic/` 迁移目录会遮蔽包）。
 - admin-console 静态产物由 nginx 挂到 `/console/` 之类路径（哈希路由，无需回退配置）。
 
 ## 安全边界
