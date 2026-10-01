@@ -65,11 +65,34 @@ tunely connect --config /etc/tunely/client.toml
 server = "wss://your-server/ws/tunnel"
 token = "tun_xxxxx"
 target = "http://127.0.0.1:3080"
+proxy = "http://127.0.0.1:7890"   # 可选：出站 HTTP CONNECT 代理（见下「代理出站」）
 reconnect_secs = 5
 max_reconnect = 0        # 0 = 无限
 request_timeout_secs = 300
 force = false
 ```
+
+### 代理出站（HTTP CONNECT，0.6.0+）
+
+跨境直连受限时，客户端 → server 的 WS 可经 HTTP CONNECT 代理转发：
+
+```toml
+proxy = "http://proxy.lan:7890"
+```
+
+```bash
+# 环境变量回退（HTTPS_PROXY > https_proxy > ALL_PROXY > all_proxy）
+export HTTPS_PROXY=http://proxy.lan:7890
+tunely connect
+```
+
+- 优先级：**配置文件 > 代理 env > 无**（注意与 TUNELY_* 的 CLI > env > file
+  顺序不同：站点级配置覆盖部署环境注入的通用代理变量）。
+- **作用域**：只作用于「客户端 → server」的 WS 出站；转发目标（target）的
+  流量语义不变，不经代理。wss 场景 TLS 在 CONNECT 隧道内部完成，端到端加密不变。
+- **v1 仅支持 HTTP CONNECT 代理，SOCKS 明确不支持**（配置了 socks 启动即报错）；
+  对代理本身走 TLS（`https://` 代理）与代理认证（userinfo）暂不支持。
+- 代理失败（不可达/拒绝 CONNECT）走既有重连退避语义；启动横幅会打印生效的代理。
 
 ### status 子命令与状态文件
 

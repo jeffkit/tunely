@@ -200,6 +200,19 @@ tunely/
 | `--token` | (必填) | 隧道令牌 |
 | `--target` | `http://localhost:8080` | 本地目标服务 URL |
 | `--reconnect` | `5` | 重连间隔（秒） |
+| `proxy` | - | 出站 HTTP CONNECT 代理（配置文件字段 / 环境变量回退，见下） |
+
+**客户端代理出站（HTTP CONNECT）**——跨境直连受限时，客户端 → server 的 WS
+可经更快的代理线路转发（Rust ≥ 0.6.0 与 TypeScript ≥ 0.5.0 支持）：
+
+- 配置文件字段：`proxy = "http://host:port"`（`client.toml` 顶层，多隧道形态下
+  全局共享）；环境变量回退 `HTTPS_PROXY` / `https_proxy` / `ALL_PROXY` /
+  `all_proxy`（wss:// 语义按 https 处理）；**优先级：配置 > env > 无**。
+- **v1 仅支持 HTTP CONNECT 代理，SOCKS 明确不支持**（配置了 socks 启动即报错）；
+  对代理本身走 TLS（`https://` 代理）与代理认证（userinfo）暂不支持。
+- **作用域**：proxy 只作用于「客户端 → server」的 WS 出站；转发目标（target）
+  的流量语义不变，不经代理。wss 场景 TLS 在 CONNECT 隧道内部完成，端到端加密不变。
+- Python 客户端暂不支持 `proxy`（后续版本跟进）。
 
 ## 协议版本
 

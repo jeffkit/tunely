@@ -150,6 +150,39 @@ curl -X POST http://localhost:8000/api/tunnels/demo-agent/forward \
 - 阅读 [PROTOCOL.md](PROTOCOL.md) 了解协议详情
 - 查看 Python 和 TypeScript SDK 源码
 
+## 受限网络：经 HTTP CONNECT 代理出站（Rust / TypeScript 客户端）
+
+跨境直连受限（晚高峰吞吐骤降、UDP 受限）时，客户端 → server 的 WS 可经
+HTTP CONNECT 代理转发。写进与 rust/python 同一份 `client.toml`：
+
+```toml
+# tunely-client.toml
+server = "wss://your-server/ws/tunnel"
+token = "tun_xxxxx"
+target = "http://127.0.0.1:8080"
+proxy = "http://proxy.lan:7890"   # 出站代理（客户端 → server 的 WS 经此转发）
+```
+
+```bash
+tunely connect --config tunely-client.toml
+```
+
+也可用环境变量回退（无需改配置文件）：
+
+```bash
+export HTTPS_PROXY=http://proxy.lan:7890   # 亦识别 https_proxy / ALL_PROXY / all_proxy
+tunely connect
+```
+
+要点：
+
+- 优先级：**配置 > env > 无**；Rust ≥ 0.6.0 与 TypeScript ≥ 0.5.0 支持
+  （Python 客户端暂不支持 `proxy`）。
+- **作用域**：proxy 只作用于「客户端 → server」的 WS 出站；转发目标（target）
+  的流量语义不变，不经代理。wss 场景 TLS 在 CONNECT 隧道内部完成，端到端加密不变。
+- **v1 仅支持 HTTP CONNECT 代理，SOCKS 明确不支持**；对代理本身走 TLS 与
+  代理认证暂不支持（配置了会启动即报错）。
+
 ## 故障排除
 
 ### 连接失败
