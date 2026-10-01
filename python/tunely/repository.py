@@ -149,6 +149,15 @@ class TunnelRepository:
         )
         return result.scalar_one() or 0
 
+    async def count_grouped_by_owner(self) -> dict[int, int]:
+        """按所有者聚合隧道数（管理端用户列表 tunnel_count 用；一条 SQL，避免逐用户查询）"""
+        result = await self.session.execute(
+            select(Tunnel.owner_id, func.count(Tunnel.id))
+            .where(Tunnel.owner_id.is_not(None))
+            .group_by(Tunnel.owner_id)
+        )
+        return {owner_id: count for owner_id, count in result.all()}
+
     async def increment_tunnel_bytes(
         self, domain: str, bytes_in_delta: int, bytes_out_delta: int
     ) -> bool:

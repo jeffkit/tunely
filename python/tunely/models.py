@@ -356,6 +356,13 @@ class Invite(Base):
     created_by: Mapped[str] = mapped_column(
         String(32), default="admin", nullable=False, comment="签发者标识（admin key 通道签发为 'admin'）"
     )
+    # 契约 v1.1 §5：签发时可指定受邀角色（默认 tenant），注册按此落 users.role
+    role: Mapped[str] = mapped_column(
+        String(10),
+        default="tenant",
+        nullable=False,
+        comment="受邀角色: tenant/admin（默认 tenant）",
+    )
     max_uses: Mapped[int] = mapped_column(
         Integer, default=1, nullable=False, comment="最大使用次数"
     )
