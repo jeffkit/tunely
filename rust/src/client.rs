@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{client_async_tls, connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::handler::{HandlerOutcome, HandlerRequest, HandlerResponse, HandlerStream, RequestHandler};
@@ -25,6 +25,11 @@ use crate::protocol::{
     encode_udp_data_frame, jitter, parse_target, Message, FRAME_TYPE_UDP_DATA,
     HOP_BY_HOP_HEADERS,
 };
+use crate::proxy;
+
+/// 客户端 → server 的 WS 流类型：直连（connect_async）与代理路径
+/// （CONNECT 隧道 + client_async_tls）收敛为同一具体类型，会话层零分支。
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn info(msg: impl AsRef<str>) {
     println!("{}", msg.as_ref());
@@ -76,6 +81,10 @@ pub struct TunnelClientConfig {
     pub keepalive_interval: Duration,
     /// keepalive：超过该时长未收到 pong 判定连接死亡并重连，默认 45s
     pub keepalive_timeout: Duration,
+    /// 出站 HTTP CONNECT 代理（客户端 → server 的 WS 经此转发；None = 直连）。
+    /// v1 仅支持 http://host:port（SOCKS 不支持）；只作用于 WS 出站，
+    /// 转发目标（target）流量语义不变
+    pub proxy: Option<String>,
     /// 多隧道模式下的会话标签（单隧道为 None）；用于连接期日志前缀，
     /// 认证成功后的日志自带 domain 不依赖此值
     pub name: Option<String>,
@@ -93,6 +102,7 @@ impl Default for TunnelClientConfig {
             force: false,
             keepalive_interval: Duration::from_secs(25),
             keepalive_timeout: Duration::from_secs(45),
+            proxy: None,
             name: None,
         }
     }
@@ -423,6 +433,53 @@ impl TunnelClient {
         let _ = tokio::time::timeout(d, self.stop.notified()).await;
     }
 
+    /// 建立客户端 → server 的 WS 连接：配置代理时先经代理完成 HTTP CONNECT
+    /// 建立隧道，再把隧道流交给 client_async_tls（wss 的 TLS 在隧道**内部**
+    /// 完成，端到端加密不变）；未配置代理走 connect_async 直连（行为不变）。
+    async fn open_ws(&self) -> Result<WsStream, ConnectError> {
+        match self.config.proxy.as_deref() {
+            Some(proxy_url) => {
+                let (proxy_host, proxy_port) =
+                    proxy::parse_proxy_url(proxy_url).map_err(ConnectError::Io)?;
+                let (dst_host, dst_port) = proxy::server_host_port(&self.config.server_url)
+                    .map_err(ConnectError::Io)?;
+                info(format!(
+                    "{}经代理 {}:{} CONNECT {}:{} ...",
+                    self.log_prefix(),
+                    proxy_host,
+                    proxy_port,
+                    dst_host,
+                    dst_port
+                ));
+                let tunnel = tokio::time::timeout(
+                    proxy::PROXY_CONNECT_TIMEOUT,
+                    proxy::connect_via_proxy(&proxy_host, proxy_port, &dst_host, dst_port),
+                )
+                .await
+                .map_err(|_| {
+                    ConnectError::Io(format!(
+                        "代理 CONNECT 超时（{:?}）: {}",
+                        proxy::PROXY_CONNECT_TIMEOUT,
+                        proxy_url
+                    ))
+                })?
+                .map_err(|e| {
+                    ConnectError::Io(format!("代理 CONNECT 失败 ({proxy_url}): {e}"))
+                })?;
+                let (ws, _resp) = client_async_tls(&self.config.server_url, tunnel)
+                    .await
+                    .map_err(|e| ConnectError::Io(format!("WebSocket 连接失败: {e}")))?;
+                Ok(ws)
+            }
+            None => {
+                let (ws, _resp) = connect_async(&self.config.server_url)
+                    .await
+                    .map_err(|e| ConnectError::Io(format!("WebSocket 连接失败: {e}")))?;
+                Ok(ws)
+            }
+        }
+    }
+
     async fn connect_and_run(
         &self,
         state: &Arc<RunState>,
@@ -437,9 +494,7 @@ impl TunnelClient {
             self.config.server_url
         ));
 
-        let (ws, _resp) = connect_async(&self.config.server_url)
-            .await
-            .map_err(|e| ConnectError::Io(format!("WebSocket 连接失败: {e}")))?;
+        let ws = self.open_ws().await?;
 
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = mpsc::channel::<OutFrame>(TX_CHANNEL_CAPACITY);

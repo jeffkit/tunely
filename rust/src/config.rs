@@ -15,12 +15,18 @@ pub const ENV_TOKEN: &str = "TUNELY_TOKEN";
 pub const ENV_SERVER: &str = "TUNELY_SERVER";
 pub const ENV_TARGET: &str = "TUNELY_TARGET";
 
+/// 代理出站的环境变量回退键（与 TS 客户端同序；wss:// 语义按 https 处理）
+pub const PROXY_ENV_KEYS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+
 /// 配置文件（TOML）字段，全部可选；未知字段忽略
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FileConfig {
     pub server: Option<String>,
     pub token: Option<String>,
     pub target: Option<String>,
+    /// 出站 HTTP CONNECT 代理（客户端 → server 的 WS 经此转发）；
+    /// v1 仅支持 http://host:port（SOCKS 不支持）。优先级：配置 > 代理 env > 无
+    pub proxy: Option<String>,
     /// 多隧道形态（TOML `[[tunnel]]` 数组-of-tables，文档键为 `tunnel`）。
     /// 非空时进入多隧道模式：顶层 token/target 视为各条目的回退与单隧道形态互斥。
     #[serde(default, rename = "tunnel")]
@@ -62,6 +68,8 @@ pub struct Settings {
     pub token: String,
     pub server: String,
     pub target: String,
+    /// 出站代理（None = 直连）；跨隧道共享（与 server 同级全局项）
+    pub proxy: Option<String>,
     /// 多隧道模式下的会话标签（单隧道为 None）
     pub name: Option<String>,
     pub reconnect: u64,
@@ -72,10 +80,11 @@ pub struct Settings {
     pub keepalive_timeout: u64,
 }
 
-/// 跨隧道共享的全局配置（server 与重连/keepalive 参数）
+/// 跨隧道共享的全局配置（server / proxy 与重连/keepalive 参数）
 #[derive(Debug, Clone)]
 pub struct Globals {
     pub server: String,
+    pub proxy: Option<String>,
     pub reconnect: u64,
     pub max_reconnect: u32,
     pub request_timeout: u64,
@@ -84,19 +93,49 @@ pub struct Globals {
     pub keepalive_timeout: u64,
 }
 
+/// 代理 env 回退：HTTPS_PROXY > https_proxy > ALL_PROXY > all_proxy（首个非空生效）
+fn env_proxy(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    PROXY_ENV_KEYS
+        .iter()
+        .find_map(|key| env(key).filter(|v| !v.trim().is_empty()))
+}
+
+/// 代理解析：**配置 > env > 无**（注意与 TUNELY_* 的 CLI > env > file 顺序不同：
+/// v1 不设 CLI 旗标，站点级配置文件覆盖部署环境注入的通用代理变量）。
+/// 拿到非空值即校验（SOCKS 等不支持的形态在此直接报错，而非运行期重连循环里反复失败）。
+fn resolve_proxy(
+    file: &FileConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    match file.proxy.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => {
+            crate::proxy::parse_proxy_url(v)?;
+            Ok(Some(v.to_string()))
+        }
+        None => match env_proxy(env) {
+            Some(v) => {
+                crate::proxy::parse_proxy_url(&v)?;
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        },
+    }
+}
+
 /// 按 CLI > env > file 解析全局项（不含 token/target——它们按隧道区分）
 fn resolve_globals(
     cli: &CliOverrides,
     file: &FileConfig,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Globals {
-    Globals {
+) -> Result<Globals, String> {
+    Ok(Globals {
         server: cli
             .server
             .clone()
             .or_else(|| env(ENV_SERVER))
             .or_else(|| file.server.clone())
             .unwrap_or_else(|| DEFAULT_SERVER.to_string()),
+        proxy: resolve_proxy(file, env)?,
         reconnect: cli.reconnect.or(file.reconnect_secs).unwrap_or(5),
         max_reconnect: cli.max_reconnect.or(file.max_reconnect).unwrap_or(0),
         request_timeout: cli
@@ -112,7 +151,7 @@ fn resolve_globals(
             .keepalive_timeout
             .or(file.keepalive_timeout_secs)
             .unwrap_or(45),
-    }
+    })
 }
 
 /// 按 CLI > env > file > 默认 的优先级合并出最终配置（单隧道形态）；
@@ -136,11 +175,12 @@ pub fn resolve(
         .or_else(|| env(ENV_TARGET))
         .or_else(|| file.target.clone())
         .unwrap_or_else(|| DEFAULT_TARGET.to_string());
-    let g = resolve_globals(cli, file, env);
+    let g = resolve_globals(cli, file, env)?;
     Ok(Settings {
         token,
         server: g.server,
         target,
+        proxy: g.proxy,
         name: None,
         reconnect: g.reconnect,
         max_reconnect: g.max_reconnect,
@@ -174,7 +214,7 @@ pub fn resolve_all(
             "配置了 [[tunnel]] 多隧道数组时不能再设置 {ENV_TOKEN}/{ENV_TARGET}"
         ));
     }
-    let g = resolve_globals(cli, file, env);
+    let g = resolve_globals(cli, file, env)?;
     let mut out = Vec::with_capacity(file.tunnels.len());
     for (i, entry) in file.tunnels.iter().enumerate() {
         let token = entry.token.as_deref().map(str::trim).unwrap_or("");
@@ -194,6 +234,7 @@ pub fn resolve_all(
             token: token.to_string(),
             server: g.server.clone(),
             target,
+            proxy: g.proxy.clone(),
             name: Some(name),
             reconnect: g.reconnect,
             max_reconnect: g.max_reconnect,
@@ -384,6 +425,7 @@ mod tests {
 server = "wss://s.example/ws/tunnel"
 token = "tok-1"
 target = "http://127.0.0.1:3080"
+proxy = "http://127.0.0.1:7890"
 reconnect_secs = 7
 max_reconnect = 2
 request_timeout_secs = 30
@@ -393,6 +435,7 @@ force = true
         assert_eq!(c.server.as_deref(), Some("wss://s.example/ws/tunnel"));
         assert_eq!(c.token.as_deref(), Some("tok-1"));
         assert_eq!(c.target.as_deref(), Some("http://127.0.0.1:3080"));
+        assert_eq!(c.proxy.as_deref(), Some("http://127.0.0.1:7890"));
         assert_eq!(c.reconnect_secs, Some(7));
         assert_eq!(c.max_reconnect, Some(2));
         assert_eq!(c.request_timeout_secs, Some(30));
@@ -405,6 +448,7 @@ force = true
         assert_eq!(c.token.as_deref(), Some("x"));
         assert_eq!(c.server, None);
         assert_eq!(c.target, None);
+        assert_eq!(c.proxy, None);
         assert_eq!(c.reconnect_secs, None);
         assert_eq!(c.max_reconnect, None);
         assert_eq!(c.request_timeout_secs, None);
@@ -565,5 +609,134 @@ token = "t-p2"
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].token, "t-file");
         assert_eq!(list[0].name, None);
+    }
+
+    // ============== 代理出站（proxy 配置 > env > 无；SOCKS 拒绝） ==============
+
+    #[test]
+    fn proxy_from_file_used_when_no_env() {
+        let file = FileConfig {
+            token: Some("t".into()),
+            proxy: Some("http://file-proxy:7890".into()),
+            ..Default::default()
+        };
+        let s = resolve(&CliOverrides::default(), &file, &env(&[])).unwrap();
+        assert_eq!(s.proxy.as_deref(), Some("http://file-proxy:7890"));
+    }
+
+    #[test]
+    fn proxy_config_beats_env() {
+        // 与 TUNELY_* 不同：proxy 明确「配置 > env」——站点级配置覆盖部署环境通用变量
+        let file = FileConfig {
+            token: Some("t".into()),
+            proxy: Some("http://file-proxy:7890".into()),
+            ..Default::default()
+        };
+        let e = env(&[(PROXY_ENV_KEYS[0], "http://env-proxy:3128")]);
+        let s = resolve(&CliOverrides::default(), &file, &e).unwrap();
+        assert_eq!(s.proxy.as_deref(), Some("http://file-proxy:7890"));
+    }
+
+    #[test]
+    fn proxy_env_fallback_order() {
+        let file = FileConfig {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        // HTTPS_PROXY（大写优先）
+        let e = env(&[
+            (PROXY_ENV_KEYS[0], "http://upper:1"),
+            (PROXY_ENV_KEYS[1], "http://lower:2"),
+            (PROXY_ENV_KEYS[2], "http://all:3"),
+        ]);
+        assert_eq!(
+            resolve(&CliOverrides::default(), &file, &e).unwrap().proxy.as_deref(),
+            Some("http://upper:1")
+        );
+        // 小写 https_proxy
+        let e = env(&[
+            (PROXY_ENV_KEYS[1], "http://lower:2"),
+            (PROXY_ENV_KEYS[2], "http://all:3"),
+            (PROXY_ENV_KEYS[3], "http://all-lower:4"),
+        ]);
+        assert_eq!(
+            resolve(&CliOverrides::default(), &file, &e).unwrap().proxy.as_deref(),
+            Some("http://lower:2")
+        );
+        // ALL_PROXY
+        let e = env(&[(PROXY_ENV_KEYS[2], "http://all:3"), (PROXY_ENV_KEYS[3], "http://all-lower:4")]);
+        assert_eq!(
+            resolve(&CliOverrides::default(), &file, &e).unwrap().proxy.as_deref(),
+            Some("http://all:3")
+        );
+        // all_proxy
+        let e = env(&[(PROXY_ENV_KEYS[3], "http://all-lower:4")]);
+        assert_eq!(
+            resolve(&CliOverrides::default(), &file, &e).unwrap().proxy.as_deref(),
+            Some("http://all-lower:4")
+        );
+    }
+
+    #[test]
+    fn proxy_env_blank_value_is_ignored() {
+        let file = FileConfig {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        let e = env(&[(PROXY_ENV_KEYS[0], "   "), (PROXY_ENV_KEYS[2], "http://all:3")]);
+        assert_eq!(
+            resolve(&CliOverrides::default(), &file, &e).unwrap().proxy.as_deref(),
+            Some("http://all:3")
+        );
+    }
+
+    #[test]
+    fn proxy_none_when_neither_config_nor_env() {
+        let file = FileConfig {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        let s = resolve(&CliOverrides::default(), &file, &env(&[])).unwrap();
+        assert_eq!(s.proxy, None);
+    }
+
+    #[test]
+    fn proxy_socks_config_rejected_at_startup() {
+        // SOCKS 在配置解析期即报错（而非运行期重连循环反复失败）
+        let file = FileConfig {
+            token: Some("t".into()),
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+            ..Default::default()
+        };
+        let err = resolve(&CliOverrides::default(), &file, &env(&[])).unwrap_err();
+        assert!(err.contains("SOCKS"), "{err}");
+        // env 注入的 SOCKS 同样拒绝
+        let file = FileConfig {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        let e = env(&[(PROXY_ENV_KEYS[0], "socks5://127.0.0.1:1080")]);
+        let err = resolve(&CliOverrides::default(), &file, &e).unwrap_err();
+        assert!(err.contains("SOCKS"), "{err}");
+    }
+
+    #[test]
+    fn proxy_shared_across_multi_tunnels() {
+        let file: FileConfig = toml::from_str(
+            r#"
+proxy = "http://shared-proxy:7890"
+
+[[tunnel]]
+name = "a"
+token = "t-a"
+
+[[tunnel]]
+token = "t-b"
+"#,
+        )
+        .unwrap();
+        let list = resolve_all(&CliOverrides::default(), &file, &env(&[])).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|s| s.proxy.as_deref() == Some("http://shared-proxy:7890")));
     }
 }

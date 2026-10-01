@@ -433,6 +433,9 @@ impl FfiConfig {
             keepalive_timeout: self
                 .keepalive_timeout
                 .map_or(default.keepalive_timeout, secs),
+            // C ABI v1 未暴露 proxy 出站配置（None = 直连）；需要时在 FfiConfig
+            // 加同名字段并在宿主侧透传即可
+            proxy: None,
             name: self.name,
         }
     }

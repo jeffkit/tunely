@@ -130,6 +130,9 @@ async fn run_connect(cli: CliOverrides, config_path: Option<PathBuf>) {
 
     println!("tunely - WebSocket Tunnel Client (Rust)");
     println!("  服务端: {}", settings_list[0].server);
+    if let Some(p) = &settings_list[0].proxy {
+        println!("  代理: {p}");
+    }
     let multi = settings_list.len() > 1;
     if multi {
         println!("  隧道 ({}):", settings_list.len());
@@ -177,6 +180,7 @@ async fn run_connect(cli: CliOverrides, config_path: Option<PathBuf>) {
             force: settings.force,
             keepalive_interval: Duration::from_secs(settings.keepalive_interval),
             keepalive_timeout: Duration::from_secs(settings.keepalive_timeout),
+            proxy: settings.proxy.clone(),
             name: settings.name.clone(),
         });
         let client = Arc::new(client);
