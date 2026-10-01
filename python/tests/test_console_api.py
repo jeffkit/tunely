@@ -91,9 +91,13 @@ async def env():
 # ============== 操作助手 ==============
 
 
-async def make_invite(client: httpx.AsyncClient, max_uses: int = 1) -> str:
+async def make_invite(
+    client: httpx.AsyncClient, max_uses: int = 1, role: str = "tenant"
+) -> str:
     resp = await client.post(
-        "/api/console/admin/invites", json={"max_uses": max_uses}, headers=ADMIN_HEADERS
+        "/api/console/admin/invites",
+        json={"max_uses": max_uses, "role": role},
+        headers=ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["code"]
@@ -373,9 +377,9 @@ async def test_disabled_user_me_403_and_login_401(env):
     server, client = env
     await register_and_login_client(client)
 
-    resp = await client.post(
-        "/api/console/admin/users",
-        json={"username": "alice", "disabled": True},
+    resp = await client.patch(
+        "/api/console/admin/users/alice",
+        json={"disabled": True},
         headers=ADMIN_HEADERS,
     )
     assert resp.status_code == 200
@@ -394,9 +398,9 @@ async def test_disabled_user_me_403_and_login_401(env):
     assert resp.status_code == 401
 
     # 解禁后原会话恢复可用（无状态会话 + 每请求查库）
-    resp = await client.post(
-        "/api/console/admin/users",
-        json={"username": "alice", "disabled": False},
+    resp = await client.patch(
+        "/api/console/admin/users/alice",
+        json={"disabled": False},
         headers=ADMIN_HEADERS,
     )
     assert resp.status_code == 200
@@ -637,38 +641,232 @@ async def test_admin_key_channel_regression(env):
 
 
 @pytest.mark.asyncio
-async def test_admin_endpoints_require_admin_key_not_session(env):
+async def test_admin_endpoints_reject_tenant_session_and_accept_admin_session(env):
+    """契约 v1.1：管理端点鉴权 = admin key 或 admin 会话（二选一）"""
     _, client = env
-    await register_and_login_client(client)
+    await register_and_login_client(client)  # alice = tenant
 
-    # 会话 cookie 冒充不了 admin key
+    # tenant 会话（无 key）→ 403 forbidden（角色不足，非未认证）
     resp = await client.get("/api/console/admin/users")
-    assert resp.status_code == 401
+    assert resp.status_code == 403 and err_code(resp) == "forbidden"
     resp = await client.post("/api/console/admin/invites", json={})
-    assert resp.status_code == 401
-    resp = await client.get("/api/console/admin/users", headers={"x-api-key": "nope"})
-    assert resp.status_code == 401
+    assert resp.status_code == 403
+    resp = await client.patch("/api/console/admin/users/alice", json={"disabled": False})
+    assert resp.status_code == 403
+
+    # 错 key + tenant 会话 → 仍 403（key 无效后走会话路径被角色拦截）
+    resp = await client.get(
+        "/api/console/admin/users", headers={"x-api-key": "wrong"}
+    )
+    assert resp.status_code == 403
+
+    # 无会话 + 无 key → 401
+    anon = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client._transport.app),
+        base_url="http://testserver",
+    )
+    try:
+        resp = await anon.get("/api/console/admin/users", headers={"x-api-key": "nope"})
+        assert resp.status_code == 401 and err_code(resp) == "unauthorized"
+    finally:
+        await anon.aclose()
+
+    # admin 邀请码注册的 admin 会话可通过（无需 key）
+    admin_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client._transport.app),
+        base_url="http://testserver",
+    )
+    try:
+        code = await make_invite(admin_client, role="admin")
+        await register_tenant(admin_client, "boss", code)
+        resp = await admin_client.post(
+            "/api/console/login", json={"username": "boss", "password": "password123"}
+        )
+        assert resp.status_code == 200 and resp.json()["role"] == "admin"
+
+        resp = await admin_client.get("/api/console/admin/users")
+        assert resp.status_code == 200
+        assert {u["username"] for u in resp.json()} == {"alice", "boss"}
+        # admin 会话签发邀请码 ✓
+        resp = await admin_client.post("/api/console/admin/invites", json={})
+        assert resp.status_code == 200 and "code" in resp.json()
+        # admin 会话 PATCH 用户 ✓
+        resp = await admin_client.patch(
+            "/api/console/admin/users/alice", json={"disabled": False}
+        )
+        assert resp.status_code == 200
+    finally:
+        await admin_client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_admin_users_list_and_disable(env):
-    _, client = env
+async def test_admin_users_list_shape_with_tunnel_count(env):
+    """契约 v1.1 形状：{id, username, role, disabled, created_at, tunnel_count}"""
+    server, client = env
     await register_and_login_client(client)
+    await client.post("/api/console/tunnels", json={"prefix": "count-app"})
 
     resp = await client.get("/api/console/admin/users", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     users = resp.json()
     assert len(users) == 1
-    assert users[0]["username"] == "alice"
-    assert users[0]["role"] == "tenant"
-    assert users[0]["disabled"] is False
+    row = users[0]
+    assert set(row.keys()) == {"id", "username", "role", "disabled", "created_at", "tunnel_count"}
+    assert row["username"] == "alice"
+    assert row["role"] == "tenant"
+    assert row["disabled"] is False
+    assert isinstance(row["id"], int) and row["id"] > 0
+    assert row["tunnel_count"] == 1
 
-    resp = await client.post(
-        "/api/console/admin/users",
-        json={"username": "ghost", "disabled": True},
+    # admin/遗留隧道（owner NULL）不计入任何用户
+    await client.post("/api/tunnels", json={"domain": "orphan"}, headers=ADMIN_HEADERS)
+    resp = await client.get("/api/console/admin/users", headers=ADMIN_HEADERS)
+    assert resp.json()[0]["tunnel_count"] == 1
+
+    # PATCH 未知用户 → 404
+    resp = await client.patch(
+        "/api/console/admin/users/ghost",
+        json={"disabled": True},
         headers=ADMIN_HEADERS,
     )
     assert resp.status_code == 404 and err_code(resp) == "not_found"
+
+    # PATCH 非法 role / 空 body → 400
+    resp = await client.patch(
+        "/api/console/admin/users/alice", json={"role": "hacker"}, headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 400 and err_code(resp) == "invalid_role"
+    resp = await client.patch(
+        "/api/console/admin/users/alice", json={}, headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 400 and err_code(resp) == "bad_request"
+
+    # 旧 POST /admin/users 已被 v1.1 的 PATCH 取代（形状收口）
+    resp = await client.post(
+        "/api/console/admin/users",
+        json={"username": "alice", "disabled": True},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_patch_user_role_and_disabled_take_effect_immediately(env):
+    """角色/禁用每请求查库 → 即时生效（被降级的 admin 会话下一个请求即 403）"""
+    server, client = env
+    # alice = admin 会话
+    code = await make_invite(client, role="admin")
+    await register_tenant(client, "alice", code)
+    resp = await client.post(
+        "/api/console/login", json={"username": "alice", "password": "password123"}
+    )
+    assert resp.status_code == 200
+
+    # 用 admin key 把 bob 从 tenant 提升为 admin → bob 会话立即可调管理端点
+    bob = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client._transport.app),
+        base_url="http://testserver",
+    )
+    try:
+        code_b = await make_invite(client)
+        await register_tenant(bob, "bob", code_b)
+        await bob.post(
+            "/api/console/login", json={"username": "bob", "password": "password123"}
+        )
+        resp = await bob.get("/api/console/admin/users")
+        assert resp.status_code == 403  # tenant 不能
+
+        resp = await client.patch(
+            "/api/console/admin/users/bob", json={"role": "admin"}, headers=ADMIN_HEADERS
+        )
+        assert resp.status_code == 200
+        resp = await bob.get("/api/console/admin/users")
+        assert resp.status_code == 200  # 提升即时生效
+
+        # 降级 → 下一个请求立即 403（不信任会话载荷 r）
+        resp = await client.patch(
+            "/api/console/admin/users/bob",
+            json={"role": "tenant"},
+            headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 200
+        resp = await bob.get("/api/console/admin/users")
+        assert resp.status_code == 403
+
+        # 禁用 bob → bob 的租户面请求也立即 403；登录被拒
+        resp = await client.patch(
+            "/api/console/admin/users/bob",
+            json={"disabled": True},
+            headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 200
+        resp = await bob.get("/api/console/me")
+        assert resp.status_code == 403 and err_code(resp) == "account_disabled"
+    finally:
+        await bob.aclose()
+
+    async with server.db.session() as session:
+        user = await UserRepository(session).get_by_username("bob")
+        assert user.role == "tenant" and user.disabled is True
+
+
+@pytest.mark.asyncio
+async def test_self_lockout_protection(env):
+    """契约 v1.1：admin 会话不可禁用/降级自己（409 self_lockout）；key 通道不受限"""
+    _, client = env
+    code = await make_invite(client, role="admin")
+    await register_tenant(client, "root", code)
+    resp = await client.post(
+        "/api/console/login", json={"username": "root", "password": "password123"}
+    )
+    assert resp.status_code == 200
+
+    # 禁用自己 → 409
+    resp = await client.patch(
+        "/api/console/admin/users/root", json={"disabled": True}
+    )
+    assert resp.status_code == 409 and err_code(resp) == "self_lockout"
+
+    # 降级自己 → 409
+    resp = await client.patch("/api/console/admin/users/root", json={"role": "tenant"})
+    assert resp.status_code == 409 and err_code(resp) == "self_lockout"
+
+    # 允许：解除自己的禁用（若有）、提升自己为 admin（幂等）
+    resp = await client.patch(
+        "/api/console/admin/users/root", json={"disabled": False}
+    )
+    assert resp.status_code == 200
+    resp = await client.patch("/api/console/admin/users/root", json={"role": "admin"})
+    assert resp.status_code == 200
+
+    # 允许：admin 会话禁用/降级**其他** admin
+    other = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client._transport.app),
+        base_url="http://testserver",
+    )
+    try:
+        code2 = await make_invite(client, role="admin")
+        await register_tenant(other, "root2", code2)
+        resp = await client.patch(
+            "/api/console/admin/users/root2", json={"disabled": True}
+        )
+        assert resp.status_code == 200
+    finally:
+        await other.aclose()
+
+    # admin key 通道不受 self_lockout 限制（key 无身份，服务器脚本场景）
+    resp = await client.patch(
+        "/api/console/admin/users/root",
+        json={"disabled": True},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    resp = await client.patch(
+        "/api/console/admin/users/root",
+        json={"role": "tenant"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -687,6 +885,7 @@ async def test_admin_invite_creation_persists(env):
         invite = await InviteRepository(session).get_by_code(code)
         assert invite is not None
         assert invite.max_uses == 3 and invite.used_count == 0
+        assert invite.role == "tenant"  # 契约 v1.1：默认 tenant
         assert invite.expires_at is not None
         remaining = invite.expires_at - datetime.now(timezone.utc).replace(tzinfo=None)
         assert timedelta(days=6.9) < remaining < timedelta(days=7.01)
@@ -696,6 +895,55 @@ async def test_admin_invite_creation_persists(env):
         assert (await register_tenant(client, f"user-{i}", code)).status_code == 201
     resp = await register_tenant(client, "user-3", code)
     assert resp.status_code == 400 and err_code(resp) == "invite_exhausted"
+
+    # 非法 role → 400
+    resp = await client.post(
+        "/api/console/admin/invites",
+        json={"role": "superadmin"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 400 and err_code(resp) == "invalid_role"
+
+
+@pytest.mark.asyncio
+async def test_role_invite_chain_admin_invite_grants_admin(env):
+    """契约 v1.1 链路：admin key 签发 role=admin 邀请码 → 注册 → role=admin → 可管理"""
+    server, client = env
+    admin_code = await make_invite(client, role="admin")
+
+    resp = await register_tenant(client, "invited-admin", admin_code)
+    assert resp.status_code == 201
+    assert resp.json()["role"] == "admin"  # 注册响应即按邀请码角色
+
+    resp = await client.post(
+        "/api/console/login",
+        json={"username": "invited-admin", "password": "password123"},
+    )
+    assert resp.status_code == 200 and resp.json()["role"] == "admin"
+    resp = await client.get("/api/console/me")
+    assert resp.status_code == 200 and resp.json()["role"] == "admin"
+
+    # admin 会话可调管理端点
+    resp = await client.get("/api/console/admin/users")
+    assert resp.status_code == 200
+
+    # DB 落库 role=admin
+    async with server.db.session() as session:
+        user = await UserRepository(session).get_by_username("invited-admin")
+        assert user.role == "admin"
+
+    # tenant 邀请码注册仍为 tenant（默认角色回归）
+    tenant_code = await make_invite(client)
+    other = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=client._transport.app),
+        base_url="http://testserver",
+    )
+    try:
+        resp = await register_tenant(other, "plain-tenant", tenant_code)
+        assert resp.json()["role"] == "tenant"
+        # admin 邀请码用尽后不可复用为 admin
+    finally:
+        await other.aclose()
 
 
 # ============== entry 模板（契约 §5） ==============

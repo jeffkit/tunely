@@ -14,10 +14,10 @@
 - DELETE /api/console/tunnels/{domain} 删除隧道（断开在线连接）
 - GET  /api/console/entry              接入说明模板（供前端渲染二维码）
 
-管理面（复用既有 admin key 鉴权，x-api-key）：
-- GET  /api/console/admin/users        列出用户
-- POST /api/console/admin/users        禁用/启用用户
-- POST /api/console/admin/invites      签发邀请码
+管理面（契约 v1.1 §5：admin key **或** role=admin 会话，二选一）：
+- GET   /api/console/admin/users                 列出用户（含 tunnel_count）
+- PATCH /api/console/admin/users/{username}      禁用/启用、调整角色（self_lockout 保护）
+- POST  /api/console/admin/invites               签发邀请码（可选 role，默认 tenant）
 
 安全决策（契约 §3/§4/§5）：
 - 密码哈希 stdlib hashlib.scrypt（n=2^14, r=8, p=1，16B 随机盐），
@@ -72,6 +72,9 @@ logger = logging.getLogger(__name__)
 USERNAME_PATTERN = re.compile(r"^[a-z0-9_-]{3,32}$")
 # 隧道前缀：与 TunnelServer.DOMAIN_PATTERN 同宽度（1-63），收敛为小写（Host 头大小写敏感）
 PREFIX_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+# 合法角色（契约 v1.1 §2）
+_VALID_ROLES = {"tenant", "admin"}
 
 PASSWORD_MIN_LENGTH = 8
 PASSWORD_MAX_LENGTH = 128
@@ -292,16 +295,19 @@ class CreateTunnelByTenantRequest(BaseModel):
     prefix: str
 
 
-class AdminUserUpdateRequest(BaseModel):
+class AdminUserPatchRequest(BaseModel):
+    """PATCH /admin/users/{username} 请求体（契约 v1.1：至少提供一项）"""
+
     model_config = ConfigDict(extra="forbid")
-    username: str
-    disabled: bool
+    disabled: bool | None = None
+    role: str | None = None
 
 
 class AdminInviteCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     max_uses: int = Field(default=1, ge=1, le=1000)
     expires_days: float | None = Field(default=None, gt=0, le=3650)
+    role: str = "tenant"  # 契约 v1.1：受邀角色，默认 tenant；合法性在端点内校验（自定义错误形状）
 
 
 # ============== 用户/邀请码数据访问 ==============
@@ -329,11 +335,12 @@ class UserRepository:
         result = await self.session.execute(select(User).order_by(User.id))
         return list(result.scalars().all())
 
-    async def set_disabled(self, username: str, disabled: bool) -> bool:
+    async def update_profile(self, username: str, values: dict) -> bool:
+        """更新用户的 disabled/role 等字段（PATCH 管理 API 用）"""
         from sqlalchemy import update as sql_update
 
         result = await self.session.execute(
-            sql_update(User).where(User.username == username).values(disabled=disabled)
+            sql_update(User).where(User.username == username).values(**values)
         )
         return result.rowcount > 0
 
@@ -354,10 +361,12 @@ class InviteRepository:
         created_by: str = "admin",
         max_uses: int = 1,
         expires_at: datetime | None = None,
+        role: str = "tenant",
     ) -> Invite:
         invite = Invite(
             code=code,
             created_by=created_by,
+            role=role,
             max_uses=max_uses,
             used_count=0,
             expires_at=expires_at,
@@ -430,6 +439,25 @@ def build_console_router(server: "TunnelServer") -> APIRouter:
             raise ConsoleError(403, "account_disabled", "账号已被禁用")
         return user
 
+    async def _authorize_admin(request: Request, x_api_key: str | None) -> User | None:
+        """管理端点鉴权（契约 v1.1 §5）：admin key **或** role=admin 会话，二选一
+
+        返回经会话鉴权通过的 admin 用户；走 admin key 通道时返回 None（无身份，
+        self_lockout 不适用）。admin key 语义与既有 admin 通道一致：未配置 key =
+        内网模式放行；配置则常数时间比较。admin 会话每请求查库校验 role+disabled
+        （降级/禁用即时生效，不信任会话载荷里的 r 字段）。
+        """
+        if server.config.admin_api_key is None:
+            # 内网模式（未配置 key）：与既有 admin 通道语义一致放行，无身份
+            return None
+        if x_api_key and hmac.compare_digest(x_api_key, server.config.admin_api_key):
+            return None
+        # key 缺失/错误 → 尝试 admin 会话（二选一：会话通过即可）
+        user = await _require_active_user(request)
+        if user.role != "admin":
+            raise ConsoleError(403, "forbidden", "需要 admin 角色")
+        return user
+
     async def _get_owned_tunnel(user: User, domain: str) -> Tunnel:
         """取 user 所有的隧道；不存在或非本人 → 一律 404（不泄露存在性，契约 §5）"""
         db = _require_db()
@@ -475,7 +503,10 @@ def build_console_router(server: "TunnelServer") -> APIRouter:
             if not await invites.consume(invite_code):
                 raise ConsoleError(400, "invite_exhausted", "邀请码已被用尽")
 
-            user = await users.create(body.username, hash_password(body.password))
+            # 契约 v1.1：注册按邀请码签发角色落 users.role（tenant 默认 / admin 受邀管理员）
+            user = await users.create(
+                body.username, hash_password(body.password), role=invite.role
+            )
             # session 上下文退出时统一 commit（失败整体回滚，含消耗额度）
 
         return JSONResponse(
@@ -664,47 +695,86 @@ def build_console_router(server: "TunnelServer") -> APIRouter:
             "desktop_connect": connect_cmd,
         }
 
-    # ---------- 管理面（复用 admin key 鉴权，契约 §5） ----------
+    # ---------- 管理面（契约 v1.1 §5：admin key 或 role=admin 会话，二选一） ----------
 
     @router.get("/admin/users")
     async def admin_list_users(
+        request: Request,
         x_api_key: str | None = Header(None, alias="x-api-key"),
     ) -> list[dict]:
-        server._check_admin_api_key(x_api_key)
+        await _authorize_admin(request, x_api_key)
         db = _require_db()
         async with db.session() as session:
             users = await UserRepository(session).list_all()
+            tunnel_counts = await TunnelRepository(session).count_grouped_by_owner()
+        # 契约 v1.1 形状：{id, username, role, disabled, created_at, tunnel_count}
         return [
             {
+                "id": u.id,
                 "username": u.username,
                 "role": u.role,
                 "disabled": u.disabled,
                 "created_at": u.created_at.isoformat() if u.created_at else None,
+                "tunnel_count": tunnel_counts.get(u.id, 0),
             }
             for u in users
         ]
 
-    @router.post("/admin/users")
-    async def admin_update_user(
+    @router.patch("/admin/users/{username}")
+    async def admin_patch_user(
+        username: str,
         request: Request,
         x_api_key: str | None = Header(None, alias="x-api-key"),
     ) -> dict:
-        server._check_admin_api_key(x_api_key)
-        body = await _parse_body(request, AdminUserUpdateRequest)
+        session_admin = await _authorize_admin(request, x_api_key)
+        body = await _parse_body(request, AdminUserPatchRequest)
+
+        if body.role is not None and body.role not in _VALID_ROLES:
+            raise ConsoleError(400, "invalid_role", "role 须为 tenant 或 admin")
+        if body.disabled is None and body.role is None:
+            raise ConsoleError(400, "bad_request", "至少提供 disabled 或 role 之一")
+
+        # self_lockout（契约 v1.1 §5）：不可禁用/降级自己。
+        # 仅会话通道有「自己」；admin key 通道无身份（服务器脚本），不受限。
+        if session_admin is not None and session_admin.username == username:
+            if body.disabled is True:
+                raise ConsoleError(409, "self_lockout", "不可禁用自己的账号")
+            if body.role is not None and body.role != "admin":
+                raise ConsoleError(409, "self_lockout", "不可降级自己的角色")
+
+        values: dict = {}
+        if body.disabled is not None:
+            values["disabled"] = body.disabled
+        if body.role is not None:
+            values["role"] = body.role
+
         db = _require_db()
         async with db.session() as session:
-            ok = await UserRepository(session).set_disabled(body.username, body.disabled)
+            ok = await UserRepository(session).update_profile(username, values)
         if not ok:
             raise ConsoleError(404, "not_found", "用户不存在")
-        return {"username": body.username, "disabled": body.disabled}
+
+        # 契约 v1.1：角色/禁用即时生效依赖每请求查库，此处无需吊销既有会话
+        # （无状态会话不存可篡改状态，payload.r 不参与鉴权判定）。
+        from .server import _client_ip
+
+        await server._record_audit(
+            "update",
+            domain=None,
+            detail=f"user:{username};{','.join(sorted(values))};via=console",
+            source_ip=_client_ip(request),
+        )
+        return {"username": username, "role": body.role, "disabled": body.disabled}
 
     @router.post("/admin/invites")
     async def admin_create_invite(
         request: Request,
         x_api_key: str | None = Header(None, alias="x-api-key"),
     ) -> dict:
-        server._check_admin_api_key(x_api_key)
+        await _authorize_admin(request, x_api_key)
         body = await _parse_body(request, AdminInviteCreateRequest)
+        if body.role not in _VALID_ROLES:
+            raise ConsoleError(400, "invalid_role", "role 须为 tenant 或 admin")
         expires_at = (
             _utcnow_naive() + timedelta(days=body.expires_days)
             if body.expires_days is not None
@@ -719,6 +789,7 @@ def build_console_router(server: "TunnelServer") -> APIRouter:
                         code=generate_invite_code(),
                         max_uses=body.max_uses,
                         expires_at=expires_at,
+                        role=body.role,
                     )
                 break
             except IntegrityError:
