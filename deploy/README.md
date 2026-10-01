@@ -80,7 +80,7 @@ request_timeout = 300                          # 单请求超时（秒）
 force = false                                  # true = 强制抢占已有连接
 ```
 
-> **注意**：当前源码中的 Rust CLI 只支持旗标形式（`tunely connect --token ... --server ... --target ...`），尚无 `--config` 参数。模板 ExecStart 按任务要求写了 `--config /etc/tunely/client.toml`；在支持 `--config` 的版本发布前，请改用各模板内注释里的旗标形式 ExecStart/ProgramArguments。
+> **说明**：Rust CLI 已支持 `--config` 参数（见 `rust/src/main.rs`，如 `tunely connect --config /etc/tunely/client.toml`），模板中的 `ExecStart`/`ProgramArguments` 可直接使用；旗标形式（`tunely connect --token ... --server ... --target ...`）仍然可用。
 
 ## 3. 隧道的创建与连接
 
@@ -157,12 +157,12 @@ journalctl -u tunely-server -p warning  # 只看告警以上
 
 ## 6. 探测面加固（Anti-Probe Hardening，运维侧 T8）
 
-> SDK 侧去特征化（0.12）已落地，见 [`docs/PROBE_HARDENING.md`](../docs/PROBE_HARDENING.md)。
+> SDK 侧去特征化已落地（当前版本 0.11.1 的现行代码即含），见 [`docs/PROBE_HARDENING.md`](../docs/PROBE_HARDENING.md)。
 > 本节是**部署侧**配套动作，目标是：主动扫描公网入口只看到一个普通站点，而不是一台隧道服务器。
 
 ### 6.1 清单（按优先级）
 
-1. **必须配置 `WS_TUNNEL_ADMIN_API_KEY`**（长随机串）：0.12 起 `/api/info`、`/metrics` 受其门控；**不配置则这两端点仍开放**（与既有 admin 端点语义一致）。
+1. **必须配置 `WS_TUNNEL_ADMIN_API_KEY`**（长随机串）：当前版本已实现 `/api/info`、`/metrics` 受其门控；**不配置则这两端点仍开放**（与既有 admin 端点语义一致）。
 2. **wss-only**：控制面务必走 TLS（`serve --ssl-certfile/--ssl-keyfile` 原生 TLS，或边缘 nginx TLS）。裸 `ws://` 下协议 JSON、base64 数据明文可读，秒识别。
 3. **`ws_path` 随机化**：默认 `/ws/tunnel` 是可猜测路径。`serve --ws-path /<随机段>/ws/tunnel`，客户端 `server` URL 同步修改。
 4. **入口收敛 + decoy**：根路径配置像样的落地页（见 6.4 的 `TUNELY_ROOT_RESPONSE_FILE`；原生无 nginx 时也生效），不要用「空白 404」——那本身就是特征。

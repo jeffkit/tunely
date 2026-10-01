@@ -169,7 +169,7 @@ The `id` field in messages is critical for matching requests to responses:
 ### Error Handling
 
 Common error scenarios:
-- **Authentication failures**（无效 token / 隧道禁用 / 已在线拒绝 / 非 auth 首包）：0.12 起统一返回 `AuthErrorMessage`（`error: "Authentication failed"`，`code: "auth_failed"`）并经同一随机延迟后关闭（探测去特征化，见 `docs/PROBE_HARDENING.md`）
+- **Authentication failures**（无效 token / 隧道禁用 / 已在线拒绝 / 非 auth 首包）：已落地——现行代码统一返回 `AuthErrorMessage`（`error: "Authentication failed"`，`code: "auth_failed"`）并经同一随机延迟后关闭（探测去特征化，见 `docs/PROBE_HARDENING.md`）
 - **Target service unavailable**: Return `TunnelResponse` with status 503 and error message
 - **Timeout**: Return `TunnelResponse` with status 504
 - **Connection lost**: Server cleans up pending requests after timeout
