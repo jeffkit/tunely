@@ -174,7 +174,8 @@ class TunnelServerConfig(BaseSettings):
     # ============== 多租户自助控制台（Console v2，docs/CONSOLE_MULTITENANT.md） ==============
     console_tunnels_per_user: int = Field(
         default=3,
-        description="每租户可创建隧道配额（0 = 该部署对租户禁建隧道）（env: WS_TUNNEL_CONSOLE_TUNNELS_PER_USER）",
+        description="每租户可创建隧道配额（0 = 该部署对租户禁建隧道）"
+        "（env: WS_TUNNEL_CONSOLE_TUNNELS_PER_USER）",
     )
     console_session_secret: str | None = Field(
         default=None,
