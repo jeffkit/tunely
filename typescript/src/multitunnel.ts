@@ -4,8 +4,12 @@
  * 配置来源（优先级：CLI > env > 配置文件 > 默认）：
  * - 配置文件（--config）：.toml 直接读 rust/python 同款 client.toml
  *   （smol-toml，TOML 1.0）；.json 为 TS 侧等价形态。键名一致：
- *     server / token / target / [[tunnel]](name|token|target) / reconnect_secs / force
+ *     server / token / target / proxy / [[tunnel]](name|token|target) /
+ *     reconnect_secs / force
  * - TUNELY_TUNNELS 环境变量：JSON 数组（systemd/launchd env 友好）
+ *
+ * 代理出站例外：proxy 明确「配置 > env > 无」（与 TUNELY_* 相反）——
+ * 站点级配置覆盖部署环境注入的通用代理变量（HTTPS_PROXY 等），见 resolveProxy。
  *
  * 多隧道形态下禁止单隧道来源（--token/--target 与 TUNELY_TOKEN/TUNELY_TARGET），
  * 避免两种形态静默混用。单隧道解析行为与 0.3.x 完全一致。
@@ -13,6 +17,7 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseToml } from 'smol-toml';
+import { resolveProxy } from './proxy.js';
 
 export interface MultiTunnelEntry {
   name?: string;
@@ -24,6 +29,8 @@ export interface MultiTunnelFileConfig {
   server?: string;
   token?: string;
   target?: string;
+  /** 出站 HTTP CONNECT 代理（客户端 → server 的 WS）；v1 仅 http://host:port */
+  proxy?: string;
   tunnel?: MultiTunnelEntry[];
   reconnect_secs?: number;
   max_reconnect?: number;
@@ -45,6 +52,8 @@ export interface ResolvedTunnel {
   serverUrl: string;
   token: string;
   targetUrl: string;
+  /** 出站代理（null = 直连）；跨隧道共享（与 server 同级全局项） */
+  proxy: string | null;
   /** 秒（TS 客户端内部换算毫秒） */
   reconnectSecs: number;
   maxReconnect: number;
@@ -55,6 +64,8 @@ export interface ResolveInputs {
   file?: MultiTunnelFileConfig | null;
   /** TUNELY_TUNNELS env 原文（JSON 数组），未设置为 null */
   envTunnels?: string | null;
+  /** 代理 env 回退查找表（通常传 process.env；缺省视为无代理 env） */
+  env?: Record<string, string | undefined>;
   /** CLI --server（未传为 undefined） */
   cliServer?: string;
   /** CLI --token 或 env TUNELY_TOKEN（未传为 undefined） */
@@ -72,6 +83,12 @@ const DEFAULT_TARGET = 'http://localhost:8080';
 
 export function resolveTunnels(input: ResolveInputs): ResolvedTunnel[] {
   const file = input.file ?? {};
+  // 代理在入口处统一解析（配置 > env > 无；非法值在此抛错），
+  // 单/多隧道形态共享同一结果
+  const proxy = resolveProxy({
+    fileProxy: file.proxy ?? null,
+    env: input.env ?? undefined,
+  });
   let entries: MultiTunnelEntry[] = Array.isArray(file.tunnel) ? file.tunnel : [];
 
   // TUNELY_TUNNELS env 优先于文件内数组（env 是部署层注入，视同 CLI 级来源）
@@ -103,6 +120,7 @@ export function resolveTunnels(input: ResolveInputs): ResolvedTunnel[] {
         serverUrl: input.cliServer ?? file.server ?? DEFAULT_SERVER,
         token,
         targetUrl: input.cliTarget ?? file.target ?? DEFAULT_TARGET,
+        proxy,
         reconnectSecs: input.cliReconnectSecs ?? file.reconnect_secs ?? 5,
         maxReconnect: file.max_reconnect ?? 0,
         force: input.cliForce ?? file.force ?? false,
@@ -127,6 +145,6 @@ export function resolveTunnels(input: ResolveInputs): ResolvedTunnel[] {
     }
     const name = entry.name ?? `tunnel-${i + 1}`;
     const targetUrl = entry.target ?? file.target ?? DEFAULT_TARGET;
-    return { name, serverUrl: server, token, targetUrl, reconnectSecs, maxReconnect, force };
+    return { name, serverUrl: server, token, targetUrl, proxy, reconnectSecs, maxReconnect, force };
   });
 }

@@ -9,7 +9,13 @@ import WebSocket from 'ws';
 // 会因跨拷贝 handler 协议不匹配丢失全部响应头（连带破坏 SSE 判定与
 // chunked_http 的 Content-Type/Content-Length 判定）
 import { Agent, fetch as undiciFetch } from 'undici';
+// 出站 HTTP CONNECT 代理（客户端 → server 的 WS 经代理转发）：
+// HttpsProxyAgent 负责与代理建 CONNECT 隧道，对 ws:// 与 wss:// 目标均适用
+// （wss 的 TLS 在隧道内部由 ws 的 https 模块完成，端到端加密不变）；
+// 选它而非 proxy-agent/global-agent：轻量零子依赖、仅做隧道建立、语义可预期
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import * as net from 'net';
+import { validateProxy } from './proxy.js';
 import {
   AuthMessage,
   AuthOkMessage,
@@ -58,6 +64,12 @@ export interface TunnelClientConfig {
    * 0 = 从不流式。env: TUNELY_STREAM_THRESHOLD_BYTES
    */
   streamThresholdBytes?: number;
+  /**
+   * 出站 HTTP CONNECT 代理（客户端 → server 的 WS 经此转发；不设 = 直连）。
+   * v1 仅支持 http://host:port（SOCKS 不支持）；只作用于 WS 出站，
+   * 转发目标（target）流量语义不变。非法值在构造时即抛错（fail fast）。
+   */
+  proxy?: string;
   /** 多隧道模式下的会话标签（单隧道不设）；用于连接期日志前缀 */
   name?: string;
 }
@@ -146,6 +158,9 @@ export class TunnelClient {
       force: config.force ?? false,
       keepaliveInterval: config.keepaliveInterval ?? 25000,
       keepaliveTimeout: config.keepaliveTimeout ?? 45000,
+      // 代理配置在构造期即校验（SOCKS 等不支持的形态 fail fast，
+      // 而不是运行期重连循环里反复失败）
+      proxy: config.proxy ? validateProxy(config.proxy) : '',
       name: config.name ?? '',
     };
     this.parseTargetUrl();
@@ -263,7 +278,16 @@ export class TunnelClient {
     return new Promise((resolve, reject) => {
       // 显式启用 permessage-deflate（ws 客户端默认关闭），
       // 服务端（uvicorn/websockets）默认开启，双方协商后压缩 wire 流量
-      const ws = new WebSocket(this.config.serverUrl, { perMessageDeflate: true });
+      const wsOptions: WebSocket.ClientOptions = { perMessageDeflate: true };
+      // 出站代理：CONNECT 隧道由 https-proxy-agent 建立（每连接一个 agent，
+      // 不复用——隧道生命周期与 WS 连接一致）；只影响客户端 → server 出站
+      if (this.config.proxy) {
+        wsOptions.agent = new HttpsProxyAgent(this.config.proxy);
+        console.log(
+          `经代理出站: ${this.config.proxy}（仅客户端 → server 的 WS，target 流量不经代理）`
+        );
+      }
+      const ws = new WebSocket(this.config.serverUrl, wsOptions);
       this.ws = ws;
 
       // keepalive：空闲长连接会被中间设备静默丢弃，必须主动探测。

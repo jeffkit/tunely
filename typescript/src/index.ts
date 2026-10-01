@@ -7,3 +7,11 @@
 export * from './protocol.js';
 export * from './framing.js';
 export * from './client.js';
+export {
+  parseProxyUrl,
+  validateProxy,
+  proxyFromEnv,
+  resolveProxy,
+  serverHostPort,
+  PROXY_ENV_KEYS,
+} from './proxy.js';

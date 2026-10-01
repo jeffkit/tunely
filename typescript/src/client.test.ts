@@ -1489,3 +1489,79 @@ describe('TunnelClient - 认证被拒不自动升级 force（互踢防护回归 
     await runPromise.catch(() => {});
   });
 });
+
+// ================================================================
+// 出站代理（客户端 → server 的 WS 经 HTTP CONNECT 代理）
+// - 配置 proxy 时：构造期校验（SOCKS fail fast）、WebSocket 第二参数带 agent；
+// - 未配置 proxy 时：选项保持 { perMessageDeflate: true }（既有行为不变）。
+// ================================================================
+
+import { HttpsProxyAgent } from 'https-proxy-agent';
+
+describe('TunnelClient - 出站代理（CONNECT）', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('配置 proxy：WebSocket 选项带 HttpsProxyAgent 实例', async () => {
+    const WebSocketMock = vi.mocked((await import('ws')).default);
+    let mockWs!: MockWebSocket;
+    WebSocketMock.mockImplementationOnce(() => {
+      mockWs = new MockWebSocket();
+      return mockWs as any;
+    }).mockImplementation(() => {
+      const ws = new MockWebSocket();
+      Promise.resolve().then(() => ws.emit('close'));
+      return ws as any;
+    });
+
+    const client = new TunnelClient({
+      serverUrl: 'ws://test-server',
+      token: 'test-token',
+      targetUrl: 'http://localhost:3000',
+      reconnectInterval: 100,
+      proxy: 'http://127.0.0.1:7890',
+    });
+    const runPromise = client.run();
+    await new Promise((r) => setImmediate(r));
+    client.stop();
+    await runPromise.catch(() => {});
+
+    const [url, options] = (WebSocketMock.mock.calls as unknown[][])[0] as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(url).toBe('ws://test-server');
+    expect(options.perMessageDeflate).toBe(true);
+    expect(options.agent).toBeInstanceOf(HttpsProxyAgent);
+  });
+
+  it('proxy 值归一化存储（validateProxy 去空白），直连为空串', () => {
+    const proxied = new TunnelClient({
+      serverUrl: 'ws://s',
+      token: 't',
+      targetUrl: 'http://localhost:3000',
+      proxy: '  http://127.0.0.1:7890  ',
+    });
+    expect((proxied as any).config.proxy).toBe('http://127.0.0.1:7890');
+
+    const direct = new TunnelClient({
+      serverUrl: 'ws://s',
+      token: 't',
+      targetUrl: 'http://localhost:3000',
+    });
+    expect((direct as any).config.proxy).toBe('');
+  });
+
+  it('SOCKS 代理构造期即抛错（fail fast，不进重连循环）', () => {
+    expect(
+      () =>
+        new TunnelClient({
+          serverUrl: 'ws://s',
+          token: 't',
+          targetUrl: 'http://localhost:3000',
+          proxy: 'socks5://127.0.0.1:1080',
+        })
+    ).toThrow(/SOCKS/);
+  });
+});

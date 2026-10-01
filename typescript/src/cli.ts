@@ -55,6 +55,7 @@ program
       tunnels = resolveTunnels({
         file,
         envTunnels: process.env.TUNELY_TUNNELS ?? null,
+        env: process.env,
         cliServer: options.server ?? process.env.TUNELY_SERVER,
         cliToken,
         cliTarget,
@@ -69,6 +70,9 @@ program
     const multi = tunnels.length > 1;
     console.log('tunely - WebSocket Tunnel Client');
     console.log(`  服务端: ${tunnels[0].serverUrl}`);
+    if (tunnels[0].proxy) {
+      console.log(`  代理: ${tunnels[0].proxy}`);
+    }
     if (multi) {
       console.log(`  隧道 (${tunnels.length}):`);
       for (const t of tunnels) {
@@ -92,6 +96,9 @@ program
         maxReconnectAttempts: t.maxReconnect,
         force: t.force,
         name: t.name ?? undefined,
+        // 出站代理（客户端 → server 的 WS 经 CONNECT 隧道；null = 直连）。
+        // 配置面见 resolveTunnels：配置文件 proxy 字段 > HTTPS_PROXY 等 env > 无
+        proxy: t.proxy ?? undefined,
         // 普通响应体内存上限（字节）：env TUNELY_MAX_RESPONSE_BYTES，0 = 不限制，默认 100MB
         maxResponseBytes: process.env.TUNELY_MAX_RESPONSE_BYTES
           ? parseInt(process.env.TUNELY_MAX_RESPONSE_BYTES, 10)
