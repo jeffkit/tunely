@@ -20,9 +20,9 @@ tunely server（多租户控制台 + 数据面）
 
 ## 角色与流程
 
-**部署方（admin，持 admin key）**
-1. 签发邀请码：控制台 `/admin` 或 `POST /api/console/admin/invites`
-2. （可选）在 `/admin` 禁用用户
+**部署方（admin 账号）**
+1. 初始化（仅一次）：用服务器 admin key 签发一枚 **role=admin** 邀请码 → 注册自己的管理员账号
+2. 日常：登录控制台 `/admin` 签发邀请码（可选角色）、管理用户——全程会话鉴权，admin key 不进浏览器
 
 **租户（tenant）**
 1. `/register` 用邀请码注册用户名/密码
@@ -53,6 +53,8 @@ tunely server（多租户控制台 + 数据面）
 - 密码 scrypt 存储；登录失败固定 ~1s 延迟（防爆破）。
 - 会话为无状态 HMAC cookie：`HttpOnly; SameSite=Lax`，`Secure` 交由 TLS 终止层追加。
 - 租户只能触碰 `owner` 是自己的隧道，越权一律 404（不泄露存在性）。
+- 管理面鉴权（契约 v1.1）：admin key **或** `role=admin` 会话二选一；admin 会话每请求查库，
+  禁用/降级即时生效；`self_lockout` 禁止对当前登录账号禁用/降级。
 - admin key 通道（`/api/tunnels` 等）行为不变，回归由测试守住。
 
 ## 部署
