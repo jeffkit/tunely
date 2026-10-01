@@ -30,8 +30,8 @@
 ```
 users        id, username(unique, 3-32, [a-z0-9_-]), password_hash(scrypt),
              role('admin'|'tenant'), disabled(bool, default false), created_at
-invites      code(unique, 可读格式如 dsh-xxxxxx), created_by, max_uses(int, default 1),
-             used_count(int, default 0), expires_at(nullable), created_at
+invites      code(unique, 可读格式如 dsh-xxxxxx), role('tenant'|'admin', default 'tenant'),
+             created_by, max_uses(int, default 1), used_count(int, default 0), expires_at(nullable), created_at
 tunnels      新增列 owner_id(FK users.id, nullable)  —— NULL 视为 admin/遗留所有
 ```
 
