@@ -4,9 +4,14 @@ import { DashboardOutlined, CloudServerOutlined, HistoryOutlined } from '@ant-de
 import { Dashboard } from './pages/Dashboard'
 import { Tunnels } from './pages/Tunnels'
 import { RequestLogs } from './pages/RequestLogs'
+import { Login } from './pages/Login'
+import { Register } from './pages/Register'
+import { MyTunnels } from './pages/MyTunnels'
+import { Admin } from './pages/Admin'
 import { BackendConfigManager } from './components/BackendConfigManager'
 import { useUserActivity } from './hooks/useUserActivity'
 import { useRealtime } from './hooks/useRealtime'
+import { useHashRoute } from './router'
 import type { MenuProps } from 'antd'
 
 const { Header, Content, Sider } = Layout
@@ -31,7 +36,10 @@ const menuItems: MenuItem[] = [
   },
 ]
 
-function App() {
+/**
+ * 既有 admin key 管理台（部署方视角，行为保持不变）
+ */
+function LegacyAdminConsole() {
   const [selectedKey, setSelectedKey] = useState('dashboard')
   const [selectedTunnelDomain, setSelectedTunnelDomain] = useState<string | null>(null)
 
@@ -53,7 +61,12 @@ function App() {
         }}
       >
         <div style={{ color: '#fff', fontSize: 18, fontWeight: 'bold' }}>Tunely Server - 管理台</div>
-        <BackendConfigManager />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <a href="#/login" style={{ color: 'rgba(255, 255, 255, 0.85)' }}>
+            多租户控制台
+          </a>
+          <BackendConfigManager />
+        </div>
       </Header>
       <Layout>
         <Sider width={200} style={{ background: '#fff' }}>
@@ -93,6 +106,28 @@ function App() {
       </Layout>
     </Layout>
   )
+}
+
+/**
+ * 多租户控制台 v2（契约 CONSOLE_MULTITENANT.md §6）：
+ * /login /register（邀请码）/tunnels（租户主页）/admin（仅 admin 入口）
+ * 默认路径仍为既有 admin key 管理台，行为不变。
+ */
+function App() {
+  const path = useHashRoute()
+
+  switch (path) {
+    case '/login':
+      return <Login />
+    case '/register':
+      return <Register />
+    case '/tunnels':
+      return <MyTunnels />
+    case '/admin':
+      return <Admin />
+    default:
+      return <LegacyAdminConsole />
+  }
 }
 
 export default App
