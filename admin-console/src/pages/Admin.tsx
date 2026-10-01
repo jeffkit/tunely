@@ -1,8 +1,11 @@
 /**
  * 管理页（/admin，仅 role=admin 可见入口）
- * 契约 §5：管理端点使用 admin key 鉴权（GET/POST /api/console/admin/users、
- * POST /api/console/admin/invites）。页面入口按会话角色控制；
- * 若后端要求 admin key 而未配置，给出引导提示。
+ * 契约 v1.1 §5/§6：管理端点鉴权为「admin key 或 admin 角色会话」，本页**只依赖会话 cookie**，
+ * 不向前端下发或粘贴 admin key（admin key 仅供服务器脚本；既有默认路径的 key 管理台保持原样）。
+ *
+ * - GET  /api/console/admin/users：用户列表
+ * - PATCH /api/console/admin/users/{username}：{disabled?, role?}；禁用/降级自己 → 409 self_lockout
+ * - POST /api/console/admin/invites：{max_uses?, expires_days?, role?}；签发 admin 邀请需二次确认
  */
 import { useCallback, useEffect, useState } from 'react'
 import {
@@ -14,6 +17,7 @@ import {
   Layout,
   Modal,
   Popconfirm,
+  Radio,
   Result,
   Space,
   Spin,
@@ -30,11 +34,12 @@ import { useSessionStore } from '../store/sessionStore'
 import { navigate } from '../router'
 import { copyTextToClipboard } from '../utils/clipboard'
 import { formatDate } from '../utils/format'
-import type { AdminInviteCreated, AdminUser } from '../types/console'
+import type { AdminInviteCreated, AdminUser, ConsoleRole } from '../types/console'
 
 const { Header, Content } = Layout
 
 interface InviteFormValues {
+  role: ConsoleRole
   max_uses?: number
   expires_days?: number
 }
@@ -46,9 +51,12 @@ export function Admin() {
   const [usersLoading, setUsersLoading] = useState(false)
   const [usersError, setUsersError] = useState<string | null>(null)
   const [togglingUsername, setTogglingUsername] = useState<string | null>(null)
+  const [roleChangingUsername, setRoleChangingUsername] = useState<string | null>(null)
 
   const [inviting, setInviting] = useState(false)
   const [inviteResult, setInviteResult] = useState<AdminInviteCreated | null>(null)
+  /** 选择 admin 角色后待二次确认的表单值 */
+  const [pendingInvite, setPendingInvite] = useState<InviteFormValues | null>(null)
 
   const [form] = Form.useForm<InviteFormValues>()
 
@@ -66,6 +74,23 @@ export function Admin() {
 
   const isAdmin = status === 'authed' && me?.role === 'admin'
 
+  /** 统一错误处理：401 会话失效回登录页；409 self_lockout 专门提示 */
+  const handleApiError = useCallback(
+    (err: unknown, fallback: string) => {
+      if (err instanceof ConsoleApiError && err.statusCode === 401) {
+        clear()
+        navigate('/login', { replace: true })
+        return
+      }
+      if (err instanceof ConsoleApiError && err.code === 'self_lockout') {
+        message.error('操作被拒绝：不能禁用或降级当前登录的账号（self_lockout）')
+        return
+      }
+      message.error(err instanceof Error ? err.message : fallback)
+    },
+    [clear]
+  )
+
   const loadUsers = useCallback(async () => {
     setUsersLoading(true)
     setUsersError(null)
@@ -74,14 +99,16 @@ export function Admin() {
       setUsers(list)
     } catch (err) {
       if (err instanceof ConsoleApiError && err.statusCode === 401) {
-        setUsersError('需要 admin key：请先在「admin key 管理台」右上角的后端配置中设置')
-      } else {
-        setUsersError(err instanceof Error ? err.message : '加载用户列表失败')
+        // 会话失效/过期：回登录页（不再依赖 admin key）
+        clear()
+        navigate('/login', { replace: true })
+        return
       }
+      setUsersError(err instanceof Error ? err.message : '加载用户列表失败')
     } finally {
       setUsersLoading(false)
     }
-  }, [])
+  }, [clear])
 
   useEffect(() => {
     if (isAdmin) {
@@ -92,33 +119,53 @@ export function Admin() {
   const handleToggleDisabled = async (user: AdminUser) => {
     setTogglingUsername(user.username)
     try {
-      await consoleApi.adminSetUserDisabled({
-        username: user.username,
-        disabled: !user.disabled,
-      })
+      await consoleApi.adminUpdateUser(user.username, { disabled: !user.disabled })
       message.success(user.disabled ? `已启用 ${user.username}` : `已禁用 ${user.username}`)
       await loadUsers()
     } catch (err) {
-      message.error(err instanceof Error ? err.message : '操作失败，请稍后重试')
+      handleApiError(err, '操作失败，请稍后重试')
     } finally {
       setTogglingUsername(null)
     }
   }
 
-  const handleCreateInvite = async (values: InviteFormValues) => {
+  const handleRoleChange = async (user: AdminUser, role: ConsoleRole) => {
+    setRoleChangingUsername(user.username)
+    try {
+      await consoleApi.adminUpdateUser(user.username, { role })
+      message.success(`已将 ${user.username} 的角色调整为 ${role}`)
+      await loadUsers()
+    } catch (err) {
+      handleApiError(err, '角色调整失败，请稍后重试')
+    } finally {
+      setRoleChangingUsername(null)
+    }
+  }
+
+  const doCreateInvite = async (values: InviteFormValues) => {
     setInviting(true)
     try {
       const result = await consoleApi.adminCreateInvite({
+        role: values.role,
         max_uses: values.max_uses,
         expires_days: values.expires_days,
       })
       form.resetFields()
       setInviteResult(result)
     } catch (err) {
-      message.error(err instanceof Error ? err.message : '签发失败，请稍后重试')
+      handleApiError(err, '签发失败，请稍后重试')
     } finally {
       setInviting(false)
     }
+  }
+
+  /** 表单提交：签发 admin 邀请需二次确认，tenant 直接签发 */
+  const handleInviteFinish = (values: InviteFormValues) => {
+    if (values.role === 'admin') {
+      setPendingInvite(values)
+      return
+    }
+    void doCreateInvite(values)
   }
 
   const handleCopyInviteCode = async () => {
@@ -188,15 +235,15 @@ export function Admin() {
     {
       title: '操作',
       key: 'actions',
-      width: 120,
-      render: (_, record) =>
-        record.role === 'admin' ? (
-          <Typography.Text type="secondary">-</Typography.Text>
-        ) : (
+      width: 240,
+      render: (_, record) => (
+        <Space size="small">
           <Popconfirm
             title={record.disabled ? '确认启用该用户？' : '确认禁用该用户？'}
             description={
-              record.disabled ? '启用后可重新登录并使用隧道。' : '禁用后会话立即失效，无法再登录。'
+              record.disabled
+                ? '启用后可重新登录并使用隧道。'
+                : '禁用后会话立即失效，无法再登录。'
             }
             okText={record.disabled ? '确认启用' : '确认禁用'}
             okButtonProps={record.disabled ? undefined : { danger: true }}
@@ -207,7 +254,34 @@ export function Admin() {
               {record.disabled ? '启用' : '禁用'}
             </Button>
           </Popconfirm>
-        ),
+          {record.role === 'admin' ? (
+            <Popconfirm
+              title={`确认将 ${record.username} 降级为 tenant？`}
+              description="降级后该账号将失去用户管理权限。"
+              okText="确认降级"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={() => handleRoleChange(record, 'tenant')}
+            >
+              <Button type="link" size="small" loading={roleChangingUsername === record.username}>
+                降级为 tenant
+              </Button>
+            </Popconfirm>
+          ) : (
+            <Popconfirm
+              title={`确认将 ${record.username} 提升为 admin？`}
+              description="提升后该账号可管理用户与邀请码。"
+              okText="确认提升"
+              cancelText="取消"
+              onConfirm={() => handleRoleChange(record, 'admin')}
+            >
+              <Button type="link" size="small" loading={roleChangingUsername === record.username}>
+                提升为 admin
+              </Button>
+            </Popconfirm>
+          )}
+        </Space>
+      ),
     },
   ]
 
@@ -236,7 +310,21 @@ export function Admin() {
       <Content style={{ padding: 24 }}>
         <div style={{ maxWidth: 1100, margin: '0 auto' }}>
           <Card title="签发邀请码" style={{ marginBottom: 24 }}>
-            <Form form={form} layout="inline" onFinish={handleCreateInvite}>
+            <Form
+              form={form}
+              layout="inline"
+              onFinish={handleInviteFinish}
+              initialValues={{ role: 'tenant' }}
+            >
+              <Form.Item name="role" label="角色">
+                <Radio.Group
+                  optionType="button"
+                  options={[
+                    { value: 'tenant', label: 'tenant' },
+                    { value: 'admin', label: 'admin' },
+                  ]}
+                />
+              </Form.Item>
               <Form.Item name="max_uses" label="最大使用次数">
                 <InputNumber min={1} placeholder="默认 1" style={{ width: 120 }} />
               </Form.Item>
@@ -250,7 +338,7 @@ export function Admin() {
               </Form.Item>
             </Form>
             <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
-              邀请码签发后请立即复制保存，关闭弹层后不再完整展示。
+              邀请码签发后请立即复制保存，关闭弹层后不再完整展示；签发 admin 角色邀请需二次确认。
             </Typography.Paragraph>
           </Card>
 
@@ -263,17 +351,7 @@ export function Admin() {
             }
           >
             {usersError ? (
-              <Alert
-                type="warning"
-                showIcon
-                message="无法加载用户列表"
-                description={
-                  <Space direction="vertical">
-                    <span>{usersError}</span>
-                    <Typography.Link href="#/">打开 admin key 管理台配置后端</Typography.Link>
-                  </Space>
-                }
-              />
+              <Alert type="warning" showIcon message="无法加载用户列表" description={usersError} />
             ) : (
               <Table
                 rowKey="id"
@@ -287,6 +365,29 @@ export function Admin() {
           </Card>
         </div>
       </Content>
+
+      {/* 签发 admin 邀请的二次确认 */}
+      {pendingInvite && (
+        <Modal
+          open
+          title="确认签发 admin 邀请码？"
+          okText="确认签发"
+          cancelText="取消"
+          confirmLoading={inviting}
+          onOk={() => {
+            const values = pendingInvite
+            setPendingInvite(null)
+            void doCreateInvite(values)
+          }}
+          onCancel={() => setPendingInvite(null)}
+        >
+          <Alert
+            type="warning"
+            showIcon
+            message="该邀请码注册的账号将拥有管理员权限（可管理用户与邀请码），请确认。"
+          />
+        </Modal>
+      )}
 
       {inviteResult && (
         <Modal
