@@ -42,6 +42,9 @@ export const UI_CONFIG = {
   MODAL_LARGE_WIDTH: '90%',
 }
 
+/** 后端配置变更事件名：旧版 admin key 管理台据此重新判定是否已配置 key */
+export const BACKEND_CONFIG_CHANGED_EVENT = 'tunely-backend-config-changed'
+
 // 时间配置
 export const TIME_CONFIG = {
   /** 时间格式 */

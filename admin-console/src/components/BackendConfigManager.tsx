@@ -17,6 +17,12 @@ import {
   type BackendConfig,
 } from '../utils/backendConfig'
 import { refreshClient } from '../api/client'
+import { BACKEND_CONFIG_CHANGED_EVENT } from '../constants'
+
+/** 广播后端配置变更（旧版管理台据此重新判定是否已配置 admin key） */
+function notifyBackendConfigChanged() {
+  window.dispatchEvent(new Event(BACKEND_CONFIG_CHANGED_EVENT))
+}
 
 export function BackendConfigManager() {
   const [backendConfigs, setBackendConfigs] = useState<BackendConfig[]>(() => getAllBackendConfigs())
@@ -39,12 +45,14 @@ export function BackendConfigManager() {
       setCurrentBackendId(null)
       setCurrentBackend(null)
       refreshClient()
+      notifyBackendConfigChanged()
       message.info('已切换到默认后端')
       return
     }
     setCurrentBackendId(backendId)
     loadBackendConfigs()
     refreshClient()
+    notifyBackendConfigChanged()
     message.success('后端切换成功')
   }
 
@@ -116,6 +124,7 @@ export function BackendConfigManager() {
   const handleDeleteConfig = (id: string) => {
     deleteBackendConfig(id)
     loadBackendConfigs()
+    notifyBackendConfigChanged()
     message.success('后端配置已删除')
   }
 
