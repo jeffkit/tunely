@@ -1493,7 +1493,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures-util",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rand_chacha",
  "reqwest",
  "serde",
