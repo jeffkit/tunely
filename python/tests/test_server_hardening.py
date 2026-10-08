@@ -80,6 +80,50 @@ class TestConstantTimeApiKeyCompare:
             assert spy.called
 
 
+# ============== 任务1b：check-availability 匿名枚举 oracle 封堵 ==============
+
+
+class TestCheckAvailabilityAuthGate:
+    """check-availability 不得匿名区分「已存在 / 可用」（@-availability-oracle）"""
+
+    def _make_server(self) -> TunnelServer:
+        return TunnelServer(
+            config=TunnelServerConfig(
+                database_url="sqlite+aiosqlite:///:memory:",
+                admin_api_key="secret-key",
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_anonymous_request_rejected_401(self):
+        """无 key 请求直接 401，不得触达 DB 判定结果"""
+        srv = self._make_server()
+        with pytest.raises(HTTPException) as exc_info:
+            await srv._check_availability("dsh", None)
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_wrong_key_rejected_401(self):
+        srv = self._make_server()
+        with pytest.raises(HTTPException) as exc_info:
+            await srv._check_availability("dsh", "wrong-key")
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_valid_key_gets_result(self):
+        """携带正确 key 时语义不变：不存在 → available=True"""
+        srv = self._make_server()
+        session = AsyncMock()
+        srv.db = MagicMock()
+        srv.db.session.return_value.__aenter__ = AsyncMock(return_value=session)
+        srv.db.session.return_value.__aexit__ = AsyncMock(return_value=None)
+        with patch("tunely.server.TunnelRepository") as repo_cls:
+            repo_cls.return_value.get_by_domain = AsyncMock(return_value=None)
+            resp = await srv._check_availability("dsh", "secret-key")
+        assert resp.available is True
+        assert resp.name == "dsh"
+
+
 # ============== 任务2：WS 认证失败限速 ==============
 
 

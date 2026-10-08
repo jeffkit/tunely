@@ -1338,8 +1338,11 @@ class TunnelServer:
         @self.router.get(
             "/api/tunnels/check-availability", response_model=CheckAvailabilityResponse
         )
-        async def check_availability(name: str):
-            return await self._check_availability(name)
+        async def check_availability(
+            name: str,
+            x_api_key: str | None = Header(None, alias="x-api-key"),
+        ):
+            return await self._check_availability(name, x_api_key)
 
         @self.router.get("/api/tunnels/{domain}", response_model=TunnelInfo)
         async def get_tunnel(
@@ -1560,8 +1563,17 @@ class TunnelServer:
     # 域名格式：字母数字开头，可包含中划线，长度 1-63
     DOMAIN_PATTERN = re.compile(r"^[a-zA-Z0-9][-a-zA-Z0-9]{0,62}$")
 
-    async def _check_availability(self, name: str) -> CheckAvailabilityResponse:
-        """检查隧道名称是否可用"""
+    async def _check_availability(
+        self, name: str, api_key: str | None
+    ) -> CheckAvailabilityResponse:
+        """检查隧道名称是否可用
+
+        与 /api/tunnels 同受 admin key 门控（@-availability-oracle）：
+        对已存在域名返回 "Domain already exists"，一旦匿名可达即为
+        全量隧道名单枚举 oracle（PROBE_HARDENING T3 同源风险）。
+        """
+        self._check_admin_api_key(api_key)
+
         # 验证格式
         if not self.DOMAIN_PATTERN.match(name):
             return CheckAvailabilityResponse(
