@@ -18,8 +18,8 @@ importers:
         specifier: ^1.9.0
         version: 1.9.0
       undici:
-        specifier: ^7.24.4
-        version: 7.24.4
+        specifier: ^8.11.2
+        version: 8.11.2
       ws:
         specifier: ^8.16.0
         version: 8.19.0
@@ -593,9 +593,9 @@ packages:
   undici-types@7.22.0:
     resolution: {integrity: sha512-RKZvifiL60xdsIuC80UY0dq8Z7DbJUV8/l2hOVbyZAxBzEeQU4Z58+4ZzJ6WN2Lidi9KzT5EbiGX+PI/UGYuRw==}
 
-  undici@7.24.4:
-    resolution: {integrity: sha512-BM/JzwwaRXxrLdElV2Uo6cTLEjhSb3WXboncJamZ15NgUURmvlXvxa6xkwIOILIjPNo9i8ku136ZvWV0Uly8+w==}
-    engines: {node: '>=20.18.1'}
+  undici@8.11.2:
+    resolution: {integrity: sha512-u4UB2/IrKdU6lFxumHmmo1a3fCQO5tzQllRorfoRS63txhrB7xTpSn1PftwC4qEHkOaqP95fCWW4lJzwErwzhQ==}
+    engines: {node: '>=22.19.0'}
 
   vite-node@1.6.1:
     resolution: {integrity: sha512-YAXkfvGtuTzwWbDSACdJSg4A4DZiAqckWe90Zapc/sEX3XvHcw1NdurM/6od8J207tSDqNbSsgdCacBgvJKFuA==}
@@ -1136,7 +1136,7 @@ snapshots:
 
   undici-types@7.22.0: {}
 
-  undici@7.24.4: {}
+  undici@8.11.2: {}
 
   vite-node@1.6.1(@types/node@20.19.30):
     dependencies:
