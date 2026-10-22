@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # typescript/package.json 没有 packageManager 字段，这里固定 pnpm 版本（与 test.yml 一致）
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
 
