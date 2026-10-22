@@ -1,4 +1,4 @@
-# PyPI 发布：推 python-v* tag 或手动触发。
+# PyPI 发布：推 python-v* tag、手动触发，或 push main（pyproject 版本与 PyPI 已发版本不同时才发）。
 # 前置：仓库 Secrets 配置 PYPI_TOKEN（crates 模式的 pypi- API token）。
 # 未配置时本 job 告警跳过，不会失败。
 name: pypi
@@ -7,7 +7,14 @@ on:
   push:
     tags:
       - 'python-v*'
+    branches:
+      - main
   workflow_dispatch:
+
+# 同 ref 的连续 push 串行执行，避免两个版本发布竞态
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -20,10 +27,39 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Decide whether to publish
+        id: gate
+        run: |
+          set -uo pipefail
+          # tag 推送 / 非 main 分支上的手动触发：明确发版意图，直接发
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 注意：PyPI JSON 有分钟级 CDN 缓存——刚发过 vX 后短时间内连续 push，
+          # 缓存可能仍显示旧版本而误判「要发」；此时 PyPI 会拒绝重复版本（响亮失败，
+          # 重跑或下次 push 自愈），不做静默跳过。
+          local_version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          published=$(curl -fsSL --max-time 30 https://pypi.org/pypi/tunely/json \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null) || published=""
+          if [ -z "$published" ]; then
+            # 查询失败按「要发」处理：重复版本在 PyPI 侧得到响亮报错，好过静默漏发
+            echo "::warning::could not query PyPI for the published version — attempting publish."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$published" = "$local_version" ]; then
+            echo "::warning::version $local_version is already on PyPI — skipping. 要发版请改 python/pyproject.toml 的 version 后推 main。"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "local $local_version != published $published — publishing"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build
+        if: steps.gate.outputs.publish == 'true'
         run: uv build
 
       - name: Publish to PyPI
+        if: steps.gate.outputs.publish == 'true'
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
