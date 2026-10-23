@@ -31,7 +31,7 @@
   "author": "HITL Team",
   "license": "MIT",
   "dependencies": {
-    "commander": "^12.0.0",
+    "commander": "^15.0.0",
     "https-proxy-agent": "^9.1.0",
     "smol-toml": "^1.9.0",
     "undici": "^7.24.4",
