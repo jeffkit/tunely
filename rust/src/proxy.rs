@@ -152,10 +152,7 @@ pub async fn connect_via_proxy(
             ));
         }
     }
-    parse_connect_response(&head).map_err(|e| std::io::Error::new(
-        std::io::ErrorKind::Other,
-        e,
-    ))?;
+    parse_connect_response(&head).map_err(std::io::Error::other)?;
     Ok(stream)
 }
 
